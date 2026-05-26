@@ -30,12 +30,6 @@ const createInviteSchema = z.object({
   role: z.enum(ROLES).default('viewer'),
   audience: z.enum(AUDIENCES).default('admin'),
   accessLevel: z.enum(ACCESS_LEVELS).default('viewer'),
-  /**
-   * Optional: when inviting a partner, the admin can pre-fill some of the
-   * partner profile. On accept we create the partners row using these fields
-   * so the new partner lands in the directory immediately without having to
-   * go through onboarding first.
-   */
   partner: partnerPrefillSchema.optional(),
 });
 
@@ -63,11 +57,7 @@ interface InvitePayload {
   };
 }
 
-/** Admin-only routes: create invite. */
 export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
-  // Only owner/admin members of the target company (or super_admin globally)
-  // should be able to invite. The per-company role check is enforced in-handler
-  // since the company isn't necessarily the user's "active" company.
   app.addHook('preHandler', app.requireAudience('admin'));
 
   app.post('/', async (request, reply) => {
@@ -78,8 +68,6 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
     const inviter = request.authUser!;
     const inviterMeta = inviter as unknown as { accessLevel?: string };
 
-    // Authorization: super_admin can invite to any company; otherwise the
-    // caller must be owner/admin on the target company.
     if (inviterMeta.accessLevel !== 'super_admin') {
       const [m] = await db
         .select()
@@ -99,8 +87,6 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!companyRow) throw notFound('Company not found');
 
-    // If the user already exists AND already has a membership on this company,
-    // there's nothing to do.
     const [existingUser] = await db.select().from(user).where(eq(user.email, body.email)).limit(1);
     if (existingUser) {
       const [m] = await db
@@ -167,10 +153,7 @@ const acceptInviteSchema = z.object({
   lastName: z.string().min(1).max(120).optional(),
 });
 
-/** Public routes: GET invite details + POST accept. */
 export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
-  // Look up invite metadata so the accept page can show "You've been invited
-  // to <CompanyName> as <role>".
   const queryGet = z.object({ token: z.string().min(8).max(200) });
   app.get(
     '/',
@@ -249,17 +232,10 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
 
-      // Reuse Better Auth's signUpEmail so the password hashing matches the
-      // production login flow. If the email already exists, fall through to
-      // attach the membership to the existing user.
       const [existing] = await db.select().from(user).where(eq(user.email, payload.email)).limit(1);
       let userId: string;
       if (existing) {
         userId = existing.id;
-        // Stub users (e.g. created by admin "manual-create partner" without an
-        // invite) have a user row but no credential account, so they cannot
-        // log in. Detect that case and create the credential account using
-        // better-auth's internal password hasher.
         const [existingCredential] = await db
           .select()
           .from(account)
@@ -274,7 +250,7 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
             accountId: userId,
             password: hashed,
           });
-          // Activate the formerly-stubbed user now that they own credentials.
+
           await db
             .update(user)
             .set({
@@ -301,8 +277,7 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
           return;
         }
         userId = created.user.id;
-        // Set audience / accessLevel + mark verified (invite link presence
-        // already proves the user controls the inbox).
+
         await db
           .update(user)
           .set({
@@ -333,10 +308,6 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
           set: { role: payload.role, acceptedAt: now },
         });
 
-      // Partner pre-fill: when the inviter chose audience=partner and supplied
-      // partner details, drop a row into the tenant's partners table tied to
-      // this user. The row starts as `pending` so it still passes through the
-      // admin approval queue.
       if (payload.partner) {
         const { loadCompany } = await import('../../lib/company-loader.js');
         const { getTenantTables } = await import('../../db/schema/tenant.js');
@@ -359,7 +330,6 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      // Single-use: delete the invite row.
       await db.delete(verification).where(eq(verification.id, v.id));
 
       reply.code(201);

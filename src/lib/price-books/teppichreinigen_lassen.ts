@@ -27,8 +27,9 @@ export const teppichreinigenLassenBook: PriceBook = {
     dropOffLabel: 'Selbst-Abgabe Werkstatt Hamburg-Speicherstadt · kostenlos',
   },
 
-  // TRL is Teppich-only — on-site Polster routes through the Anfrage form.
   upholstery: null,
+
+  teppichbodenCleaning: null,
 
   addons: hamburgBook.addons,
 };

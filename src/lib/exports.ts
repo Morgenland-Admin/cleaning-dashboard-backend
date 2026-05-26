@@ -1,20 +1,3 @@
-/**
- * Export worker (ALL_74).
- *
- * Polls the `export_jobs` table every 5 seconds for `status='pending'` rows,
- * generates a CSV for the requested kind, uploads it to S3, and flips the
- * row to `status='done'` with `s3Key` set.
- *
- * Why a polling worker instead of a queue:
- *   - one process, no Redis/RabbitMQ to deploy
- *   - works on the same Postgres we already have
- *   - export volume is low (dozens/day at most)
- *
- * The worker is *cooperative*: only one at a time runs across processes thanks
- * to `SELECT … FOR UPDATE SKIP LOCKED` when claiming the next job. If you ever
- * scale the backend horizontally, this remains safe.
- */
-
 import { desc, eq, sql } from 'drizzle-orm';
 
 import { db } from '../db/index.js';
@@ -32,9 +15,6 @@ interface JobRow extends Record<string, unknown> {
   format: string;
 }
 
-// --- CSV utilities ---------------------------------------------------------
-
-/** Quote a single field per RFC 4180 — handles embedded commas, quotes, CR/LF. */
 function csvField(v: unknown): string {
   if (v == null) return '';
   let s: string;
@@ -52,11 +32,8 @@ function rowsToCsv(header: string[], rows: Array<Record<string, unknown>>): stri
   for (const r of rows) {
     lines.push(header.map((h) => csvField(r[h])).join(','));
   }
-  // CRLF — Excel friendlier, still RFC-4180.
   return lines.join('\r\n') + '\r\n';
 }
-
-// --- Per-kind generators ---------------------------------------------------
 
 async function fetchExportRows(
   schemaName: string,
@@ -164,13 +141,7 @@ async function fetchExportRows(
   }
 }
 
-// --- Job lifecycle ---------------------------------------------------------
-
-/** Claim the next pending job using SELECT … FOR UPDATE SKIP LOCKED — safe
- *  under multiple worker processes. Returns null if none. */
 async function claimNextJob(): Promise<JobRow | null> {
-  // Drizzle doesn't have first-class "FOR UPDATE SKIP LOCKED" sugar; the
-  // cleanest path is raw SQL inside a transaction.
   return await db.transaction(async (tx) => {
     const claimed = await tx.execute<JobRow>(sql`
       WITH next_job AS (
@@ -191,7 +162,6 @@ async function claimNextJob(): Promise<JobRow | null> {
 }
 
 async function runJob(job: JobRow): Promise<void> {
-  // Resolve the company → schema mapping so we know which tenant schema to read.
   const [companyRow] = await db
     .select()
     .from(company)
@@ -223,7 +193,7 @@ async function runJob(job: JobRow): Promise<void> {
     });
 
     const expires = new Date();
-    expires.setUTCDate(expires.getUTCDate() + 30); // 30-day retention
+    expires.setUTCDate(expires.getUTCDate() + 30);
 
     await db
       .update(exportJobs)
@@ -250,12 +220,10 @@ async function runJob(job: JobRow): Promise<void> {
 
 let workerInterval: NodeJS.Timeout | null = null;
 
-/** Start the polling worker. Called once at server boot from src/server.ts. */
+/** Start the polling worker. Called once at server boot. */
 export function startExportWorker(opts: { intervalMs?: number } = {}): void {
   if (workerInterval) return;
   const interval = opts.intervalMs ?? 5000;
-  // Pull-loop: claim a job, run it, immediately try again until empty, then
-  // wait `interval`. This keeps latency low when jobs queue up.
   const tick = async (): Promise<void> => {
     try {
       let job = await claimNextJob();
@@ -264,17 +232,11 @@ export function startExportWorker(opts: { intervalMs?: number } = {}): void {
         job = await claimNextJob();
       }
     } catch (err) {
-      // Don't crash the loop — log and try again next tick.
-
       console.error('[export-worker]', err);
     }
   };
-  // Run once immediately, then on interval. The first run is async — we
-  // intentionally don't await it during boot.
   void tick();
   workerInterval = setInterval(() => void tick(), interval);
-  // Don't keep the event loop alive for the worker alone — server lifecycle
-  // is owned by Fastify.
   workerInterval.unref?.();
 }
 

@@ -31,7 +31,6 @@ const updateStatusSchema = z.object({
   internalNotes: z.string().max(2000).optional(),
 });
 
-// Partner-facing: a partner views/creates their own profile within the active company.
 export const partnersSelfRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('partner'));
   app.addHook('preHandler', app.requireCompany);
@@ -56,7 +55,6 @@ export const partnersSelfRoutes: FastifyPluginAsync = async (app) => {
   });
 };
 
-// Admin-facing: manage all partners in the active company.
 export const partnersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
@@ -67,12 +65,6 @@ export const partnersAdminRoutes: FastifyPluginAsync = async (app) => {
     return { partners: rows };
   });
 
-  // Admin manual-create: drop a partner row into the directory without sending
-  // an invite email. Used for backfilling existing partners the admin already
-  // has paperwork for. If no user exists for the supplied email we create a
-  // stub user (audience=partner, isActive=false) so the partner can later
-  // claim the account via an invite. Membership is created so the partner
-  // shows up in the per-company query.
   const createPartnerSchema = z.object({
     email: z.string().email(),
     companyName: z.string().min(1).max(200),
@@ -99,7 +91,6 @@ export const partnersAdminRoutes: FastifyPluginAsync = async (app) => {
     const companySlug = request.company!.slug;
     const now = new Date();
 
-    // Look up existing user by email; if none, stub one out.
     const [existingUser] = await db.select().from(user).where(eq(user.email, body.email)).limit(1);
 
     let userId: string;
@@ -118,7 +109,6 @@ export const partnersAdminRoutes: FastifyPluginAsync = async (app) => {
       });
     }
 
-    // Ensure they have a partner-role membership on the active company.
     await db
       .insert(membership)
       .values({
@@ -133,7 +123,6 @@ export const partnersAdminRoutes: FastifyPluginAsync = async (app) => {
         set: { role: 'partner' },
       });
 
-    // Refuse double-create — if this user already has a partner row here.
     const [existingPartner] = await db
       .select()
       .from(partners)

@@ -1,24 +1,3 @@
-/**
- * CSV import utilities for ALL_68 (existing-customer import).
- *
- * Two layers:
- *   1. `parseCsv()` — tolerant header-detecting parser. Handles BOM, quoted
- *      fields with embedded commas/quotes/newlines, CRLF + LF + CR, and a
- *      flexible header dictionary so user uploads from Mailchimp / Excel /
- *      partner spreadsheets all land in the right columns without manual
- *      column-mapping UI.
- *   2. `filterImportRows()` — pure function that runs the spam / system /
- *      own-address / dedup filters against a Set of existing emails the
- *      caller fetched from the DB.
- *
- * Why a custom parser rather than papaparse: CSV import volume is small
- * (hundreds of rows, not millions); the parser is ~80 lines, no new dep,
- * and the rules we actually need (BOM, quoted fields, flexible header
- * matching) are simple enough to own.
- */
-
-// --- Header aliases --------------------------------------------------------
-
 const EMAIL_ALIASES = ['email', 'e-mail', 'mail', 'emailaddress', 'email_address'];
 const FIRST_ALIASES = ['firstname', 'first_name', 'first name', 'given', 'givenname', 'vorname'];
 const LAST_ALIASES = [
@@ -36,27 +15,18 @@ function matchHeader(header: string, aliases: readonly string[]): boolean {
   return aliases.some((a) => a.replace(/[\s_-]+/g, '') === norm);
 }
 
-// --- Parser ----------------------------------------------------------------
-
 export interface ParsedRow {
   email: string;
   firstName?: string;
   lastName?: string;
-  /** 1-based line number in the source file (header is line 1). */
   line: number;
 }
 
-/** Parse a CSV blob into typed rows. Throws on completely unrecognisable
- *  input (no email column found). */
 export function parseCsv(input: string): ParsedRow[] {
-  // Strip UTF-8 BOM if present.
   let text = input;
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  // Normalise line endings.
   text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-  // Detect delimiter by counting in the first line — comma > semicolon > tab.
-  // Excel-DE often emits semicolons.
   const firstLine = text.slice(0, text.indexOf('\n')).slice(0, 4096) || text;
   let delim = ',';
   const commaCount = (firstLine.match(/,/g) ?? []).length;
@@ -98,8 +68,6 @@ export function parseCsv(input: string): ParsedRow[] {
   return out;
 }
 
-/** Tokenise one CSV file with the given delimiter. Handles "quoted, fields"
- *  including escaped "" quotes. */
 function parseDelimited(text: string, delim: string): string[][] {
   const rows: string[][] = [];
   let cur: string[] = [];
@@ -125,7 +93,6 @@ function parseDelimited(text: string, delim: string): string[][] {
       field = '';
     } else if (c === '\n') {
       cur.push(field);
-      // Skip empty trailing rows (file with trailing newline).
       if (!(cur.length === 1 && cur[0] === '')) rows.push(cur);
       cur = [];
       field = '';
@@ -133,15 +100,12 @@ function parseDelimited(text: string, delim: string): string[][] {
       field += c;
     }
   }
-  // Last field/row if no trailing newline.
   if (field.length > 0 || cur.length > 0) {
     cur.push(field);
     if (!(cur.length === 1 && cur[0] === '')) rows.push(cur);
   }
   return rows;
 }
-
-// --- Filters ---------------------------------------------------------------
 
 export type RejectReason =
   | 'invalid_email'
@@ -155,20 +119,14 @@ export interface ImportRow {
   firstName?: string;
   lastName?: string;
   line: number;
-  /** Reason for skip; undefined → keep. */
   reject?: RejectReason;
 }
 
 export interface FilterOptions {
-  /** Lower-cased domains the brand owns (skip its own staff mails). */
   ownDomains: string[];
-  /** Lower-cased emails already in the brand's newsletter table. */
   existingEmails: Set<string>;
 }
 
-// Standards: RFC 5321 says 254 chars max for an email path. This regex isn't
-// fully RFC-compliant (no IDN, no nested-comment edge cases) but rejects 99%
-// of real-world bad data while accepting 99.9% of real addresses.
 const EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 
 const SYSTEM_LOCALPARTS = new Set([
@@ -186,9 +144,6 @@ const SYSTEM_LOCALPARTS = new Set([
   'info',
 ]);
 
-// Conservative — best-known disposable providers. Not exhaustive; the goal
-// is to catch obvious junk uploaded by mistake, not to block determined
-// abuse (which has its own bounce-handling path).
 const DISPOSABLE_DOMAINS = new Set([
   'mailinator.com',
   'trashmail.com',
@@ -208,7 +163,6 @@ export function filterImportRows(rows: ParsedRow[], opts: FilterOptions): Import
   for (const r of rows) {
     const base: ImportRow = { ...r };
 
-    // 1. Email format
     if (!EMAIL_RE.test(r.email) || r.email.length > 254) {
       result.push({ ...base, reject: 'invalid_email' });
       continue;
@@ -217,31 +171,26 @@ export function filterImportRows(rows: ParsedRow[], opts: FilterOptions): Import
     const [local, domain] = r.email.split('@') as [string, string];
     const lowerDomain = domain.toLowerCase();
 
-    // 2. Own brand's domain
     if (opts.ownDomains.includes(lowerDomain)) {
       result.push({ ...base, reject: 'own_domain' });
       continue;
     }
 
-    // 3. System / role addresses
     if (SYSTEM_LOCALPARTS.has(local.toLowerCase())) {
       result.push({ ...base, reject: 'system_address' });
       continue;
     }
 
-    // 4. Disposable
     if (DISPOSABLE_DOMAINS.has(lowerDomain)) {
       result.push({ ...base, reject: 'disposable_domain' });
       continue;
     }
 
-    // 5. Already in DB
     if (opts.existingEmails.has(r.email)) {
       result.push({ ...base, reject: 'duplicate' });
       continue;
     }
 
-    // 6. Duplicate within the same upload
     if (seenInBatch.has(r.email)) {
       result.push({ ...base, reject: 'duplicate' });
       continue;
@@ -254,14 +203,11 @@ export function filterImportRows(rows: ParsedRow[], opts: FilterOptions): Import
   return result;
 }
 
-// --- Summary ---------------------------------------------------------------
-
 export interface ImportSummary {
   parsedRows: number;
   imported: number;
   skipped: number;
   byReason: Record<RejectReason, number>;
-  /** First N rejected rows for the UI to display so operators can see why. */
   sampleRejects: ImportRow[];
 }
 

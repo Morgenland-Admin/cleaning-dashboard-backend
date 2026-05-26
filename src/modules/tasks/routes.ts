@@ -8,23 +8,6 @@ import { parseIntId } from '../../lib/http-errors.js';
 import { membership, taskComments, tasks, user } from '../../db/schema/shared.js';
 import { notifyTaskAssigned, notifyTaskComment, spawnTask } from '../../lib/tasks.js';
 
-// ---------------------------------------------------------------------------
-//  Admin tasks (ALL_103).
-//
-//  Routes:
-//    GET    /admin/tasks              — paginated list, brand-scoped to user
-//    POST   /admin/tasks              — manual ad-hoc task creation
-//    GET    /admin/tasks/summary      — counts per brand for sidebar/dashboard
-//    GET    /admin/tasks/members      — possible assignees for a given brand
-//    GET    /admin/tasks/:id          — full task + author info
-//    PATCH  /admin/tasks/:id          — edit title/body/priority/dueAt/assignee
-//    POST   /admin/tasks/:id/ack      — claim (status → in_progress)
-//    POST   /admin/tasks/:id/done     — resolve (status → done)
-//    POST   /admin/tasks/:id/dismiss  — soft-archive (status → dismissed)
-//    GET    /admin/tasks/:id/comments — paginated thread
-//    POST   /admin/tasks/:id/comments — append (notifies assignee)
-// ---------------------------------------------------------------------------
-
 const listQuerySchema = z.object({
   status: z.enum(['open', 'in_progress', 'done', 'dismissed', 'all']).default('open'),
   brand: z.string().min(1).max(63).optional(),
@@ -68,7 +51,6 @@ async function userBrandSlugs(userId: string): Promise<string[]> {
 }
 
 export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
-  // -------------------------------------------------------------- list
   app.get('/', async (request, reply) => {
     const q = listQuerySchema.parse(request.query);
     const userId = request.authUser!.id;
@@ -105,7 +87,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ items, nextCursor });
   });
 
-  // -------------------------------------------------------------- create
   app.post('/', async (request, reply) => {
     const body = createSchema.parse(request.body);
     const userId = request.authUser!.id;
@@ -121,15 +102,10 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
       body: body.body,
       priority: body.priority,
       assigneeUserId: body.assigneeUserId,
-      // We don't pass refKind/refId on ad-hoc creation, so the unique
-      // index doesn't fire — every manual click creates a fresh row.
     });
 
-    // Surface the new row id so the client can navigate / open it.
     const [created] = await db.select().from(tasks).where(eq(tasks.id, result.id)).limit(1);
 
-    // If the manual creator assigned to someone else, fire notify so they
-    // hear about it. (Self-assignment doesn't trigger — annoying.)
     if (created && body.assigneeUserId && body.assigneeUserId !== userId) {
       void notifyTaskAssigned({
         task: created,
@@ -141,7 +117,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(201).send({ task: created, created: result.created });
   });
 
-  // -------------------------------------------------------------- summary
   app.get('/summary', async (request, reply) => {
     const userId = request.authUser!.id;
     const brands = await userBrandSlugs(userId);
@@ -164,9 +139,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     });
   });
 
-  // -------------------------------------------------------------- members
-  // Possible assignees for a brand the user has access to. Used by the
-  // assignee picker. Returns only users with active membership.
   app.get('/members', async (request, reply) => {
     const q = z.object({ brand: z.string().min(1).max(63) }).parse(request.query);
     const userId = request.authUser!.id;
@@ -191,7 +163,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ members: rows });
   });
 
-  // -------------------------------------------------------------- detail
   app.get('/:id', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const userId = request.authUser!.id;
@@ -205,7 +176,7 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
       reply.code(404).send({ error: 'Task not found' });
       return;
     }
-    // Resolve assignee + resolver names for the UI.
+
     const userIds = [row.assigneeUserId, row.resolvedByUserId].filter((v): v is string =>
       Boolean(v),
     );
@@ -223,7 +194,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     });
   });
 
-  // -------------------------------------------------------------- edit
   app.patch('/:id', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const userId = request.authUser!.id;
@@ -240,7 +210,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    // Validate assignee — must be a member of this task's brand.
     if (body.assigneeUserId) {
       const [m] = await db
         .select()
@@ -267,11 +236,10 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     if (body.body !== undefined) patch.body = body.body;
     if (body.priority !== undefined) patch.priority = body.priority;
     if (body.dueAt !== undefined) patch.dueAt = body.dueAt === null ? null : new Date(body.dueAt);
-    if (body.assigneeUserId !== undefined) patch.assigneeUserId = body.assigneeUserId; // null = unassign
+    if (body.assigneeUserId !== undefined) patch.assigneeUserId = body.assigneeUserId;
 
     const [updated] = await db.update(tasks).set(patch).where(eq(tasks.id, id)).returning();
 
-    // Assignment change → notify the new assignee.
     if (
       updated &&
       body.assigneeUserId !== undefined &&
@@ -289,7 +257,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ task: updated });
   });
 
-  // -------------------------------------------------------------- claim
   app.post('/:id/ack', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const userId = request.authUser!.id;
@@ -310,7 +277,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ task: updated });
   });
 
-  // -------------------------------------------------------------- done
   app.post('/:id/done', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const userId = request.authUser!.id;
@@ -333,7 +299,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ task: updated });
   });
 
-  // -------------------------------------------------------------- dismiss
   app.post('/:id/dismiss', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const userId = request.authUser!.id;
@@ -356,7 +321,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ task: updated });
   });
 
-  // -------------------------------------------------------------- comments list
   app.get('/:id/comments', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const userId = request.authUser!.id;
@@ -386,7 +350,6 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ comments: rows });
   });
 
-  // -------------------------------------------------------------- comment post
   app.post('/:id/comments', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const body = commentSchema.parse(request.body);
@@ -410,10 +373,8 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
       })
       .returning();
 
-    // Touch the parent task so list views re-sort if needed.
     await db.update(tasks).set({ updatedAt: new Date() }).where(eq(tasks.id, id));
 
-    // Ping the assignee unless they're the author or unassigned.
     if (task.assigneeUserId && task.assigneeUserId !== userId) {
       void notifyTaskComment({
         task,

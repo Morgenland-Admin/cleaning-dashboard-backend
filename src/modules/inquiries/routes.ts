@@ -65,6 +65,7 @@ const updateSchema = z.object({
     .regex(/^\d+(\.\d{1,2})?$/, 'quotedAmount must be numeric')
     .nullable()
     .optional(),
+  metadata: z.record(z.unknown()).optional(),
 });
 
 export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
@@ -83,9 +84,6 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
         reply.code(201);
         return { ok: true, inquiry: null };
       }
-      // Defense in depth: every attachment key must live under this tenant's
-      // S3 folder. Without this an attacker could submit an inquiry referencing
-      // an arbitrary S3 key (e.g. another tenant's file or a planted payload).
       if (body.attachments && body.attachments.length > 0) {
         const expectedPrefix = `${request.company!.keyPrefix}/`;
         const bad = body.attachments.find((a) => !a.key.startsWith(expectedPrefix));
@@ -126,7 +124,6 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
             .limit(1);
           if (companyRow) {
             const brand = brandInfoFromCompany(companyRow);
-            // Re-use the contact-ack template — the content shape is the same.
             await sendEmail({
               to: row.email,
               from: brandSender(companyRow),
@@ -138,7 +135,6 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
                 brand,
               }),
             });
-            // Admin notification — leads worth real money shouldn't sit unseen.
             if (companyRow.email) {
               const details: Array<{ label: string; value: string }> = [];
               if (row.service) details.push({ label: 'Service', value: row.service });
@@ -171,7 +167,6 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
           );
         }
 
-        // Fire Web Push to admins with membership in this brand.
         try {
           const { sendPushToBrandAdmins } = await import('../../lib/push.js');
           await sendPushToBrandAdmins(request.company!.slug, {
@@ -185,8 +180,6 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
           request.log.warn({ err, inquiryId: row.id }, 'push dispatch failed');
         }
 
-        // Spawn operator task — idempotent on (brand, "service_inquiry", id).
-        // Inquiries are usually higher-value than contacts, so priority "high".
         try {
           const { spawnTask } = await import('../../lib/tasks.js');
           await spawnTask({
@@ -209,9 +202,6 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
   );
 };
 
-// Strip PII fields (ipAddress, userAgent, internalNotes) for viewer-level
-// admins. They're investigation-grade data — anyone above viewer (manager,
-// admin, super_admin) keeps full visibility.
 const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
 
 function redactPii<T extends { ipAddress?: unknown; userAgent?: unknown; internalNotes?: unknown }>(
@@ -290,6 +280,15 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
     if (body.status === 'won' || body.status === 'lost') {
       patch.closedAt = now;
     }
+
+    if (body.metadata) {
+      const [cur] = await db
+        .select({ metadata: serviceInquiries.metadata })
+        .from(serviceInquiries)
+        .where(eq(serviceInquiries.id, id))
+        .limit(1);
+      patch.metadata = { ...(cur?.metadata ?? {}), ...body.metadata };
+    }
     const [row] = await db
       .update(serviceInquiries)
       .set(patch)
@@ -298,9 +297,6 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
     return { inquiry: row };
   });
 
-  // Send the customer a quote email. The admin types the message + amount —
-  // typically right after PATCH /:id status -> quoted. Returns the updated
-  // row so the client can refresh state.
   const quoteSchema = z.object({
     body: z.string().min(1).max(8000),
     quotedAmount: z

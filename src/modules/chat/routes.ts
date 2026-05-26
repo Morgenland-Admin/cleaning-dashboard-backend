@@ -6,18 +6,6 @@ import { db } from '../../db/index.js';
 import { user } from '../../db/schema/shared.js';
 import { broadcast, roomKey, type ChatMessagePayload } from './hub.js';
 
-/**
- * Admin-side chat routes. All operations are scoped to the active company
- * (resolved via the standard `X-Company-Slug` header by app.requireCompany).
- *
- * Conversation key is the partner's user_id — there's exactly one
- * conversation row per partner per brand. Auto-created on first send.
- *
- * REST is the source of truth; WebSocket broadcasts are best-effort UX
- * accelerators. Clients that miss a WS event will still re-sync on the next
- * GET /messages refresh.
- */
-
 const sendBodySchema = z
   .object({
     body: z.string().max(8000).optional(),
@@ -68,19 +56,8 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
 
-  /**
-   * List conversations in the active brand. Joined with partner_name +
-   * partner_email so the inbox can render without per-row user lookups.
-   */
   app.get('/conversations', async (request) => {
     const { chatConversations, partners } = request.company!.tables;
-    // Driven from `partners` (not `chat_conversations`) so every active
-    // partner is selectable in the inbox — even before either side has sent
-    // a message. The conversation row is created lazily on first send, so a
-    // partner with `id = null` and no preview just means "no chat yet".
-    //
-    // Suspended / rejected partners are excluded — once the relationship is
-    // over, the admin shouldn't be able to start a new thread with them.
     const rows = await db
       .select({
         id: chatConversations.id,
@@ -99,22 +76,14 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
       .leftJoin(chatConversations, eq(chatConversations.partnerUserId, partners.userId))
       .leftJoin(user, eq(user.id, partners.userId))
       .where(inArray(partners.status, ['pending', 'active']))
-      // Conversations with recent activity first; partners without a
-      // conversation row sink to the bottom but stay reachable.
       .orderBy(sql`${chatConversations.lastMessageAt} desc nulls last`, desc(partners.createdAt));
     return { conversations: rows };
   });
 
-  /**
-   * Fetch (or auto-create) a conversation for a specific partner user id.
-   * Returns the conversation row + the most recent 100 messages, oldest first.
-   */
   app.get('/conversations/:partnerUserId/messages', async (request, reply) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
     const { chatConversations, chatMessages, partners } = request.company!.tables;
 
-    // Verify the partner actually belongs to this brand — otherwise an admin
-    // could probe arbitrary user IDs by guessing.
     const [partnerRow] = await db
       .select({ userId: partners.userId })
       .from(partners)
@@ -147,11 +116,6 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  /**
-   * Send a message from the admin to the partner. Inserts the message,
-   * updates the conversation denorms, bumps partner's unread counter, and
-   * broadcasts on the WS room so anyone listening gets it instantly.
-   */
   app.post('/conversations/:partnerUserId/messages', async (request, reply) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
     const body = sendBodySchema.parse(request.body);
@@ -169,8 +133,6 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    // Tx so the insert + denorm update are atomic — without this, a crash
-    // mid-flight would leave the conversation list showing a stale preview.
     const result = await db.transaction(async (tx) => {
       let [conv] = await tx
         .select()
@@ -228,12 +190,6 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
     return { message: payload };
   });
 
-  /**
-   * Mark the conversation as read by the admin — zeroes the admin's unread
-   * counter and stamps `read_at` on every incoming (partner→admin) message
-   * that's still unread. Broadcasts a `read` event so the partner's UI can
-   * update the "Gelesen" indicator on outgoing bubbles.
-   */
   app.post('/conversations/:partnerUserId/read', async (request, reply) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
     const slug = request.company!.slug;
@@ -258,7 +214,6 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
           and(
             eq(chatMessages.conversationId, conv.id),
             eq(chatMessages.senderRole, 'partner'),
-            // Only the rows that haven't been read yet — avoids touching old ones.
             sql`${chatMessages.readAt} IS NULL`,
           ),
         );
@@ -282,10 +237,6 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204).send();
   });
 
-  /**
-   * Typing indicator. No DB writes — just a WS broadcast. Returns 204 and
-   * silently no-ops if no one's listening on the other side.
-   */
   app.post('/conversations/:partnerUserId/typing', async (request, reply) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
     const { isTyping } = typingSchema.parse(request.body);

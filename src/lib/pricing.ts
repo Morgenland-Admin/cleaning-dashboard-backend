@@ -1,55 +1,35 @@
-/**
- * Pricing engine for storefront orders.
- *
- * Pure function: same `priceOrder(input, book)` powers both
- *   - /storefront/orders/quote (display in the wizard)
- *   - /storefront/orders/checkout (Stripe line items)
- * so a tampered cart can never change what we charge — the client only ever
- * submits a configuration, never a price.
- *
- * Per-brand variation: prices, labels, mins and which services are even
- * sold live in `price-books/<slug>.ts`. To change a brand's prices, edit
- * its file; to add a 4th brand, create a new book + register in
- * `price-books/index.ts`. The engine itself doesn't know about brand names.
- *
- * The const-arrays exported below (TEPPICH_ARTS, REPARATUR_ARTS, …) are the
- * **universal vocabulary** of every possible tier across all brands; a brand
- * subsets them via its book. Zod uses these arrays for input validation —
- * input validity ≠ brand availability; the latter is checked inside the
- * engine and rejected as "service nicht verfügbar".
- */
-
-import { effectivePickupFeeCents, resolvePickupZone } from './pickup-zones.js';
+import { effectivePickupFeeCents, resolvePickupZone, type Coords } from './pickup-zones.js';
 import type { PriceBook } from './price-books/types.js';
-
-// --- Universal service vocabulary -------------------------------------------
-// Used by Zod for input validation. A brand opts into a subset via its book.
 
 export const TEPPICH_ARTS = [
   'maschinell',
   'shaggy',
-  'doppelseitig',
-  'orient',
-  'berber',
+  'handgeknuepft',
+  'perser_premium',
   'china',
   'seide',
-  'schmutzfangmatten',
+  'antik',
 ] as const;
 export type TeppichArt = (typeof TEPPICH_ARTS)[number];
 
 export const REPARATUR_ARTS = [
-  'fransen_handketteln',
-  'ketteln_fein',
-  'ketteln_grob',
-  'fransen_mech_ohne_knoten',
-  'fransen_mech_mit_knoten',
-  'leder',
+  'fransen_sichern',
+  'kanten_sichern',
+  'fransen_erneuern',
+  'kanten_erneuern',
+  'auf_mass_kuerzen',
 ] as const;
 export type ReparaturArt = (typeof REPARATUR_ARTS)[number];
 
 export const POLSTER_ITEMS = [
+  'stuhl_klein',
+  'hocker',
+  'stuhl_gross',
+  'buerostuhl',
+  'hocker_gross',
   'sessel',
   'sofa_2',
+  'auto_innenraum',
   'sofa_3',
   'eckcouch_klein',
   'eckcouch_gross',
@@ -57,24 +37,39 @@ export const POLSTER_ITEMS = [
 ] as const;
 export type PolsterItem = (typeof POLSTER_ITEMS)[number];
 
-export const ZUSATZ_KINDS = ['motten', 'impraegnierung', 'geruch'] as const;
+export const ZUSATZ_KINDS = ['impraegnierung', 'mottenschutz', 'mottenbekaempfung'] as const;
 export type ZusatzKind = (typeof ZUSATZ_KINDS)[number];
 
-// --- Input shapes ------------------------------------------------------------
+export const TEPPICHBODEN_TIERS = ['basis', 'standard', 'premium'] as const;
+export type TeppichbodenTier = (typeof TEPPICHBODEN_TIERS)[number];
+
+/**
+ * Flächenstaffeln — Festpreis pro Auftrag (nicht pro m²).
+ *
+ * Die letzte Bracket `ab_150` hat im PriceBook für jede Tier einen `null`-Preis
+ * und löst im Engine eine "individuelles-Angebot"-Antwort aus
+ * (`outOfArea: true`). Das Frontend leitet dann auf das Kontaktformular.
+ */
+export const TEPPICHBODEN_BRACKETS = [
+  'bis_30',
+  'bis_50',
+  'bis_75',
+  'bis_100',
+  'bis_125',
+  'bis_150',
+  'ab_150',
+] as const;
+export type TeppichbodenBracket = (typeof TEPPICHBODEN_BRACKETS)[number];
 
 export interface CarpetLineInput {
   art: TeppichArt;
-  /** Square meters. Decimal allowed (e.g. 2.5). */
   sqm: number;
-  /** Optional human label, e.g. "Wohnzimmerteppich". Stored, not priced. */
   note?: string;
-  /** Per-carpet add-ons priced per qm. */
   addons?: ZusatzKind[];
 }
 
 export interface RepairLineInput {
   art: ReparaturArt;
-  /** Laufende Meter — decimal allowed. */
   meters: number;
   note?: string;
 }
@@ -88,74 +83,59 @@ export type OrderServiceInput =
   | {
       kind: 'teppichreinigung';
       carpets: CarpetLineInput[];
-      /** "pickup" runs through pickup-zone fee logic; "drop_off" is free. */
       pickupMode: 'pickup' | 'drop_off';
-      /** German 5-digit PLZ. Required when pickupMode === "pickup". */
       pickupPlz?: string;
+      /** Geocoded address coords — used for accurate distance-based zoning. */
+      pickupCoords?: Coords;
     }
   | {
       kind: 'teppichreparatur';
       repairs: RepairLineInput[];
       pickupMode: 'pickup' | 'drop_off';
       pickupPlz?: string;
+      pickupCoords?: Coords;
     }
   | {
       kind: 'polsterreinigung';
       items: PolsterLineInput[];
-      /** PLZ for the on-site appointment — used to surface zone in admin UI. */
       addressPlz: string;
+      addressCoords?: Coords;
+    }
+  | {
+      kind: 'teppichbodenreinigung';
+      tier: TeppichbodenTier;
+      bracket: TeppichbodenBracket;
+      /** Optionale, exakte Flächen-Angabe — nur zur Anzeige / E-Mail-Hinweis. */
+      sqm?: number;
+      addressPlz: string;
+      addressCoords?: Coords;
     };
 
-// --- Output shapes -----------------------------------------------------------
-
 export interface PricedLine {
-  /** Machine-stable code for the line — e.g. "carpet.orient", "addon.motten". */
   code: string;
-  /** Human-readable German label, shown to customers + on Stripe + on the invoice. */
   label: string;
-  /** Quantity column, e.g. "2.5 qm", "1 lfdm", "1 Sessel". */
   quantityLabel: string;
-  /** Per-unit price in cents (display only — the source of truth is `subtotalCents`). */
   unitPriceCents: number;
-  /** Quantity used for the math — float allowed. */
   quantity: number;
-  /** Line total in cents. */
   subtotalCents: number;
 }
 
 export interface PriceQuote {
   lines: PricedLine[];
   subtotalCents: number;
-  /** Pickup fee (0 if Selbst-Abgabe or ≥ freePickupSqmThreshold qm carpet). */
   pickupFeeCents: number;
   pickupLabel: string | null;
-  /** Min-order bump if the gross is below the service's Mindestauftrag. */
   minOrderTopUpCents: number;
   totalCents: number;
-  /** True when the configured service literally cannot be sold online — caller
-   *  should reroute to the Anfrage form. */
   outOfArea: boolean;
-  /** Reason string when outOfArea === true, for the storefront to display. */
   outOfAreaReason?: string;
 }
 
-// --- Math helpers ------------------------------------------------------------
-
-/** Bankers-round to whole cents. We multiply floats (sqm × €) so this matters. */
 function toCents(cents: number): number {
-  // Math.round is half-to-even-ish only in some JS engines; Math.floor(x + 0.5)
-  // is safe for non-negative values which is what we have here.
   return Math.floor(cents + 0.5);
 }
 
-// --- Main entry point --------------------------------------------------------
-
-/**
- * Compute the full price quote for an order configuration against a brand's
- * price book. Pure — no DB, no external calls. The returned object is what
- * we both (a) show the customer in the cart and (b) hand to Stripe as
- * Checkout Session line items.
- */
+/** Compute the full price quote. Pure — no DB or external calls. */
 export function priceOrder(input: OrderServiceInput, book: PriceBook): PriceQuote {
   switch (input.kind) {
     case 'teppichreinigung':
@@ -164,6 +144,8 @@ export function priceOrder(input: OrderServiceInput, book: PriceBook): PriceQuot
       return priceTeppichreparatur(input, book);
     case 'polsterreinigung':
       return pricePolsterreinigung(input, book);
+    case 'teppichbodenreinigung':
+      return priceTeppichbodenreinigung(input, book);
   }
 }
 
@@ -172,6 +154,7 @@ function priceTeppichreinigung(
     carpets: CarpetLineInput[];
     pickupMode: 'pickup' | 'drop_off';
     pickupPlz?: string;
+    pickupCoords?: Coords;
   },
   book: PriceBook,
 ): PriceQuote {
@@ -218,7 +201,6 @@ function priceTeppichreinigung(
 
   const subtotalCents = lines.reduce((acc, l) => acc + l.subtotalCents, 0);
 
-  // Pickup fee
   let pickupFeeCents = 0;
   let pickupLabel: string | null = null;
   if (input.pickupMode === 'pickup') {
@@ -227,7 +209,7 @@ function priceTeppichreinigung(
     }
     let zoneResult;
     try {
-      zoneResult = resolvePickupZone(input.pickupPlz);
+      zoneResult = resolvePickupZone(input.pickupPlz, input.pickupCoords);
     } catch (err) {
       return emptyQuote(err instanceof Error ? err.message : 'Ungültige PLZ');
     }
@@ -257,7 +239,6 @@ function priceTeppichreinigung(
     pickupLabel = catalog.dropOffLabel;
   }
 
-  // Min-order top-up
   const grossBeforeMin = subtotalCents + pickupFeeCents;
   const minOrderTopUpCents =
     grossBeforeMin < catalog.minOrderCents ? catalog.minOrderCents - grossBeforeMin : 0;
@@ -278,6 +259,7 @@ function priceTeppichreparatur(
     repairs: RepairLineInput[];
     pickupMode: 'pickup' | 'drop_off';
     pickupPlz?: string;
+    pickupCoords?: Coords;
   },
   book: PriceBook,
 ): PriceQuote {
@@ -304,15 +286,13 @@ function priceTeppichreparatur(
   }
   const subtotalCents = lines.reduce((a, l) => a + l.subtotalCents, 0);
 
-  // Repair pickup uses the zone table but never gets the free-≥6qm rule
-  // (the discount is keyed to carpet area, not repair length).
   let pickupFeeCents = 0;
   let pickupLabel: string | null = null;
   if (input.pickupMode === 'pickup') {
     if (!input.pickupPlz) return emptyQuote('PLZ erforderlich für Abholung');
     let zoneResult;
     try {
-      zoneResult = resolvePickupZone(input.pickupPlz);
+      zoneResult = resolvePickupZone(input.pickupPlz, input.pickupCoords);
     } catch (err) {
       return emptyQuote(err instanceof Error ? err.message : 'Ungültige PLZ');
     }
@@ -346,7 +326,7 @@ function priceTeppichreparatur(
 }
 
 function pricePolsterreinigung(
-  input: { items: PolsterLineInput[]; addressPlz: string },
+  input: { items: PolsterLineInput[]; addressPlz: string; addressCoords?: Coords },
   book: PriceBook,
 ): PriceQuote {
   const catalog = book.upholstery;
@@ -356,11 +336,9 @@ function pricePolsterreinigung(
   if (input.items.length === 0) {
     return emptyQuote('Mindestens ein Möbelstück erforderlich');
   }
-  // We still validate the PLZ — Polsterreinigung is on-site, so out-of-area
-  // means we can't take the booking online.
   let zoneResult;
   try {
-    zoneResult = resolvePickupZone(input.addressPlz);
+    zoneResult = resolvePickupZone(input.addressPlz, input.addressCoords);
   } catch (err) {
     return emptyQuote(err instanceof Error ? err.message : 'Ungültige PLZ');
   }
@@ -394,29 +372,93 @@ function pricePolsterreinigung(
   }
   const subtotalCents = lines.reduce((a, l) => a + l.subtotalCents, 0);
 
-  // Min on-site: if total < catalog.minOnsiteCents, add Anfahrtspauschale as a
-  // separate line so the customer sees why their order ticked up.
-  let pickupFeeCents = 0;
-  let pickupLabel: string | null = null;
-  if (subtotalCents < catalog.minOnsiteCents) {
-    pickupFeeCents = catalog.anfahrtCents;
-    pickupLabel = `Anfahrtspauschale · Vor-Ort-Service unter ${formatEurFromCents(catalog.minOnsiteCents)}`;
-  } else {
-    pickupLabel = `Vor-Ort-Service · ${zoneResult.label} · keine Anfahrtspauschale`;
-  }
+  const minOrderTopUpCents =
+    subtotalCents < catalog.minOrderCents ? catalog.minOrderCents - subtotalCents : 0;
 
   return {
     lines,
     subtotalCents,
-    pickupFeeCents,
-    pickupLabel,
-    minOrderTopUpCents: 0,
-    totalCents: subtotalCents + pickupFeeCents,
+    pickupFeeCents: 0,
+    pickupLabel: `Vor-Ort-Service · ${zoneResult.label}`,
+    minOrderTopUpCents,
+    totalCents: subtotalCents + minOrderTopUpCents,
     outOfArea: false,
   };
 }
 
-// --- Helpers -----------------------------------------------------------------
+function priceTeppichbodenreinigung(
+  input: {
+    tier: TeppichbodenTier;
+    bracket: TeppichbodenBracket;
+    sqm?: number;
+    addressPlz: string;
+    addressCoords?: Coords;
+  },
+  book: PriceBook,
+): PriceQuote {
+  const catalog = book.teppichbodenCleaning;
+  if (!catalog) {
+    return serviceUnavailable(book, 'Teppichbodenreinigung');
+  }
+
+  let zoneResult;
+  try {
+    zoneResult = resolvePickupZone(input.addressPlz, input.addressCoords);
+  } catch (err) {
+    return emptyQuote(err instanceof Error ? err.message : 'Ungültige PLZ');
+  }
+  if (zoneResult.outOfArea) {
+    return {
+      lines: [],
+      subtotalCents: 0,
+      pickupFeeCents: 0,
+      pickupLabel: null,
+      minOrderTopUpCents: 0,
+      totalCents: 0,
+      outOfArea: true,
+      outOfAreaReason: 'Vor-Ort-Service außerhalb 50 km — bitte stellen Sie eine Anfrage.',
+    };
+  }
+
+  const bracketPrice = catalog.prices[input.tier]?.[input.bracket];
+
+  if (bracketPrice == null) {
+    return {
+      lines: [],
+      subtotalCents: 0,
+      pickupFeeCents: 0,
+      pickupLabel: null,
+      minOrderTopUpCents: 0,
+      totalCents: 0,
+      outOfArea: true,
+      outOfAreaReason:
+        'Für diese Fläche erstellen wir Ihnen ein individuelles Festpreis-Angebot — bitte stellen Sie eine kostenfreie Anfrage.',
+    };
+  }
+
+  const sqmLabel =
+    typeof input.sqm === 'number' && input.sqm > 0 ? ` · ${formatSqm(input.sqm)} m²` : '';
+  const lines: PricedLine[] = [
+    {
+      code: `teppichboden.${input.tier}`,
+      label: `Teppichbodenreinigung · ${catalog.tierLabels[input.tier]}`,
+      quantityLabel: `${catalog.bracketLabels[input.bracket]}${sqmLabel}`,
+      unitPriceCents: bracketPrice,
+      quantity: 1,
+      subtotalCents: bracketPrice,
+    },
+  ];
+
+  return {
+    lines,
+    subtotalCents: bracketPrice,
+    pickupFeeCents: 0,
+    pickupLabel: `Vor-Ort-Service · ${zoneResult.label}`,
+    minOrderTopUpCents: 0,
+    totalCents: bracketPrice,
+    outOfArea: false,
+  };
+}
 
 function emptyQuote(reason: string): PriceQuote {
   return {
@@ -437,7 +479,6 @@ function serviceUnavailable(book: PriceBook, label: string): PriceQuote {
   );
 }
 
-/** German number formatting for qm/lfdm display (1.5 → "1,5"). */
 function formatSqm(n: number): string {
   return n.toLocaleString('de-DE', {
     minimumFractionDigits: n % 1 === 0 ? 0 : 1,
@@ -445,7 +486,7 @@ function formatSqm(n: number): string {
   });
 }
 
-/** Format cents as German EUR string, e.g. 2990 → "29,90 €". Used in emails. */
+/** Format cents as German EUR string, e.g. 2990 → "29,90 €". */
 export function formatEurFromCents(cents: number): string {
   return (cents / 100).toLocaleString('de-DE', {
     style: 'currency',

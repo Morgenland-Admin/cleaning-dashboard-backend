@@ -3,27 +3,34 @@ import type { FastifyPluginAsync } from 'fastify';
 import { getPriceBook } from '../../lib/price-books/index.js';
 import type { PriceBook } from '../../lib/price-books/types.js';
 
-// ---------------------------------------------------------------------------
-// Public storefront catalog. Returns a JSON description of the services + tiers
-// the brand sells through online checkout, so storefronts can render only the
-// kinds and addons their book exposes (rather than hard-coding the catalog
-// client-side, which drifts from the engine).
-//
-// Mounted at /storefront/catalog. Tenant resolved by X-Company-Slug.
-// ---------------------------------------------------------------------------
-
 interface TierDto {
   code: string;
   label: string;
+  /**
+   * Für Bracket-Services (unit: 'bracket') sind die Preise tier × bracket
+   * — `unitPriceCents` ist dann nicht aussagekräftig und wird mit `0`
+   * belegt. Clients sollen `brackets` lesen.
+   */
   unitPriceCents: number;
+  /** Optionale Kurzbeschreibung pro Tier (für Card-Subtitle). */
+  description?: string;
+}
+
+interface BracketDto {
+  code: string;
+  label: string;
+  /** Preis je Tier-Code (z. B. `{ basis: 21000, standard: 27900, premium: 39000 }`).
+   *  `null` ⇒ "auf Anfrage". */
+  pricesCents: Record<string, number | null>;
 }
 
 interface ServiceDto {
-  kind: 'teppichreinigung' | 'teppichreparatur' | 'polsterreinigung';
+  kind: 'teppichreinigung' | 'teppichreparatur' | 'polsterreinigung' | 'teppichbodenreinigung';
   label: string;
-  unit: 'qm' | 'lfdm' | 'stueck';
+  unit: 'qm' | 'lfdm' | 'stueck' | 'bracket';
   tiers: TierDto[];
-  /** Extra config the storefront wizard needs. */
+  /** Nur gesetzt für `unit: 'bracket'`. */
+  brackets?: BracketDto[];
   options: Record<string, unknown>;
 }
 
@@ -31,7 +38,6 @@ interface CatalogDto {
   brand: { slug: string; name: string };
   currency: string;
   services: ServiceDto[];
-  /** Carpet add-ons attach to carpetCleaning lines. */
   addons: TierDto[];
 }
 
@@ -83,10 +89,30 @@ function buildCatalog(book: PriceBook): CatalogDto {
         label: u.labels[k],
         unitPriceCents: u.prices[k],
       })),
-      options: {
-        minOnsiteCents: u.minOnsiteCents,
-        anfahrtCents: u.anfahrtCents,
-      },
+      options: { minOrderCents: u.minOrderCents },
+    });
+  }
+
+  if (book.teppichbodenCleaning) {
+    const t = book.teppichbodenCleaning;
+    const tierCodes = Object.keys(t.prices) as Array<keyof typeof t.prices>;
+    const bracketCodes = Object.keys(t.bracketLabels) as Array<keyof typeof t.bracketLabels>;
+    services.push({
+      kind: 'teppichbodenreinigung',
+      label: 'Teppichbodenreinigung (Vor-Ort)',
+      unit: 'bracket',
+      tiers: tierCodes.map((k) => ({
+        code: k,
+        label: t.tierLabels[k],
+        unitPriceCents: 0,
+        description: t.tierDescriptions[k],
+      })),
+      brackets: bracketCodes.map((b) => ({
+        code: b,
+        label: t.bracketLabels[b],
+        pricesCents: Object.fromEntries(tierCodes.map((k) => [k, t.prices[k][b]])),
+      })),
+      options: {},
     });
   }
 
@@ -109,7 +135,6 @@ function buildCatalog(book: PriceBook): CatalogDto {
 export const catalogPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
 
-  // Cheap, deterministic — no need for tight rate limits.
   app.get('/', async (request, reply) => {
     const book = getPriceBook(request.company!.slug);
     if (!book) {

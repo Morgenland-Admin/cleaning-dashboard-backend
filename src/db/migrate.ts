@@ -77,34 +77,19 @@ async function main(): Promise<void> {
   const pool = new Pool({ connectionString: env.DATABASE_URL });
   const db = drizzle(pool);
 
-  // Phase 1 — tenant schemas. Quote-identifier-safe (no user input here, all
-  // schema names come from a const allowlist).
   console.log('[migrate] ensuring tenant schemas…');
   for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
     await db.execute(sql.raw(`CREATE SCHEMA IF NOT EXISTS "${cfg.schemaName}"`));
   }
 
-  // Phase 2 — Drizzle migrations against ./drizzle. This covers the public
-  // schema tables (user / company / membership / tasks / push_subscriptions /
-  // export_jobs / etc) and the FIVE tenant tables that have top-level
-  // exports in tenant.ts (newsletter_subscribers, contact_messages,
-  // contact_replies, service_inquiries, partners).
   console.log('[migrate] applying drizzle migrations…');
   await migrate(db, { migrationsFolder: './drizzle' });
 
-  // Phase 3 — fill in the REMAINING tenant tables (orders / order_items /
-  // order_status_log / chat_conversations / chat_messages). These aren't
-  // top-level exports — they're built by buildTenantTables() at runtime, so
-  // drizzle-kit doesn't generate migrations for them. createTenantSchemaSql
-  // is idempotent (IF NOT EXISTS everywhere), so this is safe to re-run on
-  // every boot and on already-existing schemas.
   console.log('[migrate] ensuring tenant tables (orders + chat)…');
   for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
     await db.execute(sql.raw(createTenantSchemaSql(cfg.schemaName)));
   }
 
-  // Phase 4 — minimal company-row bootstrap. ON CONFLICT DO NOTHING so we
-  // never overwrite operator-edited values on subsequent boots.
   console.log('[migrate] upserting legacy company rows…');
   for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
     await db

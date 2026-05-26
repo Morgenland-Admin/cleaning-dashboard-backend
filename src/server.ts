@@ -11,9 +11,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Async work runners. The export worker polls export_jobs every 5s and
-  // generates CSVs server-side; we start it after the listener is bound so
-  // a slow first poll doesn't delay startup.
   startExportWorker();
 
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {

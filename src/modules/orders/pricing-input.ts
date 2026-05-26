@@ -3,15 +3,11 @@ import {
   POLSTER_ITEMS,
   REPARATUR_ARTS,
   TEPPICH_ARTS,
+  TEPPICHBODEN_BRACKETS,
+  TEPPICHBODEN_TIERS,
   ZUSATZ_KINDS,
   type OrderServiceInput,
 } from '../../lib/pricing.js';
-
-// --- Customer + address ------------------------------------------------------
-// Shared across all three order kinds. Kept inline rather than tied to a
-// hypothetical Customer table because guest checkout means every order is a
-// fresh customer snapshot — they may even have an old, outdated phone number
-// in our DB and we don't want to silently overwrite it.
 
 export const customerSchema = z.object({
   name: z.string().trim().min(1).max(120),
@@ -29,11 +25,6 @@ export const addressSchema = z.object({
     .regex(/^\d{5}$/, 'PLZ must be 5 digits'),
   country: z.string().length(2).default('DE'),
 });
-
-// --- Quote / Checkout body shapes -------------------------------------------
-// `quoteSchema` is the public input; the same shape powers /quote (no DB,
-// returns price) and /checkout (DB write + Stripe). The /checkout endpoint
-// extends with customer + consent + address.
 
 const carpetLineSchema = z.object({
   art: z.enum(TEPPICH_ARTS),
@@ -53,6 +44,11 @@ const polsterLineSchema = z.object({
   quantity: z.number().int().positive().max(20),
 });
 
+const coordsSchema = z.object({
+  lat: z.number().min(-90).max(90),
+  lon: z.number().min(-180).max(180),
+});
+
 export const quoteSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('teppichreinigung'),
@@ -63,6 +59,7 @@ export const quoteSchema = z.discriminatedUnion('kind', [
       .trim()
       .regex(/^\d{5}$/)
       .optional(),
+    pickupCoords: coordsSchema.optional(),
   }),
   z.object({
     kind: z.literal('teppichreparatur'),
@@ -73,6 +70,7 @@ export const quoteSchema = z.discriminatedUnion('kind', [
       .trim()
       .regex(/^\d{5}$/)
       .optional(),
+    pickupCoords: coordsSchema.optional(),
   }),
   z.object({
     kind: z.literal('polsterreinigung'),
@@ -81,33 +79,45 @@ export const quoteSchema = z.discriminatedUnion('kind', [
       .string()
       .trim()
       .regex(/^\d{5}$/),
+    addressCoords: coordsSchema.optional(),
+  }),
+  z.object({
+    kind: z.literal('teppichbodenreinigung'),
+    tier: z.enum(TEPPICHBODEN_TIERS),
+    bracket: z.enum(TEPPICHBODEN_BRACKETS),
+    sqm: z.number().positive().max(2000).optional(),
+    addressPlz: z
+      .string()
+      .trim()
+      .regex(/^\d{5}$/),
+    addressCoords: coordsSchema.optional(),
   }),
 ]);
 
 export type QuoteInput = z.infer<typeof quoteSchema>;
 
-// The Zod output matches the pricing engine input one-to-one (just discriminated
-// on `kind`). This cast keeps the union types aligned without re-mapping fields.
 export function toServiceInput(parsed: QuoteInput): OrderServiceInput {
   return parsed;
 }
 
-// /checkout extends /quote with customer + consent + (optional) date + address.
 export const checkoutSchema = quoteSchema.and(
   z.object({
     customer: customerSchema,
     address: addressSchema.optional(),
-    /** Only required for Polsterreinigung (on-site appointment). */
     preferredDate: z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/, 'preferredDate must be YYYY-MM-DD')
+      .optional(),
+    preferredSlots: z
+      .array(z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/))
+      .min(1)
+      .max(3)
       .optional(),
     customerNotes: z.string().trim().max(2000).optional(),
     consentPrivacy: z.literal(true, {
       errorMap: () => ({ message: 'Privacy consent is required' }),
     }),
     consentMarketing: z.boolean().optional(),
-    /** Honeypot — must stay empty. */
     website: z.string().max(200).optional(),
     source: z.string().trim().max(64).optional(),
   }),

@@ -24,11 +24,6 @@ const subscribeSchema = z.object({
   consentMarketing: z.literal(true, {
     errorMap: () => ({ message: 'Marketing consent is required to subscribe' }),
   }),
-  /**
-   * Honeypot: hidden field rendered off-screen on the storefront. Real users
-   * never see it; bots fill every input. Any non-empty value silently treats
-   * the submission as success without persisting.
-   */
   website: z.string().max(200).optional(),
 });
 
@@ -76,7 +71,6 @@ function renderHtmlPage(
 </head><body><main><h1>${escapeHtml(opts.heading)}</h1>${opts.bodyHtml}</main></body></html>`);
 }
 
-// Public submit — used by all 3 storefronts. Tenant resolved via X-Company-Slug.
 export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
   app.post(
     '/subscribe',
@@ -88,7 +82,6 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
     },
     async (request, reply) => {
       const body = subscribeSchema.parse(request.body);
-      // Honeypot: bot detected — pretend success, never persist.
       if (body.website && body.website.trim().length > 0) {
         reply.code(201);
         return { ok: true, subscriber: null };
@@ -116,9 +109,6 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
         .onConflictDoNothing({ target: newsletterSubscribers.email })
         .returning();
 
-      // If onConflict skipped (email already exists), short-circuit success:
-      // never reveal whether the address was already subscribed (enumeration
-      // defense + spec-compliant: re-confirming is a no-op).
       if (row) {
         const [companyRow] = await db
           .select()
@@ -156,8 +146,6 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // Double-opt-in confirmation. Single-click GET so the user can confirm from
-  // the email without an extra POST step. Idempotent: re-clicking does nothing.
   const confirmQuerySchema = z.object({
     slug: z.string().min(1).max(64),
     token: z.string().min(8).max(200),
@@ -175,7 +163,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
           status: 400,
         });
       }
-      // Resolve company via the URL slug (no X-Company-Slug header from email clients).
+
       const [companyRow] = await db
         .select()
         .from(company)
@@ -189,7 +177,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
           status: 404,
         });
       }
-      // Look up the row via the tenant table for this slug.
+
       const tenant = await import('../../db/schema/tenant.js');
       const tables = tenant.getTenantTables(companyRow.schemaName);
       const now = new Date();
@@ -236,8 +224,6 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // One-click unsubscribe — required under §7 UWG / GDPR Art. 21. Stateless
-  // HMAC token; no DB lookup needed beyond the action itself.
   const unsubscribeQuerySchema = z.object({
     token: z.string().min(8).max(500),
   });
@@ -294,7 +280,6 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
   );
 };
 
-// Admin-only — list / delete subscribers per active company.
 export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
@@ -335,9 +320,6 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204).send();
   });
 
-  // ---- Sample CSV --------------------------------------------------------
-  // Tiny template the admin can download to see the expected column shape.
-  // Helps operators format Mailchimp / Excel exports correctly the first time.
   app.get('/import/sample', async (_request, reply) => {
     const lines = [
       'email,first_name,last_name',
@@ -349,120 +331,100 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.send(lines.join('\r\n') + '\r\n');
   });
 
-  // ---- POST /import (ALL_68) ---------------------------------------------
-  // Accepts a JSON body { csv: "header\nrow\nrow..." } — small payloads
-  // (typically under 1 MB; the route lifts the per-route body limit).
-  // Returns a detailed summary so the UI can show "imported X, skipped Y by
-  // reason Z" without a second round-trip.
   const importSchema = z.object({
     csv: z
       .string()
       .min(8)
       .max(10 * 1024 * 1024), // 10 MB hard cap
-    /** When true: only return what *would* import, write nothing to DB. */
     dryRun: z.boolean().default(false),
-    /** Default tag to attach to every new subscriber. */
     tag: z.string().trim().max(64).optional(),
-    /** Source label stored on each row — defaults to "csv-import". */
     source: z.string().trim().max(64).default('csv-import'),
   });
 
-  app.post(
-    '/import',
-    { bodyLimit: 12 * 1024 * 1024 }, // headroom over the schema's 10 MB
-    async (request, reply) => {
-      const body = importSchema.parse(request.body);
-      const { newsletterSubscribers } = request.company!.tables;
+  app.post('/import', { bodyLimit: 12 * 1024 * 1024 }, async (request, reply) => {
+    const body = importSchema.parse(request.body);
+    const { newsletterSubscribers } = request.company!.tables;
 
-      const { parseCsv, filterImportRows, summarise } = await import('../../lib/csv-import.js');
+    const { parseCsv, filterImportRows, summarise } = await import('../../lib/csv-import.js');
 
-      // 1. Parse — bail with a 400 if the file is unrecognisable
-      let rows;
-      try {
-        rows = parseCsv(body.csv);
-      } catch (err) {
-        reply.code(400).send({
-          error: err instanceof Error ? err.message : 'CSV could not be parsed',
-        });
-        return;
-      }
-      if (rows.length === 0) {
-        reply.send({
-          summary: summarise([], 0),
-          message: 'Datei enthält keine Datenzeilen.',
-        });
-        return;
-      }
-
-      // 2. Build the filter context — own brand domain + already-known emails
-      const [companyRow] = await db
-        .select()
-        .from(company)
-        .where(eq(company.slug, request.company!.slug))
-        .limit(1);
-      const ownDomains: string[] = [];
-      if (companyRow?.email) ownDomains.push(companyRow.email.split('@')[1]!.toLowerCase());
-      if (companyRow?.senderEmail)
-        ownDomains.push(companyRow.senderEmail.split('@')[1]!.toLowerCase());
-      try {
-        if (companyRow?.websiteUrl) {
-          ownDomains.push(new URL(companyRow.websiteUrl).hostname.toLowerCase());
-        }
-      } catch {
-        /* malformed URL — ignore */
-      }
-
-      // Load existing emails in one query (PII stays in-tenant).
-      const existing = await db
-        .select({ email: newsletterSubscribers.email })
-        .from(newsletterSubscribers);
-      const existingEmails = new Set(existing.map((e) => e.email.toLowerCase()));
-
-      const filtered = filterImportRows(rows, { ownDomains, existingEmails });
-      const accepted = filtered.filter((r) => !r.reject);
-
-      // 3. Insert — batched, single transaction. 500/batch keeps each
-      //    statement well under Postgres' wire-protocol limits.
-      let imported = 0;
-      if (!body.dryRun && accepted.length > 0) {
-        const BATCH = 500;
-        const now = new Date();
-        const tags = body.tag ? [body.tag] : [];
-        await db.transaction(async (tx) => {
-          for (let i = 0; i < accepted.length; i += BATCH) {
-            const chunk = accepted.slice(i, i + BATCH);
-            const inserted = await tx
-              .insert(newsletterSubscribers)
-              .values(
-                chunk.map((r) => ({
-                  email: r.email,
-                  firstName: r.firstName ?? null,
-                  lastName: r.lastName ?? null,
-                  locale: 'de',
-                  source: body.source,
-                  tags,
-                  confirmed: true,
-                  confirmedAt: now,
-                  ipAddress: request.ip,
-                  userAgent: request.headers['user-agent'] ?? null,
-                })),
-              )
-              // Defensive: if a row races in between the dedup scan and the
-              // insert (unlikely with a single admin operator, but cheap),
-              // skip rather than error the whole batch.
-              .onConflictDoNothing({
-                target: newsletterSubscribers.email,
-              })
-              .returning({ id: newsletterSubscribers.id });
-            imported += inserted.length;
-          }
-        });
-      }
-
-      reply.code(body.dryRun ? 200 : 201).send({
-        summary: summarise(filtered, imported),
-        dryRun: body.dryRun,
+    let rows;
+    try {
+      rows = parseCsv(body.csv);
+    } catch (err) {
+      reply.code(400).send({
+        error: err instanceof Error ? err.message : 'CSV could not be parsed',
       });
-    },
-  );
+      return;
+    }
+    if (rows.length === 0) {
+      reply.send({
+        summary: summarise([], 0),
+        message: 'Datei enthält keine Datenzeilen.',
+      });
+      return;
+    }
+
+    const [companyRow] = await db
+      .select()
+      .from(company)
+      .where(eq(company.slug, request.company!.slug))
+      .limit(1);
+    const ownDomains: string[] = [];
+    if (companyRow?.email) ownDomains.push(companyRow.email.split('@')[1]!.toLowerCase());
+    if (companyRow?.senderEmail)
+      ownDomains.push(companyRow.senderEmail.split('@')[1]!.toLowerCase());
+    try {
+      if (companyRow?.websiteUrl) {
+        ownDomains.push(new URL(companyRow.websiteUrl).hostname.toLowerCase());
+      }
+    } catch {
+      /* malformed URL — ignore */
+    }
+
+    const existing = await db
+      .select({ email: newsletterSubscribers.email })
+      .from(newsletterSubscribers);
+    const existingEmails = new Set(existing.map((e) => e.email.toLowerCase()));
+
+    const filtered = filterImportRows(rows, { ownDomains, existingEmails });
+    const accepted = filtered.filter((r) => !r.reject);
+
+    let imported = 0;
+    if (!body.dryRun && accepted.length > 0) {
+      const BATCH = 500;
+      const now = new Date();
+      const tags = body.tag ? [body.tag] : [];
+      await db.transaction(async (tx) => {
+        for (let i = 0; i < accepted.length; i += BATCH) {
+          const chunk = accepted.slice(i, i + BATCH);
+          const inserted = await tx
+            .insert(newsletterSubscribers)
+            .values(
+              chunk.map((r) => ({
+                email: r.email,
+                firstName: r.firstName ?? null,
+                lastName: r.lastName ?? null,
+                locale: 'de',
+                source: body.source,
+                tags,
+                confirmed: true,
+                confirmedAt: now,
+                ipAddress: request.ip,
+                userAgent: request.headers['user-agent'] ?? null,
+              })),
+            )
+            .onConflictDoNothing({
+              target: newsletterSubscribers.email,
+            })
+            .returning({ id: newsletterSubscribers.id });
+          imported += inserted.length;
+        }
+      });
+    }
+
+    reply.code(body.dryRun ? 200 : 201).send({
+      summary: summarise(filtered, imported),
+      dryRun: body.dryRun,
+    });
+  });
 };

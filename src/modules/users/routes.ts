@@ -59,7 +59,6 @@ const usersRoutes: FastifyPluginAsync = async (app) => {
     const body = updateProfileSchema.parse(request.body);
     const patch: Record<string, unknown> = { ...body, updatedAt: new Date() };
 
-    // Keep `name` in sync if first/last changes and name wasn't explicitly provided.
     if (body.name === undefined && (body.firstName !== undefined || body.lastName !== undefined)) {
       const [existing] = await db.select().from(user).where(eq(user.id, id)).limit(1);
       if (existing) {
@@ -92,8 +91,6 @@ const usersRoutes: FastifyPluginAsync = async (app) => {
     return { memberships: rows };
   });
 
-  // ---- Addresses ---------------------------------------------------------
-
   app.get('/me/addresses', async (request) => {
     const id = request.authUser!.id;
     const rows = await db
@@ -107,7 +104,7 @@ const usersRoutes: FastifyPluginAsync = async (app) => {
   app.post('/me/addresses', async (request, reply) => {
     const id = request.authUser!.id;
     const body = addressBaseSchema.parse(request.body);
-    // If this row should be default, clear other defaults of the same type first.
+
     if (body.isDefault) {
       await db
         .update(address)
@@ -158,8 +155,6 @@ const usersRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204);
     return null;
   });
-
-  // ---- Settings ----------------------------------------------------------
 
   app.get('/me/settings', async (request) => {
     const id = request.authUser!.id;

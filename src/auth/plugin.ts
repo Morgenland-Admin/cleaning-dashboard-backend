@@ -5,7 +5,6 @@ import { auth } from './index.js';
 type Audience = 'admin' | 'partner' | 'customer';
 type AccessLevel = 'super_admin' | 'admin' | 'manager' | 'viewer' | 'none';
 
-// Convert Fastify req/headers into a WHATWG Request for Better Auth.
 function toWebRequest(request: FastifyRequest): Request {
   const url = `${request.protocol}://${request.headers.host}${request.url}`;
   const headers = new Headers();
@@ -32,10 +31,6 @@ function toWebRequest(request: FastifyRequest): Request {
 
 async function pipeWebResponse(reply: FastifyReply, response: Response) {
   reply.status(response.status);
-  // Handle Set-Cookie specially: WHATWG Headers combines multiple Set-Cookie
-  // headers into a single comma-joined string in forEach/get(), which is wrong
-  // for cookies (commas are valid inside cookie values). getSetCookie() returns
-  // each cookie as a separate entry; we forward all of them via the raw header.
   const setCookies =
     typeof (response.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie ===
     'function'
@@ -54,7 +49,6 @@ async function pipeWebResponse(reply: FastifyReply, response: Response) {
 }
 
 const authPlugin: FastifyPluginAsync = async (app: FastifyInstance) => {
-  // Mount Better Auth handler at /auth/* (matches basePath in src/auth/index.ts).
   app.route({
     method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     url: '/auth/*',
@@ -64,7 +58,6 @@ const authPlugin: FastifyPluginAsync = async (app: FastifyInstance) => {
     },
   });
 
-  // Decorate request with session/user (populated lazily on guarded routes).
   app.decorateRequest('authSession', null);
   app.decorateRequest('authUser', null);
 
@@ -77,9 +70,6 @@ const authPlugin: FastifyPluginAsync = async (app: FastifyInstance) => {
     return session;
   });
 
-  // Every branch returns after reply.send() — Fastify lifecycle is safe even
-  // without `return` (nothing runs after .send() here), but the explicit
-  // return is defensive against future additions to these handlers.
   app.decorate('requireAuth', async (request: FastifyRequest, reply: FastifyReply) => {
     const session = await app.getSession(request);
     if (!session?.user) {

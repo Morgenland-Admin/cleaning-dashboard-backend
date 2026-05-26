@@ -8,30 +8,14 @@ import { loadCompany } from '../../lib/company-loader.js';
 import { getTenantTables } from '../../db/schema/tenant.js';
 import { join, roomKey } from './hub.js';
 
-/**
- * WebSocket endpoint at /ws/chat. Connection-time handshake:
- *   1. Validate session cookie (Better Auth)
- *   2. Read query params: ?slug=... &partnerUserId=...
- *   3. For admins  → verify they have membership in the slug
- *      For partners → verify their user_id matches partnerUserId AND they
- *                    have a partners row in that brand
- *   4. Add the socket to roomKey(slug, partnerUserId)
- *   5. Bridge incoming client messages → REST-equivalent broadcasts.
- *      We deliberately keep DB writes on the REST side; the WS is a
- *      pure delivery channel for low-latency typing/presence events.
- */
 const chatWsPlugin: FastifyPluginAsync = async (app) => {
   await app.register(fastifyWebsocket, {
     options: {
-      // ~1 MB cap — text messages are small, file uploads go via S3 presigned
-      // and only the key/metadata travels through chat.
       maxPayload: 1024 * 1024,
     },
   });
 
   app.get('/chat', { websocket: true }, async (connection, req) => {
-    // Build a WHATWG Request out of the upgrade so Better Auth can read the
-    // session cookie — same trick the HTTP auth plugin uses.
     const headers = new Headers();
     for (const [k, v] of Object.entries(req.headers)) {
       if (Array.isArray(v)) for (const item of v) headers.append(k, item);
@@ -62,7 +46,6 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
     const role: 'admin' | 'partner' = sessionUser.audience === 'partner' ? 'partner' : 'admin';
 
     if (role === 'partner') {
-      // Partners can only listen to their own conversation.
       if (sessionUser.id !== q.partnerUserId) {
         connection.close(4403, 'Partner can only subscribe to their own conversation');
         return;
@@ -77,9 +60,6 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
         return;
       }
     } else {
-      // Admins must be a member of the brand. Reuse the same query the HTTP
-      // hook does; we can't share the hook directly because it expects a
-      // Fastify request lifecycle, but the underlying check is two lines.
       const { membership, company: companyTable } = await import('../../db/schema/shared.js');
       const { and } = await import('drizzle-orm');
       const [m] = await db
@@ -94,7 +74,6 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
           ),
         )
         .limit(1);
-      // super_admin bypasses the membership check.
       const accessLevel = (sessionUser as { accessLevel?: string }).accessLevel;
       if (!m && accessLevel !== 'super_admin') {
         connection.close(4403, 'Not a member of this brand');
@@ -108,7 +87,6 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
       role,
     });
 
-    // Send a hello frame so the client can confirm the connection is live.
     connection.send(
       JSON.stringify({
         type: 'hello',
@@ -118,9 +96,6 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
       }),
     );
 
-    // We don't process inbound WS frames as authoritative — REST is the
-    // source of truth. But we DO accept typing pings for ultra-low-latency
-    // typing indicators, broadcasting them straight through without DB.
     connection.on('message', (raw: Buffer) => {
       void (async () => {
         let parsed: { type?: string; isTyping?: boolean } | null = null;
@@ -138,7 +113,7 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
             roomKey(q.slug!, q.partnerUserId!),
             {
               type: 'typing',
-              conversationId: 0, // partner doesn't know the conv id; clients ignore
+              conversationId: 0,
               from: role,
               isTyping: parsed.isTyping,
             },
@@ -148,8 +123,6 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
       })();
     });
 
-    // Heartbeat — terminate dead connections so the room set doesn't grow
-    // unbounded if the client disappears without a clean close.
     const interval = setInterval(() => {
       try {
         connection.ping();

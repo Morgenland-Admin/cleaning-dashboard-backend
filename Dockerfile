@@ -4,18 +4,18 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 RUN corepack enable
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json pnpm-lock.yaml .npmrc ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
+    pnpm install --frozen-lockfile --config.minimum-release-age=0 --config.minimumReleaseAge=0
 
 FROM node:22-alpine AS build
 WORKDIR /app
 RUN corepack enable
 COPY --from=deps /app/node_modules ./node_modules
-COPY package.json pnpm-lock.yaml* tsconfig.json drizzle.config.ts ./
+COPY package.json pnpm-lock.yaml .npmrc tsconfig.json drizzle.config.ts ./
 COPY src ./src
 COPY drizzle ./drizzle
-RUN pnpm run build && pnpm prune --prod
+RUN pnpm run build && pnpm prune --prod --config.minimum-release-age=0 --config.minimumReleaseAge=0
 
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production

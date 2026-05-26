@@ -10,12 +10,7 @@ export const s3Configured = !!(credentialsConfigured && env.S3_BUCKET);
 const client = new S3Client({
   region: env.AWS_REGION,
   endpoint: env.S3_ENDPOINT,
-  // Path-style only when an explicit endpoint is set (MinIO / LocalStack);
-  // real AWS expects virtual-hosted-style.
   forcePathStyle: !!env.S3_ENDPOINT,
-  // SDK v3 defaults to adding CRC32 checksum query params on every PUT; MinIO
-  // rejects the resulting presigned URL with SignatureDoesNotMatch. Real AWS
-  // accepts it either way, so "WHEN_REQUIRED" is safe everywhere.
   requestChecksumCalculation: 'WHEN_REQUIRED',
   responseChecksumValidation: 'WHEN_REQUIRED',
   credentials: credentialsConfigured
@@ -33,11 +28,6 @@ function getBucket(): string {
   return env.S3_BUCKET;
 }
 
-/**
- * S3 keys: `{keyPrefix}/inquiries/YYYY/MM/{nanoid}-{filename}`. The prefix is
- * the brand's top-level folder so each tenant is cleanly separated inside the
- * shared bucket — admins browsing the AWS console see one folder per domain.
- */
 function buildKey(keyPrefix: string, originalName: string): string {
   const now = new Date();
   const year = now.getUTCFullYear();
@@ -51,11 +41,10 @@ function buildKey(keyPrefix: string, originalName: string): string {
   return `${keyPrefix}/inquiries/${year}/${month}/${nanoid(12)}-${safeName}`;
 }
 
-const UPLOAD_EXPIRY_SECONDS = 60 * 5; // 5 min
-const DOWNLOAD_EXPIRY_SECONDS = 60 * 10; // 10 min
+const UPLOAD_EXPIRY_SECONDS = 60 * 5;
+const DOWNLOAD_EXPIRY_SECONDS = 60 * 10;
 
 export async function signUpload(opts: {
-  /** Per-company S3 folder (from request.company.keyPrefix). */
   keyPrefix: string;
   filename: string;
   contentType: string;
@@ -63,11 +52,6 @@ export async function signUpload(opts: {
 }): Promise<{ uploadUrl: string; key: string; expiresIn: number }> {
   const bucket = getBucket();
   const key = buildKey(opts.keyPrefix, opts.filename);
-  // ContentType is signed (browser must PUT with the same header). We
-  // deliberately omit ContentLength: signing it would lock the upload to the
-  // declared size, which trips up real-world uploads where the browser sends
-  // a slightly different Content-Length. Size is already capped at sign time
-  // via the route's schema.
   const cmd = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -77,19 +61,11 @@ export async function signUpload(opts: {
   return { uploadUrl, key, expiresIn: UPLOAD_EXPIRY_SECONDS };
 }
 
-/**
- * Direct server-side upload. Used by the export worker — we generate a CSV
- * server-side then push it to S3 at a known key. Returns the key so the
- * caller can store it alongside the export-job row.
- *
- * Keys: `{keyPrefix}/exports/{slug}-{date}.{ext}`.
- */
 export async function putExportObject(opts: {
   keyPrefix: string;
   filenameBase: string;
   contentType: string;
   body: Buffer | string;
-  /** Optional content-disposition filename suggestion. */
   downloadFilename?: string;
 }): Promise<{ key: string; sizeBytes: number }> {
   const bucket = getBucket();
@@ -117,7 +93,6 @@ export async function putExportObject(opts: {
   return { key, sizeBytes: body.length };
 }
 
-/** Sign a download URL for an already-stored object. Used to serve exports. */
 export async function signObjectDownload(opts: {
   key: string;
   expiresIn?: number;
@@ -130,14 +105,10 @@ export async function signObjectDownload(opts: {
 }
 
 export async function signDownload(opts: {
-  /** Per-company S3 folder (from request.company.keyPrefix). */
   keyPrefix: string;
   key: string;
 }): Promise<{ downloadUrl: string; expiresIn: number }> {
   const bucket = getBucket();
-  // Defense in depth: the route is already company-scoped, but double-check
-  // the requested key actually sits inside the caller's folder so a
-  // fabricated key can never read another tenant's data.
   const expectedPrefix = `${opts.keyPrefix}/`;
   if (!opts.key.startsWith(expectedPrefix)) {
     throw new Error(`Key "${opts.key}" does not belong to this tenant.`);

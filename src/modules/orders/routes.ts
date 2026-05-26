@@ -10,6 +10,7 @@ import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/servic
 import {
   isStatusEmailableStatus,
   newOrderAdminEmail,
+  appointmentConfirmedEmail,
   orderConfirmationEmail,
   orderStatusUpdateEmail,
 } from '../../email/templates.js';
@@ -33,32 +34,25 @@ import {
 } from './pricing-input.js';
 import { evaluateCancellation, type CancellationDecision } from './cancellation.js';
 
-// Human labels for emails / admin UI.
 const KIND_LABEL: Record<string, string> = {
   teppichreinigung: 'Teppichreinigung',
   teppichreparatur: 'Teppichreparatur',
   polsterreinigung: 'Polsterreinigung (Vor-Ort)',
+  teppichbodenreinigung: 'Teppichbodenreinigung (Vor-Ort)',
 };
 
 function orderNumberFor(id: number): string {
-  // Six-digit zero-padded counter behind the year. Sequential is fine — we
-  // already have a serial PK; the year prefix gives operators a quick visual.
   const year = new Date().getUTCFullYear();
   return `${year}/${String(id).padStart(6, '0')}`;
 }
 
-// ---------------------------------------------------------------------------
-//  Customer status-change notifications (ALL_10)
-//
-//  Called from both the admin /transition route and the /cancel route. Sends
-//  one email per status flip using the per-status copy registry in
-//  templates.ts. Failure here is intentionally swallowed — the status flip
-//  itself already succeeded; we only log so ops can alert on a backlog.
-//
-//  Skipped statuses (we don't email on these):
-//    - pending / payment_pending: no useful info for customer yet
-//    - paid: already covered by the rich orderConfirmationEmail at checkout
-// ---------------------------------------------------------------------------
+/** "YYYY-MM-DDTHH:mm" → "DD.MM.YYYY · HH:mm Uhr" for German display. */
+function formatSlotDe(slot: string): string {
+  const [d, t] = slot.split('T');
+  const [y, m, day] = (d ?? '').split('-');
+  if (!y || !m || !day) return slot;
+  return `${day}.${m}.${y}${t ? ` · ${t} Uhr` : ''}`;
+}
 
 interface NotifyCustomerArgs {
   log: { error: (obj: object, msg?: string) => void };
@@ -72,15 +66,12 @@ interface NotifyCustomerArgs {
   };
   fromStatus: OrderStatus;
   toStatus: OrderStatus;
-  /** Only meaningful for cancelled / refunded transitions. */
   refundCents?: number;
 }
 
 async function notifyCustomerStatusChange(args: NotifyCustomerArgs): Promise<void> {
-  // Skip statuses where the customer doesn't benefit from a message OR where
-  // a different (richer) template already fires.
   if (!isStatusEmailableStatus(args.toStatus)) return;
-  if (args.toStatus === args.fromStatus) return; // shouldn't happen, but defensive
+  if (args.toStatus === args.fromStatus) return;
 
   try {
     const [companyRow] = await db
@@ -115,17 +106,9 @@ async function notifyCustomerStatusChange(args: NotifyCustomerArgs): Promise<voi
   }
 }
 
-// ---------------------------------------------------------------------------
-// Public storefront routes — no auth, X-Company-Slug resolves the tenant.
-// Mounted at /storefront/orders.
-// ---------------------------------------------------------------------------
-
 export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
 
-  // ---- POST /quote ---------------------------------------------------------
-  // Stateless price preview. The storefront calls this on every wizard step so
-  // the customer sees the up-to-date total. No DB, no Stripe.
   app.post(
     '/quote',
     { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
@@ -144,9 +127,6 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // ---- POST /checkout ------------------------------------------------------
-  // Creates a DRAFT order + Stripe Checkout Session. On Stripe success we flip
-  // the order to "paid" via the webhook. The client redirects to session.url.
   app.post(
     '/checkout',
     { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } },
@@ -158,15 +138,18 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
 
       const body: CheckoutInput = checkoutSchema.parse(request.body);
 
-      // Honeypot — silently 200 without writing anything.
       if (body.website && body.website.trim().length > 0) {
         reply.code(200).send({ ok: true, checkoutUrl: null });
         return;
       }
 
-      // Polster requires a preferred date for the on-site appointment.
-      if (body.kind === 'polsterreinigung' && !body.preferredDate) {
-        reply.code(400).send({ error: 'preferredDate ist für Polsterreinigung erforderlich' });
+      if (
+        (body.kind === 'polsterreinigung' || body.kind === 'teppichbodenreinigung') &&
+        (!body.preferredSlots || body.preferredSlots.length === 0)
+      ) {
+        reply
+          .code(400)
+          .send({ error: 'Mindestens ein Wunschtermin ist für den Vor-Ort-Service erforderlich' });
         return;
       }
 
@@ -176,8 +159,6 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
 
-      // Re-run pricing server-side. Clients only submit a configuration, never
-      // a price — this is the source-of-truth for what we charge.
       const quote = priceOrder(toServiceInput(body), book);
       if (quote.outOfArea || quote.lines.length === 0 || quote.totalCents <= 0) {
         reply.code(400).send({
@@ -186,7 +167,6 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
 
-      // Pull the company row for sender/branding + admin URL.
       const [companyRow] = await db
         .select()
         .from(company)
@@ -196,32 +176,38 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
 
       const { orders, orderItems, orderStatusLog } = request.company!.tables;
       const publicToken = generateOrderToken();
-      const pickupMode = body.kind === 'polsterreinigung' ? 'onsite' : body.pickupMode;
+      const pickupMode =
+        body.kind === 'polsterreinigung' || body.kind === 'teppichbodenreinigung'
+          ? 'onsite'
+          : body.pickupMode;
 
-      // Address only for pickup / onsite — drop_off has no shipping address.
       const addressForOrder =
-        body.kind === 'polsterreinigung'
+        body.kind === 'polsterreinigung' || body.kind === 'teppichbodenreinigung'
           ? body.address
           : body.pickupMode === 'pickup'
             ? body.address
             : undefined;
 
-      // PLZ + zone are derived from the priced quote, not the body, to keep
-      // the engine the single source of truth.
       const pickupPlz =
-        body.kind === 'polsterreinigung'
+        body.kind === 'polsterreinigung' || body.kind === 'teppichbodenreinigung'
           ? body.addressPlz
           : body.pickupMode === 'pickup'
             ? body.pickupPlz
             : null;
+      const pickupCoords =
+        body.kind === 'polsterreinigung' || body.kind === 'teppichbodenreinigung'
+          ? body.addressCoords
+          : body.pickupMode === 'pickup'
+            ? body.pickupCoords
+            : undefined;
       const pickupZone =
         pickupPlz && !quote.outOfArea
-          ? (await import('../../lib/pickup-zones.js')).resolvePickupZone(pickupPlz).zone
+          ? (await import('../../lib/pickup-zones.js')).resolvePickupZone(pickupPlz, pickupCoords)
+              .zone
           : null;
 
       const now = new Date();
 
-      // Insert order + items + status-log atomically.
       const orderRow = await db.transaction(async (tx) => {
         const inserted = await tx
           .insert(orders)
@@ -238,7 +224,11 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
             pickupZone: pickupZone ?? null,
             pickupPlz: pickupPlz ?? null,
             pickupLabel: quote.pickupLabel,
-            preferredDate: body.preferredDate ?? null,
+            preferredDate: body.preferredSlots?.[0]?.slice(0, 10) ?? body.preferredDate ?? null,
+            metadata:
+              body.preferredSlots && body.preferredSlots.length > 0
+                ? { preferredSlots: body.preferredSlots }
+                : {},
             customerName: body.customer.name,
             customerEmail: body.customer.email,
             customerPhone: body.customer.phone ?? null,
@@ -281,13 +271,23 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return order;
       });
 
-      // Build Stripe line items. We bundle the entire order into ONE Stripe
-      // line item priced at totalCents — keeps the receipt clean and avoids
-      // edge cases where Stripe's rounding disagrees with ours. The per-item
-      // breakdown is preserved in our DB and our confirmation email.
       const stripe = getStripe();
       const appBase = env.APP_BASE_URL.replace(/\/$/, '');
       const storefrontOrigin = (companyRow.storefrontOrigin ?? appBase).replace(/\/$/, '');
+
+      if (
+        env.NODE_ENV === 'production' &&
+        /^https?:\/\/(localhost|127\.0\.0\.1)/i.test(storefrontOrigin)
+      ) {
+        request.log.error(
+          { storefrontOrigin, companySlug: request.company!.slug },
+          'Refusing to create Stripe session — storefrontOrigin resolves to localhost in production',
+        );
+        reply.code(503).send({
+          error: 'Checkout temporarily unavailable. Please contact us if this persists.',
+        });
+        return;
+      }
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
         payment_method_types: ['card', 'klarna', 'sepa_debit'],
@@ -317,13 +317,10 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         success_url: `${storefrontOrigin}/buchung/erfolg?token=${publicToken}&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${storefrontOrigin}/buchung/storno?token=${publicToken}`,
         locale: 'de',
-        // 30 min checkout window — long enough for SEPA, short enough to
-        // free up tokens if abandoned.
         expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
         billing_address_collection: 'auto',
       });
 
-      // Stamp the session id + flip to payment_pending.
       await db
         .update(orders)
         .set({
@@ -349,67 +346,53 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // ---- GET /:token ---------------------------------------------------------
-  // Public order tracker — the link in the confirmation email points here.
-  // Returns the order + status log so the customer can see "where is my carpet
-  // right now" without an auth account.
-  app.get('/:token', async (request, reply) => {
-    const token = (request.params as { token: string }).token;
-    if (typeof token !== 'string' || token.length < 8 || token.length > 64) {
-      reply.code(400).send({ error: 'Invalid token' });
-      return;
-    }
-    const { orders, orderItems, orderStatusLog } = request.company!.tables;
-    const [row] = await db.select().from(orders).where(eq(orders.publicToken, token)).limit(1);
-    if (!row) {
-      reply.code(404).send({ error: 'Order not found' });
-      return;
-    }
-    const items = await db.select().from(orderItems).where(eq(orderItems.orderId, row.id));
-    const log = await db
-      .select()
-      .from(orderStatusLog)
-      .where(eq(orderStatusLog.orderId, row.id))
-      .orderBy(desc(orderStatusLog.createdAt));
+  app.get(
+    '/:token',
+    { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const token = (request.params as { token: string }).token;
+      if (typeof token !== 'string' || token.length < 8 || token.length > 64) {
+        reply.code(400).send({ error: 'Invalid token' });
+        return;
+      }
+      const { orders, orderItems, orderStatusLog } = request.company!.tables;
+      const [row] = await db.select().from(orders).where(eq(orders.publicToken, token)).limit(1);
+      if (!row) {
+        reply.code(404).send({ error: 'Order not found' });
+        return;
+      }
+      const items = await db.select().from(orderItems).where(eq(orderItems.orderId, row.id));
+      const log = await db
+        .select()
+        .from(orderStatusLog)
+        .where(eq(orderStatusLog.orderId, row.id))
+        .orderBy(desc(orderStatusLog.createdAt));
 
-    // Strip sensitive fields the public tracker should never expose.
-    const {
-      ipAddress: _i,
-      userAgent: _u,
-      internalNotes: _n,
-      stripeSessionId: _s,
-      stripePaymentIntentId: _p,
-      ...safe
-    } = row;
-    reply.send({
-      order: { ...safe, orderNumber: orderNumberFor(row.id) },
-      items,
-      statusLog: log,
-    });
-  });
+      const {
+        ipAddress: _i,
+        userAgent: _u,
+        internalNotes: _n,
+        stripeSessionId: _s,
+        stripePaymentIntentId: _p,
+        ...safe
+      } = row;
+      reply.send({
+        order: { ...safe, orderNumber: orderNumberFor(row.id) },
+        items,
+        statusLog: log,
+      });
+    },
+  );
 };
 
-// ---------------------------------------------------------------------------
-// Stripe webhook — separate sub-plugin so we can install a buffer-keeping
-// content-type parser inside an isolated Fastify scope. The parent's JSON
-// parser still works for every other route.
-// Mounted at /storefront/orders/webhook.
-// ---------------------------------------------------------------------------
-
 export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
-  // Replace the inherited JSON parser within this plugin scope with one that
-  // keeps the raw bytes. Stripe webhook signature verification requires the
-  // exact payload that was signed — JSON.stringify + re-parse changes byte
-  // order and breaks the HMAC.
   app.removeContentTypeParser('application/json');
   app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (_req, body, done) => {
-    done(null, body); // route receives a Buffer in `request.body`
+    done(null, body);
   });
 
   app.post('/stripe', async (request, reply) => {
     if (!stripeConfigured || !env.STRIPE_WEBHOOK_SECRET) {
-      // Webhook misconfig is a 503, not 400 — Stripe will retry, which is
-      // what we want until ops fix the env.
       reply.code(503).send({ error: 'Stripe webhook not configured' });
       return;
     }
@@ -437,8 +420,6 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
     try {
       await handleStripeEvent(app, event);
     } catch (err) {
-      // Log + return 500 so Stripe retries. The webhook handler is idempotent
-      // (re-fires on a paid order are no-ops) so a retry is safe.
       request.log.error(
         { err, eventType: event.type, eventId: event.id },
         'Stripe webhook handler failed',
@@ -450,11 +431,6 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
     reply.code(200).send({ received: true });
   });
 };
-
-// ---------------------------------------------------------------------------
-// Event dispatch — checkout.session.completed is the happy path. We also
-// handle async_payment_failed (SEPA fail) and refunded to flip statuses.
-// ---------------------------------------------------------------------------
 
 async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Promise<void> {
   switch (event.type) {
@@ -493,12 +469,12 @@ async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Pro
       const charge = event.data.object;
       const pi = typeof charge.payment_intent === 'string' ? charge.payment_intent : null;
       if (!pi) return;
-      await markOrderRefundedByPaymentIntent(app, pi);
+      const refundAmount =
+        typeof charge.amount_refunded === 'number' ? charge.amount_refunded : undefined;
+      await markOrderRefundedByPaymentIntent(app, pi, refundAmount);
       return;
     }
     default:
-      // Ignore other events. Keeping this default explicit prevents accidental
-      // matches on future Stripe additions that look similar.
       return;
   }
 }
@@ -524,8 +500,7 @@ async function markOrderPaid(
     app.log.warn({ orderId, companySlug }, 'Stripe webhook for unknown order');
     return;
   }
-  // Idempotency: webhook may fire multiple times for the same session. If
-  // already paid (or beyond), skip the side-effects.
+
   const isAlreadyAdvanced =
     order.status === 'paid' ||
     order.status === 'accepted' ||
@@ -558,8 +533,6 @@ async function markOrderPaid(
     });
   });
 
-  // Fire emails outside the tx — failure to send doesn't roll back the paid
-  // state. Resend errors are logged inside sendEmail().
   try {
     const items = await db
       .select()
@@ -621,6 +594,19 @@ async function markOrderPaid(
   } catch (err) {
     app.log.error({ err, orderId }, 'Failed to send order confirmation emails');
   }
+
+  try {
+    const { sendPushToBrandAdmins } = await import('../../lib/push.js');
+    await sendPushToBrandAdmins(companySlug, {
+      title: `${companyRow.name} · Neuer Auftrag`,
+      body: `${orderNumberFor(orderId)} · ${order.customerName} · ${formatEurFromCents(order.totalCents)}`,
+      url: `/auftraege?id=${orderId}`,
+      tag: `order:${orderId}`,
+      brandSlug: companySlug,
+    });
+  } catch (err) {
+    app.log.warn({ err, orderId }, 'push dispatch failed for new paid order');
+  }
 }
 
 async function markOrderCancelled(
@@ -641,6 +627,22 @@ async function markOrderCancelled(
     .limit(1);
   if (!order) return;
   if (order.status === 'cancelled' || order.status === 'refunded') return;
+  const paidStatuses: OrderStatus[] = [
+    'paid',
+    'accepted',
+    'picked_up',
+    'in_cleaning',
+    'ready',
+    'delivered',
+    'completed',
+  ];
+  if (paidStatuses.includes(order.status as OrderStatus)) {
+    app.log.warn(
+      { orderId, currentStatus: order.status, reason },
+      'Refusing to cancel an already-paid order from webhook — admin must refund manually',
+    );
+    return;
+  }
   const now = new Date();
   await db.transaction(async (tx) => {
     await tx
@@ -659,9 +661,8 @@ async function markOrderCancelled(
 async function markOrderRefundedByPaymentIntent(
   app: FastifyInstance,
   paymentIntentId: string,
+  refundAmountCents?: number,
 ): Promise<void> {
-  // Refunds can hit any tenant — we look up by stripe_payment_intent_id across
-  // all known schemas. The number of tenants is small, so this is cheap.
   const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
   const { getTenantTables } = await import('../../db/schema/tenant.js');
   const companies = await loadAllActiveCompanies();
@@ -675,6 +676,7 @@ async function markOrderRefundedByPaymentIntent(
     if (!order) continue;
     if (order.status === 'refunded') return;
     const now = new Date();
+    const fromStatus = order.status as OrderStatus;
     await db.transaction(async (tx) => {
       await tx
         .update(tables.orders)
@@ -687,15 +689,24 @@ async function markOrderRefundedByPaymentIntent(
         reason: 'Stripe charge.refunded',
       });
     });
+    void notifyCustomerStatusChange({
+      log: app.log,
+      companySlug: c.slug,
+      order: {
+        id: order.id,
+        orderNumber: orderNumberFor(order.id),
+        customerName: order.customerName,
+        customerEmail: order.customerEmail,
+        publicToken: order.publicToken,
+      },
+      fromStatus,
+      toStatus: 'refunded',
+      refundCents: refundAmountCents,
+    }).catch(() => null);
     return;
   }
   app.log.warn({ paymentIntentId }, 'Refund webhook for unknown payment intent');
 }
-
-// ---------------------------------------------------------------------------
-// Admin routes — list / detail / status transitions.
-// Mounted at /admin/orders. Requires audience=admin (added in routes/admin.ts).
-// ---------------------------------------------------------------------------
 
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -798,8 +809,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // Status transition — validates against the FSM. Refund triggers a Stripe
-  // refund via the API if a PaymentIntent exists.
   app.post('/:id/transition', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { toStatus, reason } = transitionSchema.parse(request.body);
@@ -820,8 +829,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    // Refund: hit Stripe before we flip DB state. If the Stripe call fails
-    // we never commit the refunded status — the admin can retry.
     if (toStatus === 'refunded') {
       if (!row.stripePaymentIntentId) {
         reply.code(400).send({ error: 'Order has no payment intent — cannot refund via Stripe' });
@@ -861,8 +868,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       return u;
     });
 
-    // Customer notification — fire and forget. Failure logged but doesn't
-    // affect the API response (the transition itself already succeeded).
     void notifyCustomerStatusChange({
       log: request.log,
       companySlug: request.company!.slug,
@@ -873,10 +878,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
   });
-
-  // ---- Cancellation (ALL_06) --------------------------------------------
-  // Two-step: GET /preview returns the decision so the UI can show the right
-  // modal copy; POST /cancel applies it (refund + status flip).
 
   app.get('/:id/cancel-preview', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
@@ -929,7 +930,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    // Refund — clamp override to [0, total]. Skip Stripe call if zero.
     const refundCents = Math.min(
       row.totalCents ?? 0,
       Math.max(0, body.refundCentsOverride ?? decision.suggestedRefundCents),
@@ -950,7 +950,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       try {
         await getStripe().refunds.create({
           payment_intent: row.stripePaymentIntentId,
-          amount: refundCents, // omit for full refund? — explicit is safer + supports partial
+          amount: refundCents,
         });
       } catch (err) {
         request.log.error({ err, orderId: id, refundCents }, 'Stripe refund failed');
@@ -987,8 +987,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       return u;
     });
 
-    // Customer notification — fire-and-forget. Reuses the per-status email
-    // pipeline (see notifyCustomerStatusChange in this file).
     void notifyCustomerStatusChange({
       log: request.log,
       companySlug: request.company!.slug,
@@ -1019,5 +1017,201 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
     return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+  });
+  app.post('/:id/confirm-appointment', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { slot } = z
+      .object({ slot: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/) })
+      .parse(request.body);
+    const { orders } = request.company!.tables;
+    const companySlug = request.company!.slug;
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+
+    const meta = row.metadata ?? {};
+    const [updated] = await db
+      .update(orders)
+      .set({
+        preferredDate: slot.slice(0, 10),
+        metadata: { ...meta, confirmedSlot: slot },
+        updatedAt: new Date(),
+      })
+      .where(eq(orders.id, id))
+      .returning();
+    if (!updated) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+
+    try {
+      const [companyRow] = await db
+        .select()
+        .from(company)
+        .where(eq(company.slug, companySlug))
+        .limit(1);
+      if (companyRow) {
+        const trackerUrl = `${(companyRow.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '')}/bestellung?token=${encodeURIComponent(row.publicToken)}`;
+        await sendEmail({
+          to: row.customerEmail,
+          from: brandSender(companyRow),
+          replyTo: companyRow.email ?? undefined,
+          email: appointmentConfirmedEmail({
+            brand: brandInfoFromCompany(companyRow),
+            customerName: row.customerName,
+            orderNumber: orderNumberFor(row.id),
+            trackerUrl,
+            appointmentFormatted: formatSlotDe(slot),
+          }),
+        });
+      }
+    } catch (err) {
+      request.log.error({ err, orderId: id }, 'appointment confirmation email failed');
+    }
+
+    return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+  });
+  app.post('/:id/sync-stripe', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { orders } = request.company!.tables;
+    const companySlug = request.company!.slug;
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+
+    if (!stripeConfigured) {
+      reply.code(503).send({ error: 'Stripe not configured on this server' });
+      return;
+    }
+    if (!row.stripeSessionId) {
+      reply.code(400).send({
+        error: 'Order has no Stripe session — it was likely cancelled before checkout could start.',
+      });
+      return;
+    }
+
+    let session: Stripe.Checkout.Session;
+    try {
+      session = await getStripe().checkout.sessions.retrieve(row.stripeSessionId);
+    } catch (err) {
+      request.log.error({ err, orderId: id }, 'Stripe session retrieve failed');
+      reply.code(502).send({ error: 'Could not reach Stripe' });
+      return;
+    }
+
+    const paid =
+      session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+
+    const terminalStatuses: OrderStatus[] = [
+      'paid',
+      'accepted',
+      'picked_up',
+      'in_cleaning',
+      'ready',
+      'delivered',
+      'completed',
+      'cancelled',
+      'refunded',
+    ];
+    if (terminalStatuses.includes(row.status as OrderStatus)) {
+      reply.send({
+        order: { ...row, orderNumber: orderNumberFor(row.id) },
+        stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
+        action: 'noop',
+      });
+      return;
+    }
+
+    if (paid) {
+      await markOrderPaid(app, companySlug, id, session);
+      const [updated] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+      reply.send({
+        order: updated ? { ...updated, orderNumber: orderNumberFor(updated.id) } : null,
+        stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
+        action: 'marked_paid',
+      });
+      return;
+    }
+
+    if (session.status === 'expired') {
+      await markOrderCancelled(app, companySlug, id, 'Stripe session expired');
+      const [updated] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+      reply.send({
+        order: updated ? { ...updated, orderNumber: orderNumberFor(updated.id) } : null,
+        stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
+        action: 'marked_cancelled',
+      });
+      return;
+    }
+
+    reply.send({
+      order: { ...row, orderNumber: orderNumberFor(row.id) },
+      stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
+      action: 'still_pending',
+    });
+  });
+};
+
+const crossListQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  status: z
+    .enum([
+      'pending',
+      'payment_pending',
+      'paid',
+      'accepted',
+      'picked_up',
+      'in_cleaning',
+      'ready',
+      'delivered',
+      'completed',
+      'cancelled',
+      'refunded',
+    ])
+    .optional(),
+});
+
+export const ordersAdminCrossRoutes: FastifyPluginAsync = async (app) => {
+  app.get('/orders/all', async (request) => {
+    const { limit, status } = crossListQuerySchema.parse(request.query);
+    const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
+    const { getTenantTables } = await import('../../db/schema/tenant.js');
+    const companies = await loadAllActiveCompanies();
+
+    type EnrichedOrder = Awaited<ReturnType<typeof fetchOrdersForCompany>>[number];
+    async function fetchOrdersForCompany(c: (typeof companies)[number]) {
+      const tables = getTenantTables(c.schemaName);
+      const where = status ? eq(tables.orders.status, status) : undefined;
+      const rows = await db
+        .select()
+        .from(tables.orders)
+        .where(where)
+        .orderBy(desc(tables.orders.createdAt), desc(tables.orders.id))
+        .limit(limit);
+      return rows.map((r) => ({
+        ...r,
+        orderNumber: orderNumberFor(r.id),
+        companySlug: c.slug,
+        companyName: c.name,
+      }));
+    }
+
+    const perCompany = await Promise.all(companies.map(fetchOrdersForCompany));
+    const all: EnrichedOrder[] = perCompany.flat();
+    all.sort((a, b) => {
+      const t = b.createdAt.getTime() - a.createdAt.getTime();
+      if (t !== 0) return t;
+      return b.id - a.id;
+    });
+    return {
+      orders: all.slice(0, limit),
+      nextCursor: null,
+    };
   });
 };

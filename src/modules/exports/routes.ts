@@ -8,17 +8,6 @@ import { exportJobs, membership } from '../../db/schema/shared.js';
 import { parseIntId } from '../../lib/http-errors.js';
 import { s3Configured, signObjectDownload } from '../../lib/s3.js';
 
-// ---------------------------------------------------------------------------
-//  Admin exports (ALL_74).
-//
-//  Routes:
-//    POST   /admin/exports             — enqueue a job (returns 202 + jobId)
-//    GET    /admin/exports             — list my recent jobs
-//    GET    /admin/exports/:id         — single job status
-//    GET    /admin/exports/:id/download — presigned S3 URL for the result
-//    POST   /admin/exports/:id/cancel   — mark a still-pending job as cancelled
-// ---------------------------------------------------------------------------
-
 const createSchema = z.object({
   companySlug: z.string().min(1).max(63),
   kind: z.enum(['orders', 'inquiries', 'contacts', 'newsletter']),
@@ -64,15 +53,12 @@ export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
         status: 'pending',
       })
       .returning();
-    // 202 because the work happens async — the polling worker picks it up.
     reply.code(202).send({ job: row });
   });
 
   app.get('/', async (request, reply) => {
     const q = listQuerySchema.parse(request.query);
     const userId = request.authUser!.id;
-    // Only show jobs the user requested themselves — keeps the "exports
-    // contain PII" boundary tight.
     const conds = [eq(exportJobs.requestedByUserId, userId)];
     if (q.status !== 'all') conds.push(eq(exportJobs.status, q.status));
     if (q.cursor) {
@@ -140,9 +126,6 @@ export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.post('/:id/cancel', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const userId = request.authUser!.id;
-    // Race-safe: only flip pending → cancelled. If the worker already claimed
-    // it ('processing'), too late, the job will finish and we ignore the
-    // cancel request.
     const [updated] = await db
       .update(exportJobs)
       .set({ status: 'cancelled', completedAt: new Date() })

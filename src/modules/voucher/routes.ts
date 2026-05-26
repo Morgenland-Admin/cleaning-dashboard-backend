@@ -3,23 +3,6 @@ import { z } from 'zod';
 
 import { getStripe, stripeConfigured } from '../../lib/stripe.js';
 
-// ---------------------------------------------------------------------------
-//  Voucher validation (ALL_77).
-//
-//  Storefront endpoint. Validates a customer-entered code against the brand's
-//  Stripe Coupons (each brand uses its own Stripe account, so the lookup is
-//  scoped to the request's company via the existing Stripe client config —
-//  which today is the platform's single account, but the response is
-//  intentionally minimal so we can scope to a Connect account later).
-//
-//  No DB writes. Returns:
-//    - valid: true + discountCents
-//    - valid: false + reasonCode (not_found | expired | redeemed | inactive)
-//
-//  Rate limit: 20/min/IP — generous for legitimate UX (typo, paste, retry)
-//  but cuts code-stuffing attacks.
-// ---------------------------------------------------------------------------
-
 const validateSchema = z.object({
   code: z
     .string()
@@ -27,7 +10,6 @@ const validateSchema = z.object({
     .min(2)
     .max(80)
     .regex(/^[A-Z0-9_-]+$/i, 'Code may only contain letters, digits, _, -'),
-  /** Total cents before discount — used to convert percent-off into a cents value. */
   subtotalCents: z.number().int().min(0).max(10_000_000),
 });
 
@@ -39,8 +21,6 @@ export const voucherPublicRoutes: FastifyPluginAsync = async (app) => {
     { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
     async (request, reply) => {
       if (!stripeConfigured) {
-        // Without Stripe we can't validate — treat as no-vouchers-available.
-        // 200 + valid:false keeps the client UX consistent (no error toast).
         reply.send({
           valid: false,
           reasonCode: 'inactive',
@@ -52,9 +32,6 @@ export const voucherPublicRoutes: FastifyPluginAsync = async (app) => {
       const code = body.code.toUpperCase();
 
       try {
-        // We allow both Promotion Codes (customer-facing strings) AND raw
-        // Coupon IDs. Promotion Codes are the better UX — they decouple the
-        // user-typed string from the underlying coupon.
         const promo = await getStripe().promotionCodes.list({
           code,
           active: true,
@@ -92,10 +69,6 @@ export const voucherPublicRoutes: FastifyPluginAsync = async (app) => {
           return;
         }
 
-        // PromotionCode → promotion.coupon can be a string id (un-expanded)
-        // or the full Coupon object. We always need the full object; if it's
-        // just an id, fetch it explicitly. This is the only case where
-        // we make a second Stripe call.
         let coupon = promoCode.promotion.coupon;
         if (coupon == null) {
           reply.send({
@@ -111,7 +84,6 @@ export const voucherPublicRoutes: FastifyPluginAsync = async (app) => {
 
         let discountCents = 0;
         if (typeof coupon.amount_off === 'number') {
-          // amount_off is in the currency's smallest unit (cents for EUR).
           discountCents = Math.min(coupon.amount_off, body.subtotalCents);
         } else if (typeof coupon.percent_off === 'number') {
           discountCents = Math.floor((body.subtotalCents * coupon.percent_off) / 100);
@@ -129,8 +101,6 @@ export const voucherPublicRoutes: FastifyPluginAsync = async (app) => {
           valid: true,
           discountCents,
           code,
-          // Echo the promo-code id so the checkout endpoint can apply it
-          // server-side without a second Stripe round-trip.
           promotionCodeId: promoCode.id,
           message:
             typeof coupon !== 'string' && typeof coupon.percent_off === 'number'
@@ -141,8 +111,6 @@ export const voucherPublicRoutes: FastifyPluginAsync = async (app) => {
                 })}`,
         });
       } catch (err) {
-        // Stripe lookup failed (network, auth) — fail-closed so we never
-        // grant a discount we can't validate.
         request.log.error({ err, code }, 'voucher lookup failed');
         reply.code(502).send({
           valid: false,

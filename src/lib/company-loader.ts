@@ -61,7 +61,6 @@ export async function loadAllActiveCompanies(): Promise<CompanyRow[]> {
   const rows = await db.select().from(company).where(eq(company.isActive, true));
   const normalized = rows.map(normalize);
   allCache = { rows: normalized, expiresAt: Date.now() + TTL_MS };
-  // Warm the per-slug cache too so subsequent loadCompany() calls hit it.
   for (const r of normalized) {
     cache.set(r.slug, { value: r, expiresAt: Date.now() + TTL_MS });
   }

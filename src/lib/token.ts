@@ -1,14 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { env } from '../config/env.js';
 
-/**
- * Stateless signed tokens for newsletter unsubscribe (and similar). Format:
- *   base64url(payload).base64url(hmac)
- * Payload encodes the data we need to identify the row + action; the HMAC
- * binds it to BETTER_AUTH_SECRET so it can't be forged. No DB row needed,
- * so no migration to add an `unsubscribe_token` column per tenant schema.
- */
-
 function b64urlEncode(buf: Buffer): string {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
@@ -23,9 +15,7 @@ function hmac(payload: string): Buffer {
 }
 
 export interface UnsubPayload {
-  /** Tenant schema's newsletter row id. */
   id: number;
-  /** Company slug — needed to know which tenant schema to update. */
   slug: string;
 }
 
@@ -62,7 +52,7 @@ export function verifyUnsubscribeToken(token: string): UnsubPayload | null {
   return null;
 }
 
-/** Random URL-safe token for double-opt-in confirmation. Stored in DB. */
+/** Random URL-safe token for double-opt-in confirmation. */
 export function randomConfirmToken(): string {
   return b64urlEncode(randomBytes(24));
 }

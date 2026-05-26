@@ -13,9 +13,7 @@ const switchSchema = z.object({ slug: z.string().min(1) });
 const createCompanySchema = z.object({
   slug: z.string().min(2).max(63),
   name: z.string().min(1).max(200),
-  /** Defaults to `slug` if omitted. Must satisfy isValidSchemaName. */
   schemaName: z.string().min(2).max(63).optional(),
-  /** S3 folder. Defaults to slug with `_` -> `-`. */
   keyPrefix: z.string().min(2).max(63).optional(),
   storefrontOrigin: z.string().url().optional(),
   senderEmail: z.string().email().optional(),
@@ -32,8 +30,6 @@ const createCompanySchema = z.object({
 const companiesRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAuth);
 
-  // List companies this user has access to. Returns the full set of editable
-  // fields so the admin UI can pre-fill the edit form without a second fetch.
   app.get('/', async (request) => {
     const userId = request.authUser!.id;
     const rows = await db
@@ -67,9 +63,6 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     return { companies: rows };
   });
 
-  // Create a new company. super_admin only. This is what makes the multi-tenant
-  // model truly dynamic — inserting a `company` row + provisioning its
-  // Postgres schema + tables, all from an authenticated request.
   app.post('/', { preHandler: app.requireAccess('super_admin') }, async (request, reply) => {
     const body = createCompanySchema.parse(request.body);
     if (!isValidCompanySlug(body.slug)) {
@@ -88,8 +81,6 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
       );
     }
 
-    // Pre-flight uniqueness — surface a friendlier error than a Postgres
-    // constraint violation.
     const [existing] = await db
       .select({ slug: company.slug })
       .from(company)
@@ -97,11 +88,6 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (existing) throw conflict('Company with this slug already exists');
 
-    // Provision schema + insert company row + grant ownership atomically.
-    // If any step fails (e.g. concurrent slug collision past the pre-flight),
-    // Postgres rolls back the schema creation too, so we never leave an
-    // orphaned schema in the registry-less state. The schema SQL is
-    // idempotent (CREATE ... IF NOT EXISTS) so retries are safe.
     const userId = request.authUser!.id;
     const inserted = await db.transaction(async (tx) => {
       await tx.execute(sql.raw(createTenantSchemaSql(schemaName)));
@@ -129,19 +115,11 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     });
 
     invalidateCompany();
-    // Force-refresh the CORS allow-list so the new storefrontOrigin (if any)
-    // is granted access on this instance immediately, not after the 60 s tick.
     void app.refreshCorsOrigins();
     reply.code(201);
     return { company: inserted };
   });
 
-  // Update an existing company's branding / contact / sender details. Limited
-  // to owner-membership on the target (or super_admin). Schema name + slug
-  // + key prefix cannot be changed — they're load-bearing for the tenant
-  // schema and S3 layout.
-  // Editable surface — slug, schemaName, keyPrefix are intentionally NOT here
-  // because they're load-bearing for tenant isolation + S3 layout.
   const updateCompanySchema = z.object({
     name: z.string().min(1).max(200).optional(),
     legalName: z.string().max(200).nullable().optional(),
@@ -198,9 +176,6 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     return { company: updated };
   });
 
-  // Aggregate stats for one brand — powers the brand detail page widgets.
-  // Membership-gated (not super_admin-only) so any user with access to the
-  // brand can see its overview.
   app.get('/:slug/stats', { preHandler: app.requireAudience('admin') }, async (request, reply) => {
     const slug = (request.params as { slug: string }).slug;
     if (!isValidCompanySlug(slug)) throw badRequest('Invalid slug');
@@ -223,11 +198,8 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     if (!companyRow) throw notFound('Company not found');
     const tables = getTenantTables(companyRow.schemaName);
 
-    // 7-day window — created_at indexed, so this is cheap.
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-    // Parallelize per-table queries — Postgres pools handle this fine, and the
-    // serial path would otherwise add 5–10 ms latency per query.
     const [
       [nlConfirmed],
       [nlPending],
@@ -302,7 +274,6 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // Switch active company — stores slug on the session row.
   app.post('/switch', async (request) => {
     const userId = request.authUser!.id;
     const { slug } = switchSchema.parse(request.body);

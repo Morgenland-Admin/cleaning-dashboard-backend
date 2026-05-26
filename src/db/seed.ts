@@ -151,7 +151,6 @@ async function ensureUser(seed: SeedUser) {
   const [existing] = await db.select().from(user).where(eq(user.email, seed.email)).limit(1);
 
   if (existing) {
-    // Existing — keep password as-is, just sync auth metadata.
     const [updated] = await db
       .update(user)
       .set({
@@ -169,7 +168,6 @@ async function ensureUser(seed: SeedUser) {
     return updated;
   }
 
-  // Create via Better Auth so password hashing matches the production flow.
   const created = await auth.api.signUpEmail({
     body: {
       email: seed.email,
@@ -223,8 +221,6 @@ async function ensureUserSettings(userId: string) {
     .values({ userId, locale: 'de', theme: 'system' })
     .onConflictDoNothing();
 }
-
-// ----- Tenant sample data ------------------------------------------------
 
 function daysAgo(n: number): Date {
   return new Date(Date.now() - n * 24 * 60 * 60 * 1000);
@@ -488,7 +484,6 @@ async function seedContacts() {
 }
 
 async function seedInquiries() {
-  // Brand-specific fixtures with realistic form-field metadata.
   const INQUIRY_FIXTURES: Record<
     CompanySlug,
     Array<{
@@ -710,11 +705,6 @@ async function seedInquiries() {
 }
 
 async function main() {
-  // Two modes:
-  //   default        → full bootstrap (schemas, companies, users, then data)
-  //   SEED_DATA_ONLY → just the per-tenant fixtures (newsletter/contact/inquiry).
-  //                    Use this in environments where users/companies are already
-  //                    provisioned and you only need realistic demo rows.
   const dataOnly = process.env.SEED_DATA_ONLY === '1';
 
   if (!dataOnly) {

@@ -23,7 +23,6 @@ export function adminSender(): string {
 }
 
 function formatSender(name: string, email: string): string {
-  // Quote the display name if it contains punctuation Resend may dislike.
   const safeName = name.replace(/[<>",;]/g, '').trim() || email;
   return `${safeName} <${email}>`;
 }
@@ -32,15 +31,9 @@ export interface SendOptions {
   to: string | string[];
   from: string;
   email: RenderedEmail;
-  /** Optional reply-to override (typically a brand support address). */
   replyTo?: string;
 }
 
-/**
- * Send an email via Resend. If RESEND_API_KEY isn't set, the email is logged
- * and treated as a no-op success — so newsletter / contact submissions still
- * work in local dev.
- */
 export async function sendEmail(opts: SendOptions): Promise<{
   ok: boolean;
   skipped?: boolean;

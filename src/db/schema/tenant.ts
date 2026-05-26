@@ -12,8 +12,6 @@ import {
   varchar,
 } from 'drizzle-orm/pg-core';
 
-// Factory that produces an identical set of tables for a given Postgres schema.
-// Each company gets its own Postgres schema; the column structure is shared.
 function buildTenantTables(schemaName: string) {
   const s = pgSchema(schemaName);
 
@@ -56,11 +54,6 @@ function buildTenantTables(schemaName: string) {
       handledAt: timestamp('handled_at', { withTimezone: true }),
       repliedAt: timestamp('replied_at', { withTimezone: true }),
       internalNotes: text('internal_notes'),
-      /**
-       * Brand-specific form fields. Mirrors service_inquiries.metadata — lets each
-       * storefront submit arbitrary extra keys (e.g. carpet size, pickup vs on-site)
-       * without a schema change. Admin UI renders unknown keys via MetadataBlock.
-       */
       metadata: jsonb('metadata').$type<Record<string, unknown>>().notNull().default({}),
       attachments: jsonb('attachments')
         .$type<Array<{ key: string; name: string; size: number; contentType?: string }>>()
@@ -76,7 +69,6 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  /** Admin replies sent in response to a contact message. One contact_messages row → many. */
   const contactReplies = s.table(
     'contact_replies',
     {
@@ -167,12 +159,6 @@ function buildTenantTables(schemaName: string) {
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   });
 
-  /**
-   * Chat conversations between an admin and a partner. One row per partner —
-   * we don't need group chats yet, so the partner's user_id is the conversation
-   * key. `lastMessageAt` + `lastMessagePreview` are denormalized so the inbox
-   * list can render without a per-row aggregate query.
-   */
   const chatConversations = s.table(
     'chat_conversations',
     {
@@ -180,7 +166,6 @@ function buildTenantTables(schemaName: string) {
       partnerUserId: text('partner_user_id').notNull(),
       lastMessageAt: timestamp('last_message_at', { withTimezone: true }),
       lastMessagePreview: text('last_message_preview'),
-      /** Per-side unread counters — incremented on send, zeroed on mark-read. */
       unreadForAdmin: integer('unread_for_admin').notNull().default(0),
       unreadForPartner: integer('unread_for_partner').notNull().default(0),
       createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -191,12 +176,6 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  /**
-   * Individual messages inside a conversation. `senderUserId` references the
-   * sender (admin or partner). `readAt` is set when the recipient's chat is
-   * focused on this thread — drives the "Gelesen" indicator on outgoing
-   * bubbles. Attachments are S3 keys, same shape as the inquiry attachments.
-   */
   const chatMessages = s.table(
     'chat_messages',
     {
@@ -205,7 +184,7 @@ function buildTenantTables(schemaName: string) {
         .notNull()
         .references(() => chatConversations.id, { onDelete: 'cascade' }),
       senderUserId: text('sender_user_id').notNull(),
-      senderRole: varchar('sender_role', { length: 16 }).notNull(), // admin | partner
+      senderRole: varchar('sender_role', { length: 16 }).notNull(),
       body: text('body'),
       attachments: jsonb('attachments')
         .$type<Array<{ key: string; name: string; size: number; contentType?: string }>>()
@@ -221,52 +200,30 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  /**
-   * Paid customer orders. One row per checkout. Order details (line items)
-   * live in `order_items`; lifecycle transitions are recorded in
-   * `order_status_log` for auditability + ALL_10-style customer notifications.
-   *
-   * Status FSM (matches workflow ALL_09):
-   *   pending → payment_pending → paid → accepted → picked_up
-   *           → in_cleaning → ready → delivered → completed
-   *   any → cancelled | refunded
-   *
-   * `kind` keys into the pricing engine (lib/pricing.ts) — never present a
-   * kind here that the engine doesn't understand.
-   */
   const orders = s.table(
     'orders',
     {
       id: serial('id').primaryKey(),
-      /** URL-safe random token for the public /bestellung/[token] tracker. */
       publicToken: text('public_token').notNull().unique(),
       kind: varchar('kind', { length: 32 }).notNull(),
       status: varchar('status', { length: 24 }).notNull().default('pending'),
 
-      // Money — all in cents, EUR, inkl. 19% MwSt. Stripe is the system of
-      // record but we store snapshots so admin can render an invoice without
-      // re-hitting Stripe.
       currency: varchar('currency', { length: 3 }).notNull().default('EUR'),
       subtotalCents: integer('subtotal_cents').notNull(),
       pickupFeeCents: integer('pickup_fee_cents').notNull().default(0),
       minOrderTopUpCents: integer('min_order_top_up_cents').notNull().default(0),
       totalCents: integer('total_cents').notNull(),
 
-      // Pickup / delivery
-      pickupMode: varchar('pickup_mode', { length: 16 }).notNull(), // pickup | drop_off | onsite
+      pickupMode: varchar('pickup_mode', { length: 16 }).notNull(),
       pickupZone: integer('pickup_zone'),
       pickupPlz: varchar('pickup_plz', { length: 5 }),
       pickupLabel: text('pickup_label'),
-      /** YYYY-MM-DD — customer's requested date (Polster) or earliest pickup. */
       preferredDate: date('preferred_date'),
 
-      // Customer contact (no auth account — guest checkout)
       customerName: text('customer_name').notNull(),
       customerEmail: text('customer_email').notNull(),
       customerPhone: varchar('customer_phone', { length: 32 }),
 
-      // Pickup address (Teppichreinigung / Teppichreparatur) or service
-      // address (Polsterreinigung). For drop_off mode, may be null.
       addressLine1: text('address_line1'),
       addressLine2: text('address_line2'),
       addressCity: text('address_city'),
@@ -276,12 +233,9 @@ function buildTenantTables(schemaName: string) {
       customerNotes: text('customer_notes'),
       internalNotes: text('internal_notes'),
 
-      // Stripe linkage
       stripeSessionId: text('stripe_session_id'),
       stripePaymentIntentId: text('stripe_payment_intent_id'),
 
-      // Lifecycle timestamps — one per status. Sparser than a log table but
-      // fast to query for dashboards.
       paidAt: timestamp('paid_at', { withTimezone: true }),
       acceptedAt: timestamp('accepted_at', { withTimezone: true }),
       pickedUpAt: timestamp('picked_up_at', { withTimezone: true }),
@@ -292,7 +246,6 @@ function buildTenantTables(schemaName: string) {
       cancelledAt: timestamp('cancelled_at', { withTimezone: true }),
       refundedAt: timestamp('refunded_at', { withTimezone: true }),
 
-      /** Admin user who most-recently advanced the order. */
       handledByUserId: text('handled_by_user_id'),
 
       consentPrivacy: boolean('consent_privacy').notNull().default(false),
@@ -301,7 +254,6 @@ function buildTenantTables(schemaName: string) {
       locale: varchar('locale', { length: 16 }).notNull().default('de'),
       source: varchar('source', { length: 64 }),
 
-      /** Brand-specific extras (e.g. Polster appointment window preference). */
       metadata: jsonb('metadata').$type<Record<string, unknown>>().notNull().default({}),
 
       ipAddress: text('ip_address'),
@@ -317,11 +269,6 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  /**
-   * Line items for an order. Stored after pricing engine ran — these are the
-   * exact lines we sent to Stripe and they're what the customer + admin see
-   * on the invoice. Quantity is `numeric` to support 2.5 qm / 1.5 lfdm.
-   */
   const orderItems = s.table(
     'order_items',
     {
@@ -329,7 +276,6 @@ function buildTenantTables(schemaName: string) {
       orderId: integer('order_id')
         .notNull()
         .references(() => orders.id, { onDelete: 'cascade' }),
-      /** Machine code (e.g. "carpet.orient", "addon.motten"). See pricing.ts. */
       code: varchar('code', { length: 64 }).notNull(),
       label: text('label').notNull(),
       quantityLabel: text('quantity_label').notNull(),
@@ -344,11 +290,6 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  /**
-   * Append-only status transition log. Lets admin review "who moved this to
-   * ready, when, and why" without scraping email history. System transitions
-   * (Stripe webhook flipping pending → paid) have changedByUserId = null.
-   */
   const orderStatusLog = s.table(
     'order_status_log',
     {
@@ -384,13 +325,7 @@ function buildTenantTables(schemaName: string) {
 
 export type TenantTables = ReturnType<typeof buildTenantTables>;
 
-/**
- * Dynamic accessor: returns Drizzle table bindings for any Postgres schema
- * name. Memoized so repeated lookups (e.g. per-request) reuse the same
- * objects. This is what makes admin-created companies work without a code
- * change — when a new `company` row lands in the registry with its own
- * `schemaName`, routes can resolve table bindings for it on demand.
- */
+/** Memoized accessor — admin-created companies resolve their tables at runtime. */
 const tenantCache = new Map<string, TenantTables>();
 export function getTenantTables(schemaName: string): TenantTables {
   let cached = tenantCache.get(schemaName);
@@ -401,10 +336,6 @@ export function getTenantTables(schemaName: string): TenantTables {
   return cached;
 }
 
-// Static named exports for the three legacy schemas — kept so drizzle-kit's
-// schema scanner discovers them when generating migrations. New companies
-// added via the admin UI get their tables created at runtime via raw SQL
-// in createTenantSchemaSql() below, not via drizzle migrations.
 const _cleanilo = getTenantTables('cleanilo');
 const _hamburg = getTenantTables('hamburg_teppichreinigung');
 const _teppichreinigenLassen = getTenantTables('teppichreinigen_lassen');
@@ -431,16 +362,6 @@ export const teppichreinigenLassenContactReplies = _teppichreinigenLassen.contac
 export const teppichreinigenLassenServiceInquiries = _teppichreinigenLassen.serviceInquiries;
 export const teppichreinigenLassenPartners = _teppichreinigenLassen.partners;
 
-/**
- * SQL template that creates the per-tenant tables inside a freshly-created
- * Postgres schema. Used by POST /admin/companies to provision a new
- * tenant without requiring a drizzle migration generation step. Keep this
- * in sync with buildTenantTables() above — these are the same five tables.
- *
- * The schemaName is interpolated directly into the SQL because Postgres
- * identifiers cannot be parameterized. Callers must already have validated
- * the schema name (see `isValidSchemaName` in src/config/companies.ts).
- */
 export function createTenantSchemaSql(schemaName: string): string {
   const q = `"${schemaName}"`;
   return `

@@ -93,8 +93,6 @@ function button(href: string, label: string, accent = '#bd5b3e'): string {
   </table>`;
 }
 
-// --- Templates ------------------------------------------------------------
-
 export interface RenderedEmail {
   subject: string;
   html: string;
@@ -541,14 +539,6 @@ export function contactAckEmail(opts: {
   };
 }
 
-// ---------------------------------------------------------------------------
-//  Per-status order update email (ALL_10).
-//
-//  One template + a status copy registry. To add a new status, add a row to
-//  STATUS_COPY — the call site doesn't need to change. Cancelled + refunded
-//  branches accept an extra `refundFormatted` line.
-// ---------------------------------------------------------------------------
-
 type StatusKey =
   | 'accepted'
   | 'picked_up'
@@ -661,9 +651,32 @@ export function orderStatusUpdateEmail(opts: {
   };
 }
 
-// ---------------------------------------------------------------------------
-//  Tasks notifications (ALL_103) — system emails, ADMIN_BRAND header.
-// ---------------------------------------------------------------------------
+export function appointmentConfirmedEmail(opts: {
+  brand: BrandInfo;
+  customerName: string;
+  orderNumber: string;
+  trackerUrl: string;
+  appointmentFormatted: string;
+}): RenderedEmail {
+  return {
+    subject: `Termin bestätigt · ${opts.orderNumber}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `Ihr Vor-Ort-Termin: ${opts.appointmentFormatted}`,
+      contentHtml: `
+        <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
+        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Termin bestätigt</p>
+        <p style="margin:0 0 16px;font-size:16px;font-weight:600;">${escapeHtml(opts.brand.name)} — ${escapeHtml(opts.orderNumber)}</p>
+        <p style="margin:0 0 16px;font-size:14px;">wir haben Ihren Vor-Ort-Termin bestätigt:</p>
+        <p style="margin:0 0 16px;padding:14px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:16px;font-weight:600;">${escapeHtml(opts.appointmentFormatted)}</p>
+        <p style="margin:0 0 16px;font-size:14px;">Sollte der Termin nicht passen, antworten Sie einfach auf diese E-Mail oder rufen Sie uns an — wir finden eine Alternative.</p>
+        ${button(opts.trackerUrl, 'Auftrag ansehen', opts.brand.primaryColor)}
+        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">Wir freuen uns auf Ihren Termin.</p>
+      `,
+      footerNote: `Terminbestätigung zu Ihrem Auftrag bei ${opts.brand.domain}.`,
+    }),
+  };
+}
 
 const PRIORITY_LABEL: Record<string, string> = {
   low: 'niedrig',

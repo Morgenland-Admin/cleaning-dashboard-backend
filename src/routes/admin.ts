@@ -10,14 +10,12 @@ import { inquiriesAdminRoutes } from '../modules/inquiries/routes.js';
 import { partnersAdminRoutes } from '../modules/partners/routes.js';
 import { uploadsAdminRoutes } from '../modules/uploads/routes.js';
 import { invitesAdminRoutes } from '../modules/invites/routes.js';
-import { ordersAdminRoutes } from '../modules/orders/routes.js';
+import { ordersAdminCrossRoutes, ordersAdminRoutes } from '../modules/orders/routes.js';
 import exportsAdminRoutes from '../modules/exports/routes.js';
 import pushAdminRoutes from '../modules/push/routes.js';
 import { qrAdminRoutes } from '../modules/qr/routes.js';
 import tasksAdminRoutes from '../modules/tasks/routes.js';
 
-// Admin dashboard: requires audience=admin. Granular RBAC via app.requireAccess(...)
-// can be layered onto individual routes as the dashboard grows.
 const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
 
@@ -32,6 +30,7 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
   await app.register(uploadsAdminRoutes, { prefix: '/uploads' });
   await app.register(invitesAdminRoutes, { prefix: '/invites' });
   await app.register(chatAdminRoutes, { prefix: '/chat' });
+  await app.register(ordersAdminCrossRoutes);
   await app.register(ordersAdminRoutes, { prefix: '/orders' });
   await app.register(pushAdminRoutes, { prefix: '/push' });
   await app.register(tasksAdminRoutes, { prefix: '/tasks' });

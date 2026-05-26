@@ -31,10 +31,42 @@ export const cleaniloBook: PriceBook = {
     dropOffLabel: 'Selbst-Abgabe Werkstatt Hamburg-Speicherstadt · kostenlos',
   },
 
-  // On-site Polsterreinigung is Hamburg-only. CLEANILO partner network is
-  // still being built per city — until then the storefront should route
-  // Polster requests to the Anfrage form.
   upholstery: null,
+
+  teppichbodenCleaning: {
+    prices: {
+      basis: {
+        bis_30: 18500,
+        bis_50: 29000,
+        bis_75: 43000,
+        bis_100: 56000,
+        bis_125: 69000,
+        bis_150: 82000,
+        ab_150: null,
+      },
+      standard: {
+        bis_30: 24900,
+        bis_50: 39000,
+        bis_75: 59000,
+        bis_100: 79000,
+        bis_125: 99000,
+        bis_150: 119000,
+        ab_150: null,
+      },
+      premium: {
+        bis_30: 34900,
+        bis_50: 59000,
+        bis_75: 89000,
+        bis_100: 119000,
+        bis_125: 149000,
+        bis_150: 179000,
+        ab_150: null,
+      },
+    },
+    tierLabels: hamburgBook.teppichbodenCleaning!.tierLabels,
+    tierDescriptions: hamburgBook.teppichbodenCleaning!.tierDescriptions,
+    bracketLabels: hamburgBook.teppichbodenCleaning!.bracketLabels,
+  },
 
   addons: hamburgBook.addons,
 };

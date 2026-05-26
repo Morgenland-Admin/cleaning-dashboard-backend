@@ -7,30 +7,12 @@ import { db } from '../../db/index.js';
 import { company } from '../../db/schema/shared.js';
 import { parseIntId } from '../../lib/http-errors.js';
 
-// ---------------------------------------------------------------------------
-//  QR codes for orders (ALL_98).
-//
-//  Two surfaces:
-//    1. Admin/operator: GET /admin/qr/order/:id?format=png|svg|json
-//       — generates a QR encoding `<APP_BASE_URL>/q/<publicToken>`. The
-//         partner sticks the PNG on the carpet during pickup.
-//    2. Public scan: GET /storefront/q/:token
-//       — minimal landing returning order status + customer last name + items.
-//         No auth needed, but only the public token is exposed so we don't
-//         leak the order ID space.
-// ---------------------------------------------------------------------------
-
-// Shared visual settings — applied to all three output formats. We don't
-// type this as one of QRCode's per-method option types because each method
-// has its own slightly-different union; the underlying shape is identical.
 const QR_BASE = {
   errorCorrectionLevel: 'M' as const,
   margin: 2,
   width: 512,
   color: { dark: '#1a1a1a', light: '#ffffff' },
 };
-
-// --- Admin: generate ------------------------------------------------------
 
 export const qrAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
@@ -72,7 +54,7 @@ export const qrAdminRoutes: FastifyPluginAsync = async (app) => {
       reply.send(svg);
       return;
     }
-    // Default PNG — partner can print directly from the browser.
+
     const buf = await QRCode.toBuffer(scanUrl, QR_BASE);
     reply.header('Content-Type', 'image/png');
     reply.header('Content-Disposition', `inline; filename="order-${id}-qr.png"`);
@@ -80,19 +62,14 @@ export const qrAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 };
 
-// --- Public scan landing ---------------------------------------------------
-
 export const qrPublicRoutes: FastifyPluginAsync = async (app) => {
-  // No X-Company-Slug — the token is globally unique. We resolve the brand
-  // from the order row.
   app.get('/:token', async (request, reply) => {
     const token = (request.params as { token: string }).token;
     if (!token || token.length < 16 || token.length > 128) {
       reply.code(404).send({ error: 'Not found' });
       return;
     }
-    // Walk every company and look up by publicToken. Cheap because there are
-    // ~3 brands today; if this grows, add a global token registry table.
+
     const companies = await db.select().from(company);
     for (const c of companies) {
       const { getTenantTables } = await import('../../db/schema/tenant.js');
@@ -110,8 +87,6 @@ export const qrPublicRoutes: FastifyPluginAsync = async (app) => {
         .where(eq(tables.orders.publicToken, token))
         .limit(1);
       if (row) {
-        // Strip the customer name to last-only for partial privacy — anyone
-        // with the QR can scan, we don't want to leak the full name.
         const lastNameOnly = row.customerName?.split(/\s+/).slice(-1)[0] ?? '—';
         reply.send({
           brand: { slug: c.slug, name: c.name },

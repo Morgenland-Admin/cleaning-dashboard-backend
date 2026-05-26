@@ -14,7 +14,14 @@
  * DB table without changing the engine signature.
  */
 
-import type { PolsterItem, ReparaturArt, TeppichArt, ZusatzKind } from '../pricing.js';
+import type {
+  PolsterItem,
+  ReparaturArt,
+  TeppichArt,
+  TeppichbodenBracket,
+  TeppichbodenTier,
+  ZusatzKind,
+} from '../pricing.js';
 
 export interface CarpetCleaningBook {
   prices: Record<TeppichArt, number>;
@@ -36,10 +43,23 @@ export interface CarpetRepairBook {
 export interface UpholsteryBook {
   prices: Record<PolsterItem, number>;
   labels: Record<PolsterItem, string>;
-  /** Below this on-site total, Anfahrtspauschale kicks in. */
-  minOnsiteCents: number;
-  /** Flat fee added when on-site total < minOnsiteCents. */
-  anfahrtCents: number;
+  minOrderCents: number;
+}
+
+export interface TeppichbodenBook {
+  /**
+   * Festpreis-Matrix (Cents) je Tier × Flächen-Bracket.
+   *
+   * `null` ⇒ "auf Anfrage" — Engine antwortet mit `outOfArea: true` und
+   * Lead-Gen-Funnel-Reason. Heute der Fall für `ab_150`.
+   */
+  prices: Record<TeppichbodenTier, Record<TeppichbodenBracket, number | null>>;
+  /** Card-Titel ("Basisreinigung", "Standardreinigung", "Premiumreinigung"). */
+  tierLabels: Record<TeppichbodenTier, string>;
+  /** Card-Subtitle / Kurzbeschreibung pro Paket. */
+  tierDescriptions: Record<TeppichbodenTier, string>;
+  /** Anzeige-Labels für Brackets ("bis 30 m²", "ab 150 m²"). */
+  bracketLabels: Record<TeppichbodenBracket, string>;
 }
 
 export interface AddonsBook {
@@ -58,6 +78,8 @@ export interface PriceBook {
   carpetCleaning: CarpetCleaningBook | null;
   carpetRepair: CarpetRepairBook | null;
   upholstery: UpholsteryBook | null;
+  /** Fitted-carpet (fest verlegt) on-site cleaning. null → not offered. */
+  teppichbodenCleaning: TeppichbodenBook | null;
   /** Add-ons attach to carpet lines. If the brand sells carpetCleaning, it
    *  should also expose addons (set to a book; otherwise an empty record). */
   addons: AddonsBook;

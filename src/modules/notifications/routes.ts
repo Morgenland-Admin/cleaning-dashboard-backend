@@ -92,7 +92,6 @@ const notificationsRoutes: FastifyPluginAsync = async (app) => {
     const brands = await accessibleBrands(userId, isSuperAdmin);
     if (brands.length === 0) return { items: [] };
 
-    // Pull per-brand chunks then merge — keeps each query bounded by an index.
     const PER_BRAND = Math.min(limit, 10);
     const perBrand = await Promise.all(
       brands.map(async (b) => {

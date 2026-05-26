@@ -5,11 +5,6 @@ import { db } from '../../db/index.js';
 import { company, membership } from '../../db/schema/shared.js';
 import { getTenantTables } from '../../db/schema/tenant.js';
 
-/**
- * Per-brand stat block returned for every brand the requesting admin can see.
- * Same shape as GET /admin/companies/:slug/stats but batched here so the
- * dashboard doesn't fan out one fetch per brand from the client.
- */
 type BrandStats = {
   slug: string;
   name: string;
@@ -31,19 +26,11 @@ type ActivityItem = {
 };
 
 const dashboardRoutes: FastifyPluginAsync = async (app) => {
-  /**
-   * Single fetch powering the dashboard page. Returns:
-   *   - One stats block per brand the user has access to
-   *   - A merged "recent activity" feed (10 most-recent rows across all
-   *     accessible brands, mixing contact / inquiry / newsletter signups)
-   */
   app.get('/summary', async (request) => {
     const userId = request.authUser!.id;
     const inviterMeta = request.authUser as unknown as { accessLevel?: string };
     const isSuperAdmin = inviterMeta.accessLevel === 'super_admin';
 
-    // Resolve the brand list. Super-admins see every active brand; everyone
-    // else sees the ones they have membership on.
     const accessibleCompanies = isSuperAdmin
       ? await db
           .select({ slug: company.slug, name: company.name, schemaName: company.schemaName })
@@ -65,8 +52,6 @@ const dashboardRoutes: FastifyPluginAsync = async (app) => {
 
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-    // Per-brand stats: 9 COUNT queries each, but fan out across brands so the
-    // total wall-clock is closer to "one brand's worth" rather than NxN.
     const brandStats: BrandStats[] = await Promise.all(
       accessibleCompanies.map(async (c) => {
         const tables = getTenantTables(c.schemaName);
@@ -144,9 +129,6 @@ const dashboardRoutes: FastifyPluginAsync = async (app) => {
       }),
     );
 
-    // Recent activity — pull the latest 5 from each kind per brand, then
-    // merge + sort + slice client-side. Per-brand limit keeps the result set
-    // small even if one brand has 50k contacts.
     const RECENT_PER_BRAND = 5;
     const activityChunks = await Promise.all(
       accessibleCompanies.map(async (c) => {

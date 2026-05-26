@@ -21,11 +21,7 @@ const submitSchema = z.object({
   message: z.string().min(1).max(5000),
   locale: z.string().min(2).max(16).optional(),
   source: z.string().max(64).optional(),
-  /** Brand-specific extra fields (e.g. carpet size, pickup vs on-site). Mirrors
-   * the inquiry endpoint so storefronts can capture form-specific data without
-   * a schema change per brand. */
   metadata: z.record(z.string().max(120), z.unknown()).optional(),
-  /** S3 object refs from /storefront/uploads/sign. Same shape as inquiries. */
   attachments: z
     .array(
       z.object({
@@ -41,7 +37,6 @@ const submitSchema = z.object({
     errorMap: () => ({ message: 'Privacy consent is required' }),
   }),
   consentMarketing: z.boolean().optional(),
-  /** Honeypot field — must be empty for real users. */
   website: z.string().max(200).optional(),
 });
 
@@ -65,14 +60,12 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
     },
     async (request, reply) => {
       const body = submitSchema.parse(request.body);
-      // Honeypot: silently 201 without writing — bots see "success".
+
       if (body.website && body.website.trim().length > 0) {
         reply.code(201);
         return { ok: true, message: null };
       }
-      // Defense in depth: every attachment key must live under this tenant's
-      // S3 folder. Without this an attacker could submit a contact message
-      // referencing an arbitrary S3 key.
+
       if (body.attachments && body.attachments.length > 0) {
         const expectedPrefix = `${request.company!.keyPrefix}/`;
         const bad = body.attachments.find((a) => !a.key.startsWith(expectedPrefix));
@@ -121,8 +114,6 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
                 brand,
               }),
             });
-            // Notify the brand's admin inbox so a new message doesn't sit
-            // unseen until someone happens to open the dashboard.
             if (companyRow.email) {
               const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/contacts?id=${row.id}`;
               await sendEmail({
@@ -142,18 +133,12 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
             }
           }
         } catch (err) {
-          // Log at error level so monitoring can alert on failed customer/admin
-          // notifications — the form submission itself succeeded (row inserted)
-          // so we don't surface this to the user, but ops needs to see it.
           request.log.error(
             { err, contactMessageId: row.id, recipientEmail: row.email },
             'Failed to send contact emails',
           );
         }
 
-        // Fire Web Push to admins with membership in this brand. Silent and
-        // independent of the email branch — if VAPID isn't configured, this is
-        // a no-op.
         try {
           const { sendPushToBrandAdmins } = await import('../../lib/push.js');
           await sendPushToBrandAdmins(request.company!.slug, {
@@ -167,7 +152,6 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
           request.log.warn({ err, contactMessageId: row.id }, 'push dispatch failed');
         }
 
-        // Spawn an operator task — idempotent on (brand, "contact_message", id).
         try {
           const { spawnTask } = await import('../../lib/tasks.js');
           await spawnTask({
@@ -190,7 +174,6 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
   );
 };
 
-// Strip PII fields for viewer-level admins. Manager+ keeps full visibility.
 const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
 
 function redactPii<T extends { ipAddress?: unknown; userAgent?: unknown }>(
@@ -213,8 +196,6 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
     const { limit, cursor } = listQuerySchema.parse(request.query);
     const { contactMessages } = request.company!.tables;
     const decoded = cursor ? decodeCursor(cursor) : null;
-    // Fetch one extra row so we can tell whether there's another page without
-    // a second COUNT(*) query.
     const where = decoded
       ? or(
           lt(contactMessages.createdAt, sql`${decoded.createdAt}::timestamptz`),
@@ -274,7 +255,6 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
     return { message: row };
   });
 
-  // Send a reply email + persist as a conversation row.
   app.post('/:id/reply', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const body = replySchema.parse(request.body);
@@ -288,7 +268,6 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!msg) throw notFound('Contact message not found');
 
-    // Snapshot the admin's name for the conversation log.
     const [adminRow] = await db
       .select({ name: user.name })
       .from(user)
@@ -324,9 +303,7 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const now = new Date();
-    // Insert reply + flip message status atomically — without this transaction,
-    // an interrupted request could leave a reply row in DB with the parent
-    // message still showing status="new".
+
     const { savedReply, updatedMessage } = await db.transaction(async (tx) => {
       const [savedReply] = await tx
         .insert(contactReplies)

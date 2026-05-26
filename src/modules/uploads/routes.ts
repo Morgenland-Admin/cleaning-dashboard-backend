@@ -17,11 +17,6 @@ const signSchema = z.object({
   size: z.number().int().positive().max(MAX_BYTES),
 });
 
-/**
- * Storefront: anonymous endpoint that returns a presigned PUT URL so the
- * visitor's browser can upload directly to S3 (no proxying through us).
- * The resulting key is later included in the inquiry submission.
- */
 export const uploadsPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
 
@@ -29,8 +24,6 @@ export const uploadsPublicRoutes: FastifyPluginAsync = async (app) => {
     '/sign',
     {
       config: {
-        // A typical inquiry attaches 1–3 photos. Anonymous + S3 cost means we
-        // keep this tight; 4/min/IP covers normal use and blocks scripted abuse.
         rateLimit: { max: 4, timeWindow: '1 minute' },
       },
     },
@@ -61,16 +54,9 @@ const downloadQuerySchema = z.object({
   key: z.string().min(1).max(500),
 });
 
-/**
- * Admin: session-gated. Returns a short-lived presigned GET URL so the
- * dashboard can render the uploaded image without making the bucket public.
- */
 export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
 
-  // Mirror of the storefront /sign endpoint but session-gated — used by the
-  // admin chat composer (and any future admin upload UI). Same size + type
-  // guards because the underlying S3 layout is shared.
   app.post(
     '/sign-upload',
     {
@@ -82,9 +68,6 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
       const body = signSchema.parse(request.body);
-      // Chat attachments aren't limited to images, but we restrict to a
-      // documented allowlist (images, PDFs, common office files, plain text).
-      // Anything else must be added here explicitly — safer than a denylist.
       const ADMIN_ALLOWED_TYPES = new Set([
         'image/jpeg',
         'image/png',
@@ -121,10 +104,6 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
     }
     const { key } = downloadQuerySchema.parse(request.query);
     try {
-      // Keys live under one folder per company. `signDownload` enforces that
-      // the requested key actually belongs to `request.company.slug`, so a
-      // user can't sign URLs for another tenant's files even if they
-      // fabricate a key string.
       const { downloadUrl, expiresIn } = await signDownload({
         keyPrefix: request.company!.keyPrefix,
         key,

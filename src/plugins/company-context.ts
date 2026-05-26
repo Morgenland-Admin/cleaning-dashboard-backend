@@ -29,8 +29,6 @@ function readSlug(request: FastifyRequest): string | null {
 const companyContext: FastifyPluginAsync = async (app) => {
   app.decorateRequest('company', null);
 
-  // Public resolver — non-authed routes (storefront newsletter/contact submits) call this.
-  // Requires X-Company-Slug header pointing at a known active company.
   app.decorate('resolveCompanyPublic', async (request: FastifyRequest, reply: FastifyReply) => {
     const slug = readSlug(request);
     if (!slug) {
@@ -51,7 +49,6 @@ const companyContext: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // Authed resolver — requires user is a member of the resolved company.
   app.decorate('requireCompany', async (request: FastifyRequest, reply: FastifyReply) => {
     const session = await app.getSession(request);
     if (!session?.user) {

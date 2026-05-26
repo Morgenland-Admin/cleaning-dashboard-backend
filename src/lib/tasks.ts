@@ -1,16 +1,3 @@
-/**
- * Tasks helpers (ALL_103).
- *
- * Public surface:
- *   - spawnTask(...) — idempotent insert (ON CONFLICT on the source-event
- *     unique index). Used by contact / inquiry / order modules.
- *   - getOpenTaskCountForUser(...) — sidebar badge.
- *   - notifyTaskAssigned(...) — email + push when a task lands on someone.
- *   - notifyTaskComment(...) — email + push when a new comment arrives.
- *
- * Routes for read / update live in modules/tasks/routes.ts.
- */
-
 import { and, eq, sql } from 'drizzle-orm';
 
 import { env } from '../config/env.js';
@@ -21,12 +8,12 @@ import { taskAssignedEmail, taskCommentEmail } from '../email/templates.js';
 import { sendPushToUser } from './push.js';
 
 export type TaskKind =
-  | 'contact_review' // someone filled the contact form
-  | 'inquiry_review' // someone filled the inquiry form
-  | 'order_dispute' // future — customer reported a problem
-  | 'bad_review_followup' // future — 1-2 star review needs response
-  | 'partner_application' // future — new partner registration
-  | 'ad_hoc'; // manually created by admins
+  | 'contact_review'
+  | 'inquiry_review'
+  | 'order_dispute'
+  | 'bad_review_followup'
+  | 'partner_application'
+  | 'ad_hoc';
 
 export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
 
@@ -35,7 +22,6 @@ export type TaskStatus = 'open' | 'in_progress' | 'done' | 'dismissed';
 export interface SpawnTaskInput {
   companySlug: string;
   kind: TaskKind;
-  /** Source table + row id — used for dedup so the same event can't spawn twice. */
   refKind?: string;
   refId?: number;
   title: string;
@@ -45,10 +31,8 @@ export interface SpawnTaskInput {
   metadata?: Record<string, unknown>;
 }
 
-/** Idempotent insert. Returns the existing task on conflict so the caller can
- *  surface "already created" without a separate read. */
+/** Idempotent insert; returns existing task on (companySlug, refKind, refId) conflict. */
 export async function spawnTask(input: SpawnTaskInput): Promise<{ id: number; created: boolean }> {
-  // No ref pair → no dedup possible, just insert.
   if (!input.refKind || input.refId == null) {
     const [row] = await db
       .insert(tasks)
@@ -65,9 +49,6 @@ export async function spawnTask(input: SpawnTaskInput): Promise<{ id: number; cr
     return { id: row!.id, created: true };
   }
 
-  // With ref pair → ON CONFLICT DO NOTHING + RETURNING — Postgres returns
-  // empty when the conflict suppresses the insert, so a follow-up SELECT is
-  // needed to fetch the pre-existing row.
   const [inserted] = await db
     .insert(tasks)
     .values({
@@ -102,8 +83,6 @@ export async function spawnTask(input: SpawnTaskInput): Promise<{ id: number; cr
   return { id: existing!.id, created: false };
 }
 
-/** Count of open tasks across all brands the user has membership in. Used by
- *  the sidebar/header badge. */
 export async function getOpenTaskCountForUser(userId: string): Promise<number> {
   const [row] = await db
     .select({ count: sql<number>`count(*)::int` })
@@ -113,17 +92,8 @@ export async function getOpenTaskCountForUser(userId: string): Promise<number> {
   return row?.count ?? 0;
 }
 
-// ---------------------------------------------------------------------------
-//  Notifications
-//
-//  Both helpers fire email + push in parallel. Push failures are silent
-//  (no VAPID configured → no-op); email failures are swallowed after logging
-//  because the parent action (assignment / comment) is already committed.
-// ---------------------------------------------------------------------------
-
 type TaskRow = typeof tasks.$inferSelect;
 
-/** URL the assignee should land on when they click the email/push. */
 function buildTaskUrl(taskId: number): string {
   return `${env.APP_BASE_URL.replace(/\/$/, '')}/tasks?id=${taskId}`;
 }
@@ -137,8 +107,8 @@ interface NotifyAssignedInput {
 export async function notifyTaskAssigned(input: NotifyAssignedInput): Promise<void> {
   const assigneeId = input.task.assigneeUserId;
   if (!assigneeId) return;
-  if (assigneeId === input.previousAssigneeUserId) return; // no real change
-  if (assigneeId === input.triggeredByUserId) return; // self-assign — quiet
+  if (assigneeId === input.previousAssigneeUserId) return;
+  if (assigneeId === input.triggeredByUserId) return;
 
   const [assignee] = await db
     .select({ id: user.id, name: user.name, email: user.email })
@@ -155,7 +125,6 @@ export async function notifyTaskAssigned(input: NotifyAssignedInput): Promise<vo
   const brandName = companyRow?.name ?? input.task.companySlug;
   const url = buildTaskUrl(input.task.id);
 
-  // Email first — durable.
   try {
     await sendEmail({
       to: assignee.email,
@@ -171,10 +140,9 @@ export async function notifyTaskAssigned(input: NotifyAssignedInput): Promise<vo
       }),
     });
   } catch {
-    /* email send failed — swallowed; the assignment already succeeded */
+    /* email failure swallowed — assignment already committed */
   }
 
-  // Push best-effort.
   try {
     await sendPushToUser(assigneeId, {
       title: `${brandName} · Aufgabe zugewiesen`,
@@ -197,7 +165,7 @@ interface NotifyCommentInput {
 export async function notifyTaskComment(input: NotifyCommentInput): Promise<void> {
   const assigneeId = input.task.assigneeUserId;
   if (!assigneeId) return;
-  if (assigneeId === input.triggeredByUserId) return; // talking to themselves
+  if (assigneeId === input.triggeredByUserId) return;
 
   const [assignee] = await db
     .select({ id: user.id, name: user.name, email: user.email })
