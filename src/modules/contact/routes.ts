@@ -1,0 +1,360 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { and, asc, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { z } from 'zod';
+import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { db } from '../../db/index.js';
+import { company, user } from '../../db/schema/shared.js';
+import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
+import { env } from '../../config/env.js';
+import {
+  adminInboxNotificationEmail,
+  contactAckEmail,
+  contactReplyEmail,
+} from '../../email/templates.js';
+import { notFound, parseIntId } from '../../lib/http-errors.js';
+
+const submitSchema = z.object({
+  name: z.string().min(1).max(120),
+  email: z.string().email().max(254),
+  phone: z.string().max(32).optional(),
+  subject: z.string().max(200).optional(),
+  message: z.string().min(1).max(5000),
+  locale: z.string().min(2).max(16).optional(),
+  source: z.string().max(64).optional(),
+  /** Brand-specific extra fields (e.g. carpet size, pickup vs on-site). Mirrors
+   * the inquiry endpoint so storefronts can capture form-specific data without
+   * a schema change per brand. */
+  metadata: z.record(z.string().max(120), z.unknown()).optional(),
+  /** S3 object refs from /storefront/uploads/sign. Same shape as inquiries. */
+  attachments: z
+    .array(
+      z.object({
+        key: z.string().min(1).max(500),
+        name: z.string().min(1).max(200),
+        size: z.number().int().nonnegative(),
+        contentType: z.string().max(80).optional(),
+      }),
+    )
+    .max(10)
+    .optional(),
+  consentPrivacy: z.literal(true, {
+    errorMap: () => ({ message: 'Privacy consent is required' }),
+  }),
+  consentMarketing: z.boolean().optional(),
+  /** Honeypot field — must be empty for real users. */
+  website: z.string().max(200).optional(),
+});
+
+const updateStatusSchema = z.object({
+  status: z.enum(['new', 'read', 'replied', 'archived']),
+});
+
+const replySchema = z.object({
+  body: z.string().min(1).max(8000),
+});
+
+export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', app.resolveCompanyPublic);
+
+  app.post(
+    '/',
+    {
+      config: {
+        rateLimit: { max: 5, timeWindow: '1 minute' },
+      },
+    },
+    async (request, reply) => {
+      const body = submitSchema.parse(request.body);
+      // Honeypot: silently 201 without writing — bots see "success".
+      if (body.website && body.website.trim().length > 0) {
+        reply.code(201);
+        return { ok: true, message: null };
+      }
+      // Defense in depth: every attachment key must live under this tenant's
+      // S3 folder. Without this an attacker could submit a contact message
+      // referencing an arbitrary S3 key.
+      if (body.attachments && body.attachments.length > 0) {
+        const expectedPrefix = `${request.company!.keyPrefix}/`;
+        const bad = body.attachments.find((a) => !a.key.startsWith(expectedPrefix));
+        if (bad) {
+          reply.code(400).send({ error: 'Invalid attachment key' });
+          return;
+        }
+      }
+      const { contactMessages } = request.company!.tables;
+      const [row] = await db
+        .insert(contactMessages)
+        .values({
+          name: body.name,
+          email: body.email,
+          phone: body.phone,
+          subject: body.subject,
+          message: body.message,
+          locale: body.locale ?? 'de',
+          source: body.source,
+          metadata: body.metadata ?? {},
+          attachments: body.attachments ?? [],
+          consentPrivacy: body.consentPrivacy,
+          consentMarketing: body.consentMarketing ?? false,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'] ?? null,
+        })
+        .returning();
+
+      if (row) {
+        try {
+          const [companyRow] = await db
+            .select()
+            .from(company)
+            .where(eq(company.slug, request.company!.slug))
+            .limit(1);
+          if (companyRow) {
+            const brand = brandInfoFromCompany(companyRow);
+            await sendEmail({
+              to: row.email,
+              from: brandSender(companyRow),
+              replyTo: companyRow.email ?? undefined,
+              email: contactAckEmail({
+                name: row.name,
+                subject: row.subject,
+                message: row.message,
+                brand,
+              }),
+            });
+            // Notify the brand's admin inbox so a new message doesn't sit
+            // unseen until someone happens to open the dashboard.
+            if (companyRow.email) {
+              const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/contacts?id=${row.id}`;
+              await sendEmail({
+                to: companyRow.email,
+                from: brandSender(companyRow),
+                replyTo: row.email,
+                email: adminInboxNotificationEmail({
+                  brand,
+                  kind: 'contact',
+                  fromName: row.name,
+                  fromEmail: row.email,
+                  subject: row.subject,
+                  message: row.message,
+                  adminUrl,
+                }),
+              });
+            }
+          }
+        } catch (err) {
+          // Log at error level so monitoring can alert on failed customer/admin
+          // notifications — the form submission itself succeeded (row inserted)
+          // so we don't surface this to the user, but ops needs to see it.
+          request.log.error(
+            { err, contactMessageId: row.id, recipientEmail: row.email },
+            'Failed to send contact emails',
+          );
+        }
+
+        // Fire Web Push to admins with membership in this brand. Silent and
+        // independent of the email branch — if VAPID isn't configured, this is
+        // a no-op.
+        try {
+          const { sendPushToBrandAdmins } = await import('../../lib/push.js');
+          await sendPushToBrandAdmins(request.company!.slug, {
+            title: `${request.company!.slug} · Kontaktanfrage`,
+            body: `${row.name}: ${(row.subject || row.message || '').slice(0, 120)}`,
+            url: `/contacts?id=${row.id}`,
+            tag: `contact:${row.id}`,
+            brandSlug: request.company!.slug,
+          });
+        } catch (err) {
+          request.log.warn({ err, contactMessageId: row.id }, 'push dispatch failed');
+        }
+
+        // Spawn an operator task — idempotent on (brand, "contact_message", id).
+        try {
+          const { spawnTask } = await import('../../lib/tasks.js');
+          await spawnTask({
+            companySlug: request.company!.slug,
+            kind: 'contact_review',
+            refKind: 'contact_message',
+            refId: row.id,
+            title: `Kontaktanfrage von ${row.name}`,
+            body: (row.subject ? `Betreff: ${row.subject}\n\n` : '') + row.message,
+            priority: 'normal',
+          });
+        } catch (err) {
+          request.log.warn({ err, contactMessageId: row.id }, 'task spawn failed');
+        }
+      }
+
+      reply.code(201);
+      return { ok: true, message: row };
+    },
+  );
+};
+
+// Strip PII fields for viewer-level admins. Manager+ keeps full visibility.
+const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
+
+function redactPii<T extends { ipAddress?: unknown; userAgent?: unknown }>(
+  row: T,
+  accessLevel: string | undefined,
+): T {
+  if (accessLevel && PRIVILEGED_LEVELS.has(accessLevel)) return row;
+  return { ...row, ipAddress: null, userAgent: null };
+}
+
+export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', app.requireAudience('admin'));
+  app.addHook('preHandler', app.requireCompany);
+
+  const listQuerySchema = z.object({
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+    cursor: z.string().min(1).max(500).optional(),
+  });
+  app.get('/', async (request) => {
+    const { limit, cursor } = listQuerySchema.parse(request.query);
+    const { contactMessages } = request.company!.tables;
+    const decoded = cursor ? decodeCursor(cursor) : null;
+    // Fetch one extra row so we can tell whether there's another page without
+    // a second COUNT(*) query.
+    const where = decoded
+      ? or(
+          lt(contactMessages.createdAt, sql`${decoded.createdAt}::timestamptz`),
+          and(
+            sql`${contactMessages.createdAt} = ${decoded.createdAt}::timestamptz`,
+            lt(contactMessages.id, decoded.id),
+          ),
+        )
+      : undefined;
+    const rows = await db
+      .select()
+      .from(contactMessages)
+      .where(where)
+      .orderBy(desc(contactMessages.createdAt), desc(contactMessages.id))
+      .limit(limit + 1);
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
+        : null;
+    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    return {
+      messages: page.map((r) => redactPii(r, accessLevel)),
+      nextCursor,
+    };
+  });
+
+  app.get('/:id', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { contactMessages, contactReplies } = request.company!.tables;
+    const [row] = await db
+      .select()
+      .from(contactMessages)
+      .where(eq(contactMessages.id, id))
+      .limit(1);
+    if (!row) return { message: null, replies: [] };
+    const replies = await db
+      .select()
+      .from(contactReplies)
+      .where(eq(contactReplies.contactMessageId, id))
+      .orderBy(asc(contactReplies.createdAt));
+    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    return { message: redactPii(row, accessLevel), replies };
+  });
+
+  app.patch('/:id', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const body = updateStatusSchema.parse(request.body);
+    const { contactMessages } = request.company!.tables;
+    const [row] = await db
+      .update(contactMessages)
+      .set({ status: body.status, updatedAt: new Date() })
+      .where(eq(contactMessages.id, id))
+      .returning();
+    return { message: row };
+  });
+
+  // Send a reply email + persist as a conversation row.
+  app.post('/:id/reply', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const body = replySchema.parse(request.body);
+    const adminId = request.authUser!.id;
+    const { contactMessages, contactReplies } = request.company!.tables;
+
+    const [msg] = await db
+      .select()
+      .from(contactMessages)
+      .where(eq(contactMessages.id, id))
+      .limit(1);
+    if (!msg) throw notFound('Contact message not found');
+
+    // Snapshot the admin's name for the conversation log.
+    const [adminRow] = await db
+      .select({ name: user.name })
+      .from(user)
+      .where(eq(user.id, adminId))
+      .limit(1);
+    if (!adminRow) {
+      request.log.warn({ adminId }, 'Admin user row missing during contact reply');
+    }
+    const sentByName = adminRow?.name ?? null;
+
+    const [companyRow] = await db
+      .select()
+      .from(company)
+      .where(eq(company.slug, request.company!.slug))
+      .limit(1);
+
+    let emailMessageId: string | null = null;
+    if (companyRow) {
+      const result = await sendEmail({
+        to: msg.email,
+        from: brandSender(companyRow),
+        replyTo: companyRow.email ?? undefined,
+        email: contactReplyEmail({
+          recipientName: msg.name,
+          replyBody: body.body,
+          originalMessage: msg.message,
+          originalSubject: msg.subject,
+          brand: brandInfoFromCompany(companyRow),
+          signedBy: sentByName,
+        }),
+      });
+      emailMessageId = result.id ?? (result.skipped ? 'skipped' : null);
+    }
+
+    const now = new Date();
+    // Insert reply + flip message status atomically — without this transaction,
+    // an interrupted request could leave a reply row in DB with the parent
+    // message still showing status="new".
+    const { savedReply, updatedMessage } = await db.transaction(async (tx) => {
+      const [savedReply] = await tx
+        .insert(contactReplies)
+        .values({
+          contactMessageId: id,
+          body: body.body,
+          sentByUserId: adminId,
+          sentByName,
+          emailMessageId,
+        })
+        .returning();
+
+      const [updatedMessage] = await tx
+        .update(contactMessages)
+        .set({
+          status: 'replied',
+          repliedAt: now,
+          handledByUserId: adminId,
+          handledAt: msg.handledAt ?? now,
+          updatedAt: now,
+        })
+        .where(eq(contactMessages.id, id))
+        .returning();
+
+      return { savedReply, updatedMessage };
+    });
+
+    reply.code(201);
+    return { ok: true, reply: savedReply, message: updatedMessage };
+  });
+};

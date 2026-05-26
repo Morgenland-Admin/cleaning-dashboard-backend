@@ -1,0 +1,73 @@
+# LOCAL DEVELOPMENT ONLY. Do not use this file in production.
+# Dokploy deploys the backend by building the Dockerfile directly and injecting
+# env vars from its own UI (managed Postgres, rotated secrets, etc).
+name: cleaning-portal
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-cleaning_dashboard}
+    ports:
+      - '5433:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER:-postgres}']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    # Opt-in via profile — local dev runs the backend on the host (pnpm dev)
+    # with hot reload. Use `docker compose --profile full up -d` to also run the
+    # containerized API (e.g. for a production-like smoke test).
+    profiles: ['full']
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8000
+      HOST: 0.0.0.0
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-cleaning_dashboard}
+      # Required — no fallback. Generate with: openssl rand -base64 48
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET is required}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-https://api.reinigungs-portal.com}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://reinigungs-portal.com,https://cleanilo.de,https://hamburg-teppichreinigung.de,https://teppichreinigen-lassen.de}
+      APP_BASE_URL: ${APP_BASE_URL:-https://reinigungs-portal.com}
+    ports:
+      - '8000:8000'
+
+  # S3-compatible storage for local dev. Mirrors AWS S3 so the same code path
+  # (presigned PUT / GET) works without ever touching real AWS. Console UI on
+  # http://localhost:9001 — minioadmin / minioadmin.
+  #
+  # The pre-start `mkdir` creates the bucket directly — MinIO's single-drive
+  # backend exposes top-level folders under /data as buckets, which lets us
+  # skip a separate "minio-setup" sidecar container.
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    entrypoint: >
+      /bin/sh -c "
+        mkdir -p /data/reinigungs-portal-uploads &&
+        exec minio server /data --console-address ':9001'
+      "
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - minio_data:/data
+
+volumes:
+  postgres_data:
+  minio_data:

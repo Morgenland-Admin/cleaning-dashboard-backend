@@ -1,0 +1,165 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { and, desc, eq, lt } from 'drizzle-orm';
+import { z } from 'zod';
+
+import { db } from '../../db/index.js';
+import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { exportJobs, membership } from '../../db/schema/shared.js';
+import { parseIntId } from '../../lib/http-errors.js';
+import { s3Configured, signObjectDownload } from '../../lib/s3.js';
+
+// ---------------------------------------------------------------------------
+//  Admin exports (ALL_74).
+//
+//  Routes:
+//    POST   /admin/exports             — enqueue a job (returns 202 + jobId)
+//    GET    /admin/exports             — list my recent jobs
+//    GET    /admin/exports/:id         — single job status
+//    GET    /admin/exports/:id/download — presigned S3 URL for the result
+//    POST   /admin/exports/:id/cancel   — mark a still-pending job as cancelled
+// ---------------------------------------------------------------------------
+
+const createSchema = z.object({
+  companySlug: z.string().min(1).max(63),
+  kind: z.enum(['orders', 'inquiries', 'contacts', 'newsletter']),
+  format: z.enum(['csv']).default('csv'),
+  filter: z.record(z.unknown()).default({}),
+});
+
+const listQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+  cursor: z.string().optional(),
+  status: z.enum(['pending', 'processing', 'done', 'failed', 'cancelled', 'all']).default('all'),
+});
+
+async function userBrandSlugs(userId: string): Promise<string[]> {
+  const rows = await db
+    .select({ slug: membership.companySlug })
+    .from(membership)
+    .where(eq(membership.userId, userId));
+  return rows.map((r) => r.slug);
+}
+
+export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
+  app.post('/', async (request, reply) => {
+    if (!s3Configured) {
+      reply.code(503).send({ error: 'S3 not configured — exports are disabled' });
+      return;
+    }
+    const body = createSchema.parse(request.body);
+    const userId = request.authUser!.id;
+    const brands = await userBrandSlugs(userId);
+    if (!brands.includes(body.companySlug)) {
+      reply.code(403).send({ error: 'No access to brand' });
+      return;
+    }
+    const [row] = await db
+      .insert(exportJobs)
+      .values({
+        companySlug: body.companySlug,
+        requestedByUserId: userId,
+        kind: body.kind,
+        format: body.format,
+        filter: body.filter,
+        status: 'pending',
+      })
+      .returning();
+    // 202 because the work happens async — the polling worker picks it up.
+    reply.code(202).send({ job: row });
+  });
+
+  app.get('/', async (request, reply) => {
+    const q = listQuerySchema.parse(request.query);
+    const userId = request.authUser!.id;
+    // Only show jobs the user requested themselves — keeps the "exports
+    // contain PII" boundary tight.
+    const conds = [eq(exportJobs.requestedByUserId, userId)];
+    if (q.status !== 'all') conds.push(eq(exportJobs.status, q.status));
+    if (q.cursor) {
+      const cur = decodeCursor(q.cursor);
+      if (cur) conds.push(lt(exportJobs.id, cur.id));
+    }
+    const rows = await db
+      .select()
+      .from(exportJobs)
+      .where(and(...conds))
+      .orderBy(desc(exportJobs.createdAt), desc(exportJobs.id))
+      .limit(q.limit + 1);
+    const hasMore = rows.length > q.limit;
+    const items = hasMore ? rows.slice(0, q.limit) : rows;
+    const last = items[items.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeCursor({ id: last.id, createdAt: last.createdAt.toISOString() })
+        : null;
+    reply.send({ items, nextCursor });
+  });
+
+  app.get('/:id', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const userId = request.authUser!.id;
+    const [row] = await db
+      .select()
+      .from(exportJobs)
+      .where(and(eq(exportJobs.id, id), eq(exportJobs.requestedByUserId, userId)))
+      .limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Export job not found' });
+      return;
+    }
+    reply.send({ job: row });
+  });
+
+  app.get('/:id/download', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const userId = request.authUser!.id;
+    const [row] = await db
+      .select()
+      .from(exportJobs)
+      .where(and(eq(exportJobs.id, id), eq(exportJobs.requestedByUserId, userId)))
+      .limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Export job not found' });
+      return;
+    }
+    if (row.status !== 'done' || !row.s3Key) {
+      reply.code(409).send({ error: `Export is ${row.status}, not ready for download` });
+      return;
+    }
+    if (row.expiresAt && row.expiresAt.getTime() < Date.now()) {
+      reply.code(410).send({ error: 'Export expired' });
+      return;
+    }
+    const { downloadUrl, expiresIn } = await signObjectDownload({
+      key: row.s3Key,
+      expiresIn: 60 * 5,
+    });
+    reply.send({ downloadUrl, expiresIn });
+  });
+
+  app.post('/:id/cancel', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const userId = request.authUser!.id;
+    // Race-safe: only flip pending → cancelled. If the worker already claimed
+    // it ('processing'), too late, the job will finish and we ignore the
+    // cancel request.
+    const [updated] = await db
+      .update(exportJobs)
+      .set({ status: 'cancelled', completedAt: new Date() })
+      .where(
+        and(
+          eq(exportJobs.id, id),
+          eq(exportJobs.requestedByUserId, userId),
+          eq(exportJobs.status, 'pending'),
+        ),
+      )
+      .returning();
+    if (!updated) {
+      reply.code(409).send({ error: 'Job not cancellable (already processing or done)' });
+      return;
+    }
+    reply.send({ job: updated });
+  });
+};
+
+export default exportsAdminRoutes;

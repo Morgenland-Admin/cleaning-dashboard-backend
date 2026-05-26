@@ -1,0 +1,369 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { randomBytes } from 'node:crypto';
+import { and, eq, gte } from 'drizzle-orm';
+import { nanoid } from 'nanoid';
+import { z } from 'zod';
+import { auth } from '../../auth/index.js';
+import { env } from '../../config/env.js';
+import { isValidCompanySlug } from '../../config/companies.js';
+import { db } from '../../db/index.js';
+import { account, company, membership, user, verification } from '../../db/schema/shared.js';
+import { adminSender, sendEmail } from '../../email/service.js';
+import { inviteEmail } from '../../email/templates.js';
+import { badRequest, conflict, notFound } from '../../lib/http-errors.js';
+
+const ROLES = ['owner', 'admin', 'manager', 'viewer', 'partner'] as const;
+const AUDIENCES = ['admin', 'partner'] as const;
+const ACCESS_LEVELS = ['super_admin', 'admin', 'manager', 'viewer', 'none'] as const;
+
+const partnerPrefillSchema = z.object({
+  companyName: z.string().min(1).max(200),
+  contactPhone: z.string().max(32).optional(),
+  websiteUrl: z.string().url().optional(),
+  city: z.string().max(120).optional(),
+  postalCode: z.string().max(20).optional(),
+});
+
+const createInviteSchema = z.object({
+  email: z.string().email(),
+  companySlug: z.string().min(1).max(63),
+  role: z.enum(ROLES).default('viewer'),
+  audience: z.enum(AUDIENCES).default('admin'),
+  accessLevel: z.enum(ACCESS_LEVELS).default('viewer'),
+  /**
+   * Optional: when inviting a partner, the admin can pre-fill some of the
+   * partner profile. On accept we create the partners row using these fields
+   * so the new partner lands in the directory immediately without having to
+   * go through onboarding first.
+   */
+  partner: partnerPrefillSchema.optional(),
+});
+
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function inviteIdentifier(token: string): string {
+  return `invite:${token}`;
+}
+
+interface InvitePayload {
+  email: string;
+  companySlug: string;
+  role: (typeof ROLES)[number];
+  audience: (typeof AUDIENCES)[number];
+  accessLevel: (typeof ACCESS_LEVELS)[number];
+  invitedByUserId: string;
+  invitedByName: string;
+  /** When set, accept creates a partners row in the tenant schema. */
+  partner?: {
+    companyName: string;
+    contactPhone?: string;
+    websiteUrl?: string;
+    city?: string;
+    postalCode?: string;
+  };
+}
+
+/** Admin-only routes: create invite. */
+export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
+  // Only owner/admin members of the target company (or super_admin globally)
+  // should be able to invite. The per-company role check is enforced in-handler
+  // since the company isn't necessarily the user's "active" company.
+  app.addHook('preHandler', app.requireAudience('admin'));
+
+  app.post('/', async (request, reply) => {
+    const body = createInviteSchema.parse(request.body);
+    if (!isValidCompanySlug(body.companySlug)) {
+      throw badRequest('Invalid companySlug');
+    }
+    const inviter = request.authUser!;
+    const inviterMeta = inviter as unknown as { accessLevel?: string };
+
+    // Authorization: super_admin can invite to any company; otherwise the
+    // caller must be owner/admin on the target company.
+    if (inviterMeta.accessLevel !== 'super_admin') {
+      const [m] = await db
+        .select()
+        .from(membership)
+        .where(and(eq(membership.userId, inviter.id), eq(membership.companySlug, body.companySlug)))
+        .limit(1);
+      if (!m || (m.role !== 'owner' && m.role !== 'admin')) {
+        reply.code(403).send({ error: 'Forbidden — must be owner/admin on this company' });
+        return;
+      }
+    }
+
+    const [companyRow] = await db
+      .select()
+      .from(company)
+      .where(eq(company.slug, body.companySlug))
+      .limit(1);
+    if (!companyRow) throw notFound('Company not found');
+
+    // If the user already exists AND already has a membership on this company,
+    // there's nothing to do.
+    const [existingUser] = await db.select().from(user).where(eq(user.email, body.email)).limit(1);
+    if (existingUser) {
+      const [m] = await db
+        .select()
+        .from(membership)
+        .where(
+          and(eq(membership.userId, existingUser.id), eq(membership.companySlug, body.companySlug)),
+        )
+        .limit(1);
+      if (m) throw conflict('User is already a member of this company');
+    }
+
+    const token = randomBytes(24).toString('base64url');
+    const payload: InvitePayload = {
+      email: body.email,
+      companySlug: body.companySlug,
+      role: body.role,
+      audience: body.audience,
+      accessLevel: body.accessLevel,
+      invitedByUserId: inviter.id,
+      invitedByName: (inviter as { name?: string }).name ?? 'Admin',
+      partner: body.partner,
+    };
+    const expiresAt = new Date(Date.now() + INVITE_TTL_MS);
+
+    await db.insert(verification).values({
+      id: `invite_${token}`,
+      identifier: inviteIdentifier(token),
+      value: JSON.stringify(payload),
+      expiresAt,
+    });
+
+    const inviteUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/accept-invite?token=${encodeURIComponent(token)}`;
+    try {
+      await sendEmail({
+        to: body.email,
+        from: adminSender(),
+        email: inviteEmail({
+          inviterName: payload.invitedByName,
+          inviteUrl,
+          brandName: companyRow.name,
+        }),
+      });
+    } catch (err) {
+      request.log.warn({ err }, 'Failed to send invite email');
+    }
+
+    reply.code(201);
+    return {
+      invite: {
+        email: body.email,
+        companySlug: body.companySlug,
+        role: body.role,
+        expiresAt: expiresAt.toISOString(),
+      },
+    };
+  });
+};
+
+const acceptInviteSchema = z.object({
+  token: z.string().min(8).max(200),
+  password: z.string().min(8).max(200),
+  firstName: z.string().min(1).max(120),
+  lastName: z.string().min(1).max(120).optional(),
+});
+
+/** Public routes: GET invite details + POST accept. */
+export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
+  // Look up invite metadata so the accept page can show "You've been invited
+  // to <CompanyName> as <role>".
+  const queryGet = z.object({ token: z.string().min(8).max(200) });
+  app.get(
+    '/',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const q = queryGet.safeParse(request.query);
+      if (!q.success) {
+        reply.code(400).send({ error: 'Invalid token' });
+        return;
+      }
+      const now = new Date();
+      const [v] = await db
+        .select()
+        .from(verification)
+        .where(
+          and(
+            eq(verification.identifier, inviteIdentifier(q.data.token)),
+            gte(verification.expiresAt, now),
+          ),
+        )
+        .limit(1);
+      if (!v) {
+        reply.code(410).send({ error: 'Invite expired or not found' });
+        return;
+      }
+      let payload: InvitePayload;
+      try {
+        payload = JSON.parse(v.value);
+      } catch {
+        reply.code(500).send({ error: 'Invite payload malformed' });
+        return;
+      }
+      const [companyRow] = await db
+        .select({ slug: company.slug, name: company.name })
+        .from(company)
+        .where(eq(company.slug, payload.companySlug))
+        .limit(1);
+      return {
+        invite: {
+          email: payload.email,
+          companyName: companyRow?.name ?? null,
+          companySlug: payload.companySlug,
+          role: payload.role,
+          invitedByName: payload.invitedByName,
+          expiresAt: v.expiresAt.toISOString(),
+        },
+      };
+    },
+  );
+
+  app.post(
+    '/accept',
+    { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const body = acceptInviteSchema.parse(request.body);
+      const now = new Date();
+      const [v] = await db
+        .select()
+        .from(verification)
+        .where(
+          and(
+            eq(verification.identifier, inviteIdentifier(body.token)),
+            gte(verification.expiresAt, now),
+          ),
+        )
+        .limit(1);
+      if (!v) {
+        reply.code(410).send({ error: 'Invite expired or not found' });
+        return;
+      }
+      let payload: InvitePayload;
+      try {
+        payload = JSON.parse(v.value);
+      } catch {
+        reply.code(500).send({ error: 'Invite payload malformed' });
+        return;
+      }
+
+      // Reuse Better Auth's signUpEmail so the password hashing matches the
+      // production login flow. If the email already exists, fall through to
+      // attach the membership to the existing user.
+      const [existing] = await db.select().from(user).where(eq(user.email, payload.email)).limit(1);
+      let userId: string;
+      if (existing) {
+        userId = existing.id;
+        // Stub users (e.g. created by admin "manual-create partner" without an
+        // invite) have a user row but no credential account, so they cannot
+        // log in. Detect that case and create the credential account using
+        // better-auth's internal password hasher.
+        const [existingCredential] = await db
+          .select()
+          .from(account)
+          .where(and(eq(account.userId, userId), eq(account.providerId, 'credential')))
+          .limit(1);
+        if (!existingCredential) {
+          const hashed = await auth.$context.then((ctx) => ctx.password.hash(body.password));
+          await db.insert(account).values({
+            id: nanoid(),
+            userId,
+            providerId: 'credential',
+            accountId: userId,
+            password: hashed,
+          });
+          // Activate the formerly-stubbed user now that they own credentials.
+          await db
+            .update(user)
+            .set({
+              firstName: body.firstName,
+              lastName: body.lastName ?? null,
+              audience: payload.audience,
+              accessLevel: payload.accessLevel,
+              emailVerified: true,
+              isActive: true,
+              invitedByUserId: payload.invitedByUserId,
+              updatedAt: now,
+            })
+            .where(eq(user.id, userId));
+        }
+      } else {
+        const name = body.lastName
+          ? `${body.firstName} ${body.lastName}`.trim()
+          : body.firstName.trim();
+        const created = await auth.api.signUpEmail({
+          body: { email: payload.email, password: body.password, name },
+        });
+        if (!created?.user?.id) {
+          reply.code(500).send({ error: 'Failed to create account' });
+          return;
+        }
+        userId = created.user.id;
+        // Set audience / accessLevel + mark verified (invite link presence
+        // already proves the user controls the inbox).
+        await db
+          .update(user)
+          .set({
+            firstName: body.firstName,
+            lastName: body.lastName ?? null,
+            audience: payload.audience,
+            accessLevel: payload.accessLevel,
+            emailVerified: true,
+            isActive: true,
+            invitedByUserId: payload.invitedByUserId,
+            updatedAt: now,
+          })
+          .where(eq(user.id, userId));
+      }
+
+      await db
+        .insert(membership)
+        .values({
+          userId,
+          companySlug: payload.companySlug,
+          role: payload.role,
+          invitedByUserId: payload.invitedByUserId,
+          invitedAt: v.createdAt,
+          acceptedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: [membership.userId, membership.companySlug],
+          set: { role: payload.role, acceptedAt: now },
+        });
+
+      // Partner pre-fill: when the inviter chose audience=partner and supplied
+      // partner details, drop a row into the tenant's partners table tied to
+      // this user. The row starts as `pending` so it still passes through the
+      // admin approval queue.
+      if (payload.partner) {
+        const { loadCompany } = await import('../../lib/company-loader.js');
+        const { getTenantTables } = await import('../../db/schema/tenant.js');
+        const companyRow = await loadCompany(payload.companySlug);
+        if (companyRow) {
+          const { partners } = getTenantTables(companyRow.schemaName);
+          await db
+            .insert(partners)
+            .values({
+              userId,
+              companyName: payload.partner.companyName,
+              contactEmail: payload.email,
+              contactPhone: payload.partner.contactPhone,
+              websiteUrl: payload.partner.websiteUrl,
+              city: payload.partner.city,
+              postalCode: payload.partner.postalCode,
+              status: 'pending',
+            })
+            .onConflictDoNothing();
+        }
+      }
+
+      // Single-use: delete the invite row.
+      await db.delete(verification).where(eq(verification.id, v.id));
+
+      reply.code(201);
+      return { ok: true, companySlug: payload.companySlug };
+    },
+  );
+};

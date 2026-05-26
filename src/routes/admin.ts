@@ -1,0 +1,42 @@
+import type { FastifyPluginAsync } from 'fastify';
+import usersRoutes from '../modules/users/routes.js';
+import companiesRoutes from '../modules/companies/routes.js';
+import dashboardRoutes from '../modules/dashboard/routes.js';
+import notificationsRoutes from '../modules/notifications/routes.js';
+import { chatAdminRoutes } from '../modules/chat/routes.js';
+import { newsletterAdminRoutes } from '../modules/newsletter/routes.js';
+import { contactAdminRoutes } from '../modules/contact/routes.js';
+import { inquiriesAdminRoutes } from '../modules/inquiries/routes.js';
+import { partnersAdminRoutes } from '../modules/partners/routes.js';
+import { uploadsAdminRoutes } from '../modules/uploads/routes.js';
+import { invitesAdminRoutes } from '../modules/invites/routes.js';
+import { ordersAdminRoutes } from '../modules/orders/routes.js';
+import exportsAdminRoutes from '../modules/exports/routes.js';
+import pushAdminRoutes from '../modules/push/routes.js';
+import { qrAdminRoutes } from '../modules/qr/routes.js';
+import tasksAdminRoutes from '../modules/tasks/routes.js';
+
+// Admin dashboard: requires audience=admin. Granular RBAC via app.requireAccess(...)
+// can be layered onto individual routes as the dashboard grows.
+const adminRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', app.requireAudience('admin'));
+
+  await app.register(usersRoutes, { prefix: '/users' });
+  await app.register(companiesRoutes, { prefix: '/companies' });
+  await app.register(dashboardRoutes, { prefix: '/dashboard' });
+  await app.register(notificationsRoutes, { prefix: '/notifications' });
+  await app.register(newsletterAdminRoutes, { prefix: '/newsletter' });
+  await app.register(contactAdminRoutes, { prefix: '/contact' });
+  await app.register(inquiriesAdminRoutes, { prefix: '/inquiries' });
+  await app.register(partnersAdminRoutes, { prefix: '/partners' });
+  await app.register(uploadsAdminRoutes, { prefix: '/uploads' });
+  await app.register(invitesAdminRoutes, { prefix: '/invites' });
+  await app.register(chatAdminRoutes, { prefix: '/chat' });
+  await app.register(ordersAdminRoutes, { prefix: '/orders' });
+  await app.register(pushAdminRoutes, { prefix: '/push' });
+  await app.register(tasksAdminRoutes, { prefix: '/tasks' });
+  await app.register(exportsAdminRoutes, { prefix: '/exports' });
+  await app.register(qrAdminRoutes, { prefix: '/qr' });
+};
+
+export default adminRoutes;

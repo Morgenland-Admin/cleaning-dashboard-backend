@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.prod
+.env.*.local
+*.log
+.DS_Store
+coverage/
+.idea/
+.vscode/
+drizzle/.snapshots/
