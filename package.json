@@ -23,8 +23,8 @@
     "db:migrate:runtime": "node dist/db/migrate.js",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "db:seed": "tsx src/db/seed.ts",
-    "db:seed:n8n": "tsx src/db/seed-n8n-user.ts"
+    "db:seed:local": "tsx src/db/seed-local.ts",
+    "db:seed:prod": "tsx src/db/seed-prod.ts"
   },
   "lint-staged": {
     "*.{ts,js,mjs,cjs}": [

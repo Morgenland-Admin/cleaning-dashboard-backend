@@ -52,7 +52,8 @@ pnpm start
 | `db:migrate`        | Apply pending migrations                       |
 | `db:push`           | Push schema directly (dev only)                |
 | `db:studio`         | Open Drizzle Studio                            |
-| `db:seed`           | Seed the database                              |
+| `db:seed:local`     | Seed local dev data (refuses non-local DB)     |
+| `db:seed:prod`      | Minimal prod seed (admin + n8n, env passwords) |
 
 ## Tooling
 
