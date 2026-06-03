@@ -20,6 +20,7 @@ export const auth = betterAuth({
     enabled: true,
     autoSignIn: true,
     minPasswordLength: 8,
+    disableSignUp: true,
     sendResetPassword: async ({ user: u, url, token }) => {
       const base = env.APP_BASE_URL.replace(/\/$/, '');
       const resetUrl = token ? `${base}/reset-password?token=${encodeURIComponent(token)}` : url;

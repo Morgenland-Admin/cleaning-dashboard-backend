@@ -56,8 +56,12 @@ export async function signUpload(opts: {
     Bucket: bucket,
     Key: key,
     ContentType: opts.contentType,
+    ContentLength: opts.sizeBytes,
   });
-  const uploadUrl = await getSignedUrl(client, cmd, { expiresIn: UPLOAD_EXPIRY_SECONDS });
+  const uploadUrl = await getSignedUrl(client, cmd, {
+    expiresIn: UPLOAD_EXPIRY_SECONDS,
+    signableHeaders: new Set(['content-length', 'content-type']),
+  });
   return { uploadUrl, key, expiresIn: UPLOAD_EXPIRY_SECONDS };
 }
 

@@ -9,6 +9,7 @@ import {
   serial,
   text,
   timestamp,
+  uniqueIndex,
   varchar,
 } from 'drizzle-orm/pg-core';
 
@@ -150,6 +151,15 @@ function buildTenantTables(schemaName: string) {
     iban: varchar('iban', { length: 34 }),
     bic: varchar('bic', { length: 11 }),
     commissionRate: numeric('commission_rate', { precision: 5, scale: 2 }),
+    stripeConnectId: text('stripe_connect_id'),
+    stripeConnectStatus: varchar('stripe_connect_status', { length: 16 }).notNull().default('none'),
+    chargesEnabled: boolean('charges_enabled').notNull().default(false),
+    payoutsEnabled: boolean('payouts_enabled').notNull().default(false),
+    tier: varchar('tier', { length: 16 }).notNull().default('basic'),
+    monthlyFeeCents: integer('monthly_fee_cents').notNull().default(0),
+    rating: numeric('rating', { precision: 3, scale: 2 }),
+    ratingCount: integer('rating_count').notNull().default(0),
+    score: integer('score'),
     status: varchar('status', { length: 16 }).notNull().default('pending'),
     approvedAt: timestamp('approved_at', { withTimezone: true }),
     approvedByUserId: text('approved_by_user_id'),
@@ -212,7 +222,18 @@ function buildTenantTables(schemaName: string) {
       subtotalCents: integer('subtotal_cents').notNull(),
       pickupFeeCents: integer('pickup_fee_cents').notNull().default(0),
       minOrderTopUpCents: integer('min_order_top_up_cents').notNull().default(0),
+      discountCents: integer('discount_cents').notNull().default(0),
+      voucherCode: text('voucher_code'),
       totalCents: integer('total_cents').notNull(),
+      refundedAmountCents: integer('refunded_amount_cents').notNull().default(0),
+
+      assignedPartnerId: integer('assigned_partner_id'),
+      assignedAt: timestamp('assigned_at', { withTimezone: true }),
+      commissionCents: integer('commission_cents'),
+      partnerPayoutCents: integer('partner_payout_cents'),
+      payoutStatus: varchar('payout_status', { length: 16 }).notNull().default('none'),
+      stripeTransferId: text('stripe_transfer_id'),
+      payoutAt: timestamp('payout_at', { withTimezone: true }),
 
       pickupMode: varchar('pickup_mode', { length: 16 }).notNull(),
       pickupZone: integer('pickup_zone'),
@@ -266,6 +287,7 @@ function buildTenantTables(schemaName: string) {
       createdAtIdx: index('orders_created_at_idx').on(table.createdAt),
       statusIdx: index('orders_status_idx').on(table.status),
       stripeSessionIdx: index('orders_stripe_session_id_idx').on(table.stripeSessionId),
+      assignedPartnerIdx: index('orders_assigned_partner_idx').on(table.assignedPartnerId),
     }),
   );
 
@@ -308,6 +330,155 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
+  const customers = s.table(
+    'customers',
+    {
+      id: serial('id').primaryKey(),
+      email: text('email').notNull().unique(),
+      name: text('name'),
+      phone: varchar('phone', { length: 32 }),
+      totalOrders: integer('total_orders').notNull().default(0),
+      totalSpentCents: integer('total_spent_cents').notNull().default(0),
+      loyaltyTier: varchar('loyalty_tier', { length: 16 }).notNull().default('neukunde'),
+      firstOrderAt: timestamp('first_order_at', { withTimezone: true }),
+      lastOrderAt: timestamp('last_order_at', { withTimezone: true }),
+      marketingOptIn: boolean('marketing_opt_in').notNull().default(false),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      tierIdx: index('customers_loyalty_tier_idx').on(table.loyaltyTier),
+    }),
+  );
+
+  const reviews = s.table(
+    'reviews',
+    {
+      id: serial('id').primaryKey(),
+      orderId: integer('order_id'),
+      partnerId: integer('partner_id'),
+      customerEmail: text('customer_email'),
+      customerName: text('customer_name'),
+      rating: integer('rating').notNull(),
+      comment: text('comment'),
+      photos: jsonb('photos').$type<string[]>().notNull().default([]),
+      status: varchar('status', { length: 16 }).notNull().default('new'),
+      partnerResponse: text('partner_response'),
+      respondedAt: timestamp('responded_at', { withTimezone: true }),
+      flagged: boolean('flagged').notNull().default(false),
+      flagReason: text('flag_reason'),
+      source: varchar('source', { length: 32 }),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      statusIdx: index('reviews_status_idx').on(table.status),
+      partnerIdx: index('reviews_partner_idx').on(table.partnerId),
+    }),
+  );
+
+  const subscriptions = s.table(
+    'subscriptions',
+    {
+      id: serial('id').primaryKey(),
+      customerEmail: text('customer_email').notNull(),
+      customerName: text('customer_name'),
+      planName: text('plan_name').notNull(),
+      monthlyPriceCents: integer('monthly_price_cents').notNull().default(0),
+      intervalMonths: integer('interval_months').notNull().default(1),
+      stripeSubscriptionId: text('stripe_subscription_id'),
+      status: varchar('status', { length: 16 }).notNull().default('active'),
+      servicesIncluded: jsonb('services_included').$type<string[]>().notNull().default([]),
+      nextServiceDate: date('next_service_date'),
+      pausedAt: timestamp('paused_at', { withTimezone: true }),
+      cancelledAt: timestamp('cancelled_at', { withTimezone: true }),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      statusIdx: index('subscriptions_status_idx').on(table.status),
+      emailIdx: index('subscriptions_email_idx').on(table.customerEmail),
+    }),
+  );
+
+  const invoices = s.table(
+    'invoices',
+    {
+      id: serial('id').primaryKey(),
+      number: varchar('number', { length: 64 }),
+      orderId: integer('order_id'),
+      partnerId: integer('partner_id'),
+      customerType: varchar('customer_type', { length: 8 }).notNull().default('b2c'),
+      recipientName: text('recipient_name').notNull(),
+      recipientEmail: text('recipient_email'),
+      status: varchar('status', { length: 16 }).notNull().default('draft'),
+      currency: varchar('currency', { length: 3 }).notNull().default('EUR'),
+      subtotalCents: integer('subtotal_cents').notNull().default(0),
+      taxCents: integer('tax_cents').notNull().default(0),
+      totalCents: integer('total_cents').notNull().default(0),
+      lineItems: jsonb('line_items')
+        .$type<Array<{ label: string; quantity: number; unitPriceCents: number }>>()
+        .notNull()
+        .default([]),
+      paymentTermsDays: integer('payment_terms_days').notNull().default(14),
+      dueAt: timestamp('due_at', { withTimezone: true }),
+      sentAt: timestamp('sent_at', { withTimezone: true }),
+      paidAt: timestamp('paid_at', { withTimezone: true }),
+      dunningLevel: integer('dunning_level').notNull().default(0),
+      lastDunningAt: timestamp('last_dunning_at', { withTimezone: true }),
+      odooInvoiceId: text('odoo_invoice_id'),
+      notes: text('notes'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      statusIdx: index('invoices_status_idx').on(table.status),
+      dueIdx: index('invoices_due_idx').on(table.dueAt),
+    }),
+  );
+
+  const cityStatus = s.table(
+    'city_status',
+    {
+      id: serial('id').primaryKey(),
+      city: text('city').notNull(),
+      plzPrefix: varchar('plz_prefix', { length: 5 }).notNull(),
+      status: varchar('status', { length: 16 }).notNull().default('locked'),
+      partnerCount: integer('partner_count').notNull().default(0),
+      activePartnerCount: integer('active_partner_count').notNull().default(0),
+      orderCount30d: integer('order_count_30d').notNull().default(0),
+      ordersPerPartner: numeric('orders_per_partner', { precision: 8, scale: 2 }),
+      seoPageGenerated: boolean('seo_page_generated').notNull().default(false),
+      googleAdsActive: boolean('google_ads_active').notNull().default(false),
+      lastStatusChange: timestamp('last_status_change', { withTimezone: true }),
+      notes: text('notes'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      plzUnique: uniqueIndex('city_status_plz_unique').on(table.plzPrefix),
+    }),
+  );
+
+  const priceAdjustments = s.table(
+    'price_adjustments',
+    {
+      id: serial('id').primaryKey(),
+      scope: varchar('scope', { length: 16 }).notNull().default('global'),
+      scopeKey: varchar('scope_key', { length: 64 }),
+      adjustmentPercent: numeric('adjustment_percent', { precision: 5, scale: 2 }).notNull(),
+      reason: text('reason'),
+      active: boolean('active').notNull().default(true),
+      validFrom: timestamp('valid_from', { withTimezone: true }),
+      validTo: timestamp('valid_to', { withTimezone: true }),
+      createdByUserId: text('created_by_user_id'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      activeIdx: index('price_adjustments_active_idx').on(table.active),
+    }),
+  );
+
   return {
     schema: s,
     newsletterSubscribers,
@@ -320,6 +491,12 @@ function buildTenantTables(schemaName: string) {
     orders,
     orderItems,
     orderStatusLog,
+    customers,
+    reviews,
+    subscriptions,
+    invoices,
+    cityStatus,
+    priceAdjustments,
   };
 }
 
@@ -478,6 +655,15 @@ CREATE TABLE IF NOT EXISTS ${q}."partners" (
   "iban" varchar(34),
   "bic" varchar(11),
   "commission_rate" numeric(5, 2),
+  "stripe_connect_id" text,
+  "stripe_connect_status" varchar(16) DEFAULT 'none' NOT NULL,
+  "charges_enabled" boolean DEFAULT false NOT NULL,
+  "payouts_enabled" boolean DEFAULT false NOT NULL,
+  "tier" varchar(16) DEFAULT 'basic' NOT NULL,
+  "monthly_fee_cents" integer DEFAULT 0 NOT NULL,
+  "rating" numeric(3, 2),
+  "rating_count" integer DEFAULT 0 NOT NULL,
+  "score" integer,
   "status" varchar(16) DEFAULT 'pending' NOT NULL,
   "approved_at" timestamp with time zone,
   "approved_by_user_id" text,
@@ -522,7 +708,17 @@ CREATE TABLE IF NOT EXISTS ${q}."orders" (
   "subtotal_cents" integer NOT NULL,
   "pickup_fee_cents" integer DEFAULT 0 NOT NULL,
   "min_order_top_up_cents" integer DEFAULT 0 NOT NULL,
+  "discount_cents" integer DEFAULT 0 NOT NULL,
+  "voucher_code" text,
   "total_cents" integer NOT NULL,
+  "refunded_amount_cents" integer DEFAULT 0 NOT NULL,
+  "assigned_partner_id" integer,
+  "assigned_at" timestamp with time zone,
+  "commission_cents" integer,
+  "partner_payout_cents" integer,
+  "payout_status" varchar(16) DEFAULT 'none' NOT NULL,
+  "stripe_transfer_id" text,
+  "payout_at" timestamp with time zone,
   "pickup_mode" varchar(16) NOT NULL,
   "pickup_zone" integer,
   "pickup_plz" varchar(5),
@@ -589,5 +785,146 @@ CREATE TABLE IF NOT EXISTS ${q}."order_status_log" (
   "created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 CREATE INDEX IF NOT EXISTS "order_status_log_order_id_idx" ON ${q}."order_status_log" ("order_id");
+
+-- Self-healing adds for schemas predating these columns (idempotent).
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "stripe_connect_id" text;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "stripe_connect_status" varchar(16) DEFAULT 'none' NOT NULL;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "charges_enabled" boolean DEFAULT false NOT NULL;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "payouts_enabled" boolean DEFAULT false NOT NULL;
+
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "discount_cents" integer DEFAULT 0 NOT NULL;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "voucher_code" text;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "refunded_amount_cents" integer DEFAULT 0 NOT NULL;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "assigned_partner_id" integer;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "assigned_at" timestamp with time zone;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "commission_cents" integer;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "partner_payout_cents" integer;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payout_status" varchar(16) DEFAULT 'none' NOT NULL;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "stripe_transfer_id" text;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payout_at" timestamp with time zone;
+CREATE INDEX IF NOT EXISTS "orders_assigned_partner_idx" ON ${q}."orders" ("assigned_partner_id");
+
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "tier" varchar(16) DEFAULT 'basic' NOT NULL;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "monthly_fee_cents" integer DEFAULT 0 NOT NULL;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "rating" numeric(3, 2);
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "rating_count" integer DEFAULT 0 NOT NULL;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "score" integer;
+
+CREATE TABLE IF NOT EXISTS ${q}."customers" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "email" text NOT NULL,
+  "name" text,
+  "phone" varchar(32),
+  "total_orders" integer DEFAULT 0 NOT NULL,
+  "total_spent_cents" integer DEFAULT 0 NOT NULL,
+  "loyalty_tier" varchar(16) DEFAULT 'neukunde' NOT NULL,
+  "first_order_at" timestamp with time zone,
+  "last_order_at" timestamp with time zone,
+  "marketing_opt_in" boolean DEFAULT false NOT NULL,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+  CONSTRAINT "${schemaName}_customers_email_unique" UNIQUE("email")
+);
+CREATE INDEX IF NOT EXISTS "customers_loyalty_tier_idx" ON ${q}."customers" ("loyalty_tier");
+
+CREATE TABLE IF NOT EXISTS ${q}."reviews" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "order_id" integer,
+  "partner_id" integer,
+  "customer_email" text,
+  "customer_name" text,
+  "rating" integer NOT NULL,
+  "comment" text,
+  "photos" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "status" varchar(16) DEFAULT 'new' NOT NULL,
+  "partner_response" text,
+  "responded_at" timestamp with time zone,
+  "flagged" boolean DEFAULT false NOT NULL,
+  "flag_reason" text,
+  "source" varchar(32),
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "reviews_status_idx" ON ${q}."reviews" ("status");
+CREATE INDEX IF NOT EXISTS "reviews_partner_idx" ON ${q}."reviews" ("partner_id");
+
+CREATE TABLE IF NOT EXISTS ${q}."subscriptions" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "customer_email" text NOT NULL,
+  "customer_name" text,
+  "plan_name" text NOT NULL,
+  "monthly_price_cents" integer DEFAULT 0 NOT NULL,
+  "interval_months" integer DEFAULT 1 NOT NULL,
+  "stripe_subscription_id" text,
+  "status" varchar(16) DEFAULT 'active' NOT NULL,
+  "services_included" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "next_service_date" date,
+  "paused_at" timestamp with time zone,
+  "cancelled_at" timestamp with time zone,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "subscriptions_status_idx" ON ${q}."subscriptions" ("status");
+CREATE INDEX IF NOT EXISTS "subscriptions_email_idx" ON ${q}."subscriptions" ("customer_email");
+
+CREATE TABLE IF NOT EXISTS ${q}."invoices" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "number" varchar(64),
+  "order_id" integer,
+  "partner_id" integer,
+  "customer_type" varchar(8) DEFAULT 'b2c' NOT NULL,
+  "recipient_name" text NOT NULL,
+  "recipient_email" text,
+  "status" varchar(16) DEFAULT 'draft' NOT NULL,
+  "currency" varchar(3) DEFAULT 'EUR' NOT NULL,
+  "subtotal_cents" integer DEFAULT 0 NOT NULL,
+  "tax_cents" integer DEFAULT 0 NOT NULL,
+  "total_cents" integer DEFAULT 0 NOT NULL,
+  "line_items" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "payment_terms_days" integer DEFAULT 14 NOT NULL,
+  "due_at" timestamp with time zone,
+  "sent_at" timestamp with time zone,
+  "paid_at" timestamp with time zone,
+  "dunning_level" integer DEFAULT 0 NOT NULL,
+  "last_dunning_at" timestamp with time zone,
+  "odoo_invoice_id" text,
+  "notes" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "invoices_status_idx" ON ${q}."invoices" ("status");
+CREATE INDEX IF NOT EXISTS "invoices_due_idx" ON ${q}."invoices" ("due_at");
+
+CREATE TABLE IF NOT EXISTS ${q}."city_status" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "city" text NOT NULL,
+  "plz_prefix" varchar(5) NOT NULL,
+  "status" varchar(16) DEFAULT 'locked' NOT NULL,
+  "partner_count" integer DEFAULT 0 NOT NULL,
+  "active_partner_count" integer DEFAULT 0 NOT NULL,
+  "order_count_30d" integer DEFAULT 0 NOT NULL,
+  "orders_per_partner" numeric(8, 2),
+  "seo_page_generated" boolean DEFAULT false NOT NULL,
+  "google_ads_active" boolean DEFAULT false NOT NULL,
+  "last_status_change" timestamp with time zone,
+  "notes" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+  CONSTRAINT "${schemaName}_city_status_plz_unique" UNIQUE("plz_prefix")
+);
+
+CREATE TABLE IF NOT EXISTS ${q}."price_adjustments" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "scope" varchar(16) DEFAULT 'global' NOT NULL,
+  "scope_key" varchar(64),
+  "adjustment_percent" numeric(5, 2) NOT NULL,
+  "reason" text,
+  "active" boolean DEFAULT true NOT NULL,
+  "valid_from" timestamp with time zone,
+  "valid_to" timestamp with time zone,
+  "created_by_user_id" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "price_adjustments_active_idx" ON ${q}."price_adjustments" ("active");
 `;
 }

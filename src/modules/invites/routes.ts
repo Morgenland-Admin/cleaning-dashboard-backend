@@ -269,28 +269,27 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
         const name = body.lastName
           ? `${body.firstName} ${body.lastName}`.trim()
           : body.firstName.trim();
-        const created = await auth.api.signUpEmail({
-          body: { email: payload.email, password: body.password, name },
+        userId = nanoid();
+        const hashed = await auth.$context.then((ctx) => ctx.password.hash(body.password));
+        await db.insert(user).values({
+          id: userId,
+          name,
+          email: payload.email,
+          firstName: body.firstName,
+          lastName: body.lastName ?? null,
+          audience: payload.audience,
+          accessLevel: payload.accessLevel,
+          emailVerified: true,
+          isActive: true,
+          invitedByUserId: payload.invitedByUserId,
         });
-        if (!created?.user?.id) {
-          reply.code(500).send({ error: 'Failed to create account' });
-          return;
-        }
-        userId = created.user.id;
-
-        await db
-          .update(user)
-          .set({
-            firstName: body.firstName,
-            lastName: body.lastName ?? null,
-            audience: payload.audience,
-            accessLevel: payload.accessLevel,
-            emailVerified: true,
-            isActive: true,
-            invitedByUserId: payload.invitedByUserId,
-            updatedAt: now,
-          })
-          .where(eq(user.id, userId));
+        await db.insert(account).values({
+          id: nanoid(),
+          userId,
+          providerId: 'credential',
+          accountId: userId,
+          password: hashed,
+        });
       }
 
       await db

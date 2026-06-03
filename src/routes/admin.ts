@@ -15,6 +15,12 @@ import exportsAdminRoutes from '../modules/exports/routes.js';
 import pushAdminRoutes from '../modules/push/routes.js';
 import { qrAdminRoutes } from '../modules/qr/routes.js';
 import tasksAdminRoutes from '../modules/tasks/routes.js';
+import { reviewsAdminRoutes } from '../modules/reviews/routes.js';
+import subscriptionsAdminRoutes from '../modules/subscriptions/routes.js';
+import invoicesAdminRoutes from '../modules/invoices/routes.js';
+import cityStatusAdminRoutes from '../modules/city-status/routes.js';
+import customersAdminRoutes from '../modules/customers/routes.js';
+import priceAdjustmentsAdminRoutes from '../modules/price-adjustments/routes.js';
 
 const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
@@ -36,6 +42,12 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
   await app.register(tasksAdminRoutes, { prefix: '/tasks' });
   await app.register(exportsAdminRoutes, { prefix: '/exports' });
   await app.register(qrAdminRoutes, { prefix: '/qr' });
+  await app.register(reviewsAdminRoutes, { prefix: '/reviews' });
+  await app.register(subscriptionsAdminRoutes, { prefix: '/subscriptions' });
+  await app.register(invoicesAdminRoutes, { prefix: '/invoices' });
+  await app.register(cityStatusAdminRoutes, { prefix: '/city-status' });
+  await app.register(customersAdminRoutes, { prefix: '/customers' });
+  await app.register(priceAdjustmentsAdminRoutes, { prefix: '/price-adjustments' });
 };
 
 export default adminRoutes;

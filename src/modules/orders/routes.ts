@@ -1,11 +1,12 @@
 import type { FastifyPluginAsync, FastifyInstance } from 'fastify';
-import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type Stripe from 'stripe';
 
 import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
 import { company } from '../../db/schema/shared.js';
+import type { TenantTables } from '../../db/schema/tenant.js';
 import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
 import {
   isStatusEmailableStatus,
@@ -15,7 +16,10 @@ import {
   orderStatusUpdateEmail,
 } from '../../email/templates.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
-import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
+import { computeCommission, parseCommissionRate } from '../../lib/commission.js';
+import { computeLoyaltyTier } from '../../lib/loyalty.js';
+import { captureException } from '../../lib/observability.js';
 import { formatEurFromCents, priceOrder } from '../../lib/pricing.js';
 import { getPriceBook } from '../../lib/price-books/index.js';
 import { getStripe, stripeConfigured } from '../../lib/stripe.js';
@@ -288,6 +292,23 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         });
         return;
       }
+      let discounts: Array<{ promotion_code: string }> | undefined;
+      if (body.voucherCode) {
+        const code = body.voucherCode.toUpperCase();
+        const promo = await stripe.promotionCodes.list({ code, active: true, limit: 1 });
+        const promoCode = promo.data[0];
+        const stillRedeemable =
+          promoCode &&
+          (!promoCode.expires_at || promoCode.expires_at * 1000 > Date.now()) &&
+          (promoCode.max_redemptions == null ||
+            promoCode.times_redeemed < promoCode.max_redemptions);
+        if (!stillRedeemable) {
+          reply.code(400).send({ error: 'Gutscheincode ungültig oder abgelaufen.' });
+          return;
+        }
+        discounts = [{ promotion_code: promoCode.id }];
+      }
+
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
         payment_method_types: ['card', 'klarna', 'sepa_debit'],
@@ -306,6 +327,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
             },
           },
         ],
+        ...(discounts ? { discounts } : {}),
         customer_email: body.customer.email,
         client_reference_id: String(orderRow.id),
         metadata: {
@@ -325,6 +347,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         .update(orders)
         .set({
           stripeSessionId: session.id,
+          voucherCode: body.voucherCode ? body.voucherCode.toUpperCase() : null,
           status: 'payment_pending',
           updatedAt: now,
         })
@@ -424,6 +447,7 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
         { err, eventType: event.type, eventId: event.id },
         'Stripe webhook handler failed',
       );
+      captureException(err, { eventType: event.type, eventId: event.id });
       reply.code(500).send({ error: 'Webhook handler failed' });
       return;
     }
@@ -474,8 +498,72 @@ async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Pro
       await markOrderRefundedByPaymentIntent(app, pi, refundAmount);
       return;
     }
+    case 'account.updated': {
+      const account = event.data.object;
+      await syncPartnerConnectAccount(app, account);
+      return;
+    }
+    case 'transfer.reversed': {
+      const transfer = event.data.object;
+      await markPayoutFailedByTransfer(app, transfer.id);
+      return;
+    }
     default:
       return;
+  }
+}
+
+/** Find the partner row (across all tenant schemas) for a Connect account and sync flags. */
+async function syncPartnerConnectAccount(
+  app: FastifyInstance,
+  account: Stripe.Account,
+): Promise<void> {
+  const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  const status = account.payouts_enabled
+    ? 'active'
+    : account.details_submitted
+      ? 'restricted'
+      : 'pending';
+  for (const c of await loadAllActiveCompanies()) {
+    const tables = getTenantTables(c.schemaName);
+    const [partner] = await db
+      .select({ id: tables.partners.id })
+      .from(tables.partners)
+      .where(eq(tables.partners.stripeConnectId, account.id))
+      .limit(1);
+    if (!partner) continue;
+    await db
+      .update(tables.partners)
+      .set({
+        stripeConnectStatus: status,
+        chargesEnabled: !!account.charges_enabled,
+        payoutsEnabled: !!account.payouts_enabled,
+        updatedAt: new Date(),
+      })
+      .where(eq(tables.partners.id, partner.id));
+    return;
+  }
+}
+
+/** Mark an order's payout failed when its Connect transfer is reversed/fails. */
+async function markPayoutFailedByTransfer(app: FastifyInstance, transferId: string): Promise<void> {
+  const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  for (const c of await loadAllActiveCompanies()) {
+    const tables = getTenantTables(c.schemaName);
+    const [order] = await db
+      .select({ id: tables.orders.id })
+      .from(tables.orders)
+      .where(eq(tables.orders.stripeTransferId, transferId))
+      .limit(1);
+    if (!order) continue;
+    await db
+      .update(tables.orders)
+      .set({ payoutStatus: 'failed', updatedAt: new Date() })
+      .where(eq(tables.orders.id, order.id));
+    app.log.warn({ transferId, orderId: order.id }, 'Partner payout reversed/failed');
+    return;
   }
 }
 
@@ -515,23 +603,88 @@ async function markOrderPaid(
     typeof session.payment_intent === 'string' ? session.payment_intent : null;
   const now = new Date();
 
-  await db.transaction(async (tx) => {
-    await tx
+  const amountTotal = typeof session.amount_total === 'number' ? session.amount_total : null;
+  const discountCents = session.total_details?.amount_discount ?? 0;
+  if (amountTotal != null && amountTotal !== order.totalCents && discountCents === 0) {
+    app.log.warn(
+      { orderId, orderTotal: order.totalCents, amountTotal },
+      'Paid amount differs from order total with no discount — investigate price drift',
+    );
+  }
+  const paidTotal = amountTotal ?? order.totalCents;
+
+  const claimed = await db.transaction(async (tx) => {
+    const rows = await tx
       .update(tables.orders)
       .set({
         status: 'paid',
         paidAt: now,
         stripePaymentIntentId: paymentIntentId,
+        totalCents: paidTotal,
+        discountCents,
         updatedAt: now,
       })
-      .where(eq(tables.orders.id, orderId));
+      .where(
+        and(
+          eq(tables.orders.id, orderId),
+          inArray(tables.orders.status, ['pending', 'payment_pending']),
+        ),
+      )
+      .returning({ id: tables.orders.id });
+    if (rows.length === 0) return false;
     await tx.insert(tables.orderStatusLog).values({
       orderId,
       fromStatus: order.status,
       toStatus: 'paid',
-      reason: `Stripe ${session.payment_status}`,
+      reason:
+        discountCents > 0
+          ? `Stripe ${session.payment_status} · Rabatt ${formatEurFromCents(discountCents)}`
+          : `Stripe ${session.payment_status}`,
     });
+    return true;
   });
+  if (!claimed) return;
+  order.totalCents = paidTotal;
+
+  try {
+    const { customers } = tables;
+    const [cust] = await db
+      .insert(customers)
+      .values({
+        email: order.customerEmail,
+        name: order.customerName,
+        phone: order.customerPhone,
+        totalOrders: 1,
+        totalSpentCents: paidTotal,
+        loyaltyTier: computeLoyaltyTier(1, paidTotal),
+        firstOrderAt: now,
+        lastOrderAt: now,
+        marketingOptIn: order.consentMarketing,
+      })
+      .onConflictDoUpdate({
+        target: customers.email,
+        set: {
+          totalOrders: sql`${customers.totalOrders} + 1`,
+          totalSpentCents: sql`${customers.totalSpentCents} + ${paidTotal}`,
+          name: sql`coalesce(${customers.name}, ${order.customerName})`,
+          phone: sql`coalesce(${customers.phone}, ${order.customerPhone})`,
+          lastOrderAt: now,
+          updatedAt: now,
+        },
+      })
+      .returning();
+    if (cust) {
+      const tier = computeLoyaltyTier(cust.totalOrders, cust.totalSpentCents);
+      if (tier !== cust.loyaltyTier) {
+        await db
+          .update(customers)
+          .set({ loyaltyTier: tier, updatedAt: now })
+          .where(eq(customers.id, cust.id));
+      }
+    }
+  } catch (err) {
+    app.log.warn({ err, orderId }, 'customer aggregate update failed');
+  }
 
   try {
     const items = await db
@@ -677,16 +830,25 @@ async function markOrderRefundedByPaymentIntent(
     if (order.status === 'refunded') return;
     const now = new Date();
     const fromStatus = order.status as OrderStatus;
+    const refundedTotal = refundAmountCents ?? order.totalCents;
+    if (refundedTotal <= order.refundedAmountCents) return;
+    const isFull = refundedTotal >= order.totalCents;
+    const toStatus: OrderStatus = isFull ? 'refunded' : 'partially_refunded';
     await db.transaction(async (tx) => {
       await tx
         .update(tables.orders)
-        .set({ status: 'refunded', refundedAt: now, updatedAt: now })
+        .set({
+          status: toStatus,
+          refundedAmountCents: refundedTotal,
+          ...(isFull ? { refundedAt: now } : {}),
+          updatedAt: now,
+        })
         .where(eq(tables.orders.id, order.id));
       await tx.insert(tables.orderStatusLog).values({
         orderId: order.id,
         fromStatus: order.status,
-        toStatus: 'refunded',
-        reason: 'Stripe charge.refunded',
+        toStatus,
+        reason: `Stripe charge.refunded · ${formatEurFromCents(refundedTotal)}`,
       });
     });
     void notifyCustomerStatusChange({
@@ -700,8 +862,8 @@ async function markOrderRefundedByPaymentIntent(
         publicToken: order.publicToken,
       },
       fromStatus,
-      toStatus: 'refunded',
-      refundCents: refundAmountCents,
+      toStatus,
+      refundCents: refundedTotal,
     }).catch(() => null);
     return;
   }
@@ -723,6 +885,7 @@ const listQuerySchema = z.object({
       'delivered',
       'completed',
       'cancelled',
+      'partially_refunded',
       'refunded',
     ])
     .optional(),
@@ -1117,6 +1280,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       'delivered',
       'completed',
       'cancelled',
+      'partially_refunded',
       'refunded',
     ];
     if (terminalStatuses.includes(row.status as OrderStatus)) {
@@ -1156,6 +1320,328 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       action: 'still_pending',
     });
   });
+
+  const assignSchema = z.object({ partnerId: z.number().int().positive() });
+
+  app.post('/:id/assign', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { partnerId } = assignSchema.parse(request.body);
+    const { orders, partners } = request.company!.tables;
+    const now = new Date();
+
+    const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!order) throw notFound('Order not found');
+
+    const [partner] = await db.select().from(partners).where(eq(partners.id, partnerId)).limit(1);
+    if (!partner) throw notFound('Partner not found on this company');
+    if (partner.status !== 'active') {
+      throw badRequest('Partner is not active — approve them before assigning orders');
+    }
+
+    const split = computeCommission(order.totalCents, parseCommissionRate(partner.commissionRate));
+
+    const [updated] = await db
+      .update(orders)
+      .set({
+        assignedPartnerId: partnerId,
+        assignedAt: now,
+        commissionCents: split.commissionCents,
+        partnerPayoutCents: split.partnerPayoutCents,
+        payoutStatus: order.payoutStatus === 'paid' ? 'paid' : 'pending',
+        updatedAt: now,
+      })
+      .where(eq(orders.id, id))
+      .returning();
+
+    const payoutReady = partner.payoutsEnabled && partner.stripeConnectStatus === 'active';
+    return {
+      order: { ...updated, orderNumber: orderNumberFor(updated!.id) },
+      commission: split,
+      payoutReady,
+      warning: payoutReady
+        ? null
+        : 'Partner has not completed Stripe Connect onboarding — payout will fail until they do.',
+    };
+  });
+
+  app.post('/:id/unassign', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { orders } = request.company!.tables;
+    const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!order) throw notFound('Order not found');
+    if (order.payoutStatus === 'paid') {
+      throw conflict('Cannot unassign — partner has already been paid out for this order');
+    }
+    const [updated] = await db
+      .update(orders)
+      .set({
+        assignedPartnerId: null,
+        assignedAt: null,
+        commissionCents: null,
+        partnerPayoutCents: null,
+        payoutStatus: 'none',
+        updatedAt: new Date(),
+      })
+      .where(eq(orders.id, id))
+      .returning();
+    return { order: { ...updated, orderNumber: orderNumberFor(updated!.id) } };
+  });
+
+  app.post(
+    '/:id/payout',
+    { preHandler: app.requireAccess('super_admin', 'admin', 'manager') },
+    async (request, reply) => {
+      const id = parseIntId((request.params as { id: string }).id);
+      const { orders, partners } = request.company!.tables;
+      const now = new Date();
+
+      if (!stripeConfigured) {
+        reply.code(503).send({ error: 'Stripe not configured on this server' });
+        return;
+      }
+
+      const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+      if (!order) throw notFound('Order not found');
+      if (order.stripeTransferId || order.payoutStatus === 'paid') {
+        throw conflict('Partner has already been paid out for this order');
+      }
+      if (!order.assignedPartnerId || order.partnerPayoutCents == null) {
+        throw badRequest('Order has no assigned partner / computed payout — assign it first');
+      }
+      const payable: OrderStatus[] = [
+        'paid',
+        'accepted',
+        'picked_up',
+        'in_cleaning',
+        'ready',
+        'delivered',
+        'completed',
+      ];
+      if (!payable.includes(order.status as OrderStatus)) {
+        throw badRequest(`Order status "${order.status}" is not payable`);
+      }
+      if (!order.stripePaymentIntentId) {
+        throw badRequest('Order has no payment intent — cannot source the transfer');
+      }
+
+      const [partner] = await db
+        .select()
+        .from(partners)
+        .where(eq(partners.id, order.assignedPartnerId))
+        .limit(1);
+      if (!partner?.stripeConnectId || !partner.payoutsEnabled) {
+        throw badRequest('Partner has not completed Stripe Connect onboarding');
+      }
+
+      const stripe = getStripe();
+      const pi = await stripe.paymentIntents.retrieve(order.stripePaymentIntentId);
+      const chargeId =
+        typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge?.id;
+      if (!chargeId) throw badRequest('Could not resolve the funding charge for this order');
+
+      let transferId: string;
+      try {
+        const transfer = await stripe.transfers.create(
+          {
+            amount: order.partnerPayoutCents,
+            currency: (order.currency ?? 'eur').toLowerCase(),
+            destination: partner.stripeConnectId,
+            source_transaction: chargeId,
+            transfer_group: `order_${request.company!.slug}_${order.id}`,
+            metadata: {
+              companySlug: request.company!.slug,
+              orderId: String(order.id),
+              partnerId: String(partner.id),
+            },
+          },
+          {
+            idempotencyKey: `payout_${request.company!.slug}_${order.id}`,
+          },
+        );
+        transferId = transfer.id;
+      } catch (err) {
+        request.log.error({ err, orderId: id }, 'Stripe partner transfer failed');
+        await db
+          .update(orders)
+          .set({ payoutStatus: 'failed', updatedAt: now })
+          .where(eq(orders.id, id));
+        reply.code(502).send({ error: 'Stripe transfer failed' });
+        return;
+      }
+
+      const [updated] = await db
+        .update(orders)
+        .set({ stripeTransferId: transferId, payoutStatus: 'paid', payoutAt: now, updatedAt: now })
+        .where(eq(orders.id, id))
+        .returning();
+      return {
+        order: { ...updated, orderNumber: orderNumberFor(updated!.id) },
+        transferId,
+        payoutCents: order.partnerPayoutCents,
+      };
+    },
+  );
+
+  const upsellSchema = z.object({
+    code: z.string().min(1).max(64),
+    label: z.string().min(1).max(200),
+    quantityLabel: z.string().min(1).max(80),
+    quantity: z.number().positive().max(100000),
+    unitPriceCents: z.number().int().min(0).max(100_000_000),
+  });
+  const NON_EDITABLE: OrderStatus[] = ['cancelled', 'refunded', 'partially_refunded'];
+
+  async function commissionPatch(
+    tables: TenantTables,
+    order: { assignedPartnerId: number | null; payoutStatus: string },
+    newTotal: number,
+  ): Promise<Record<string, number>> {
+    if (!order.assignedPartnerId || order.payoutStatus === 'paid') return {};
+    const [partner] = await db
+      .select({ commissionRate: tables.partners.commissionRate })
+      .from(tables.partners)
+      .where(eq(tables.partners.id, order.assignedPartnerId))
+      .limit(1);
+    const split = computeCommission(newTotal, parseCommissionRate(partner?.commissionRate));
+    return { commissionCents: split.commissionCents, partnerPayoutCents: split.partnerPayoutCents };
+  }
+
+  app.post('/:id/upsell', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const body = upsellSchema.parse(request.body);
+    const tables = request.company!.tables;
+    const { orders, orderItems } = tables;
+    const now = new Date();
+
+    const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!order) throw notFound('Order not found');
+    if (NON_EDITABLE.includes(order.status as OrderStatus)) {
+      throw badRequest(`Cannot modify an order in status "${order.status}"`);
+    }
+    if (order.payoutStatus === 'paid') {
+      throw conflict('Partner already paid out — cannot change the order total');
+    }
+    const addCents = Math.round(body.quantity * body.unitPriceCents);
+    const newTotal = order.totalCents + addCents;
+    const commission = await commissionPatch(tables, order, newTotal);
+
+    const updated = await db.transaction(async (tx) => {
+      await tx.insert(orderItems).values({
+        orderId: id,
+        code: body.code,
+        label: body.label,
+        quantityLabel: body.quantityLabel,
+        quantity: body.quantity.toFixed(2),
+        unitPriceCents: body.unitPriceCents,
+        subtotalCents: addCents,
+        metadata: { upsell: true },
+      });
+      const [u] = await tx
+        .update(orders)
+        .set({
+          subtotalCents: order.subtotalCents + addCents,
+          totalCents: newTotal,
+          ...commission,
+          updatedAt: now,
+        })
+        .where(eq(orders.id, id))
+        .returning();
+      return u!;
+    });
+
+    return {
+      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      topUpCents: addCents,
+    };
+  });
+
+  const adjustSchema = z.object({
+    items: z
+      .array(
+        z.object({
+          code: z.string().min(1).max(64),
+          label: z.string().min(1).max(200),
+          quantityLabel: z.string().min(1).max(80),
+          quantity: z.number().positive().max(100000),
+          unitPriceCents: z.number().int().min(0).max(100_000_000),
+        }),
+      )
+      .min(1)
+      .max(50),
+    reason: z.string().trim().max(500).optional(),
+  });
+
+  app.post('/:id/adjust', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const body = adjustSchema.parse(request.body);
+    const { orders, orderItems, orderStatusLog } = request.company!.tables;
+    const adminId = request.authUser!.id;
+    const now = new Date();
+
+    const tables = request.company!.tables;
+    const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!order) throw notFound('Order not found');
+    if (NON_EDITABLE.includes(order.status as OrderStatus)) {
+      throw badRequest(`Cannot adjust an order in status "${order.status}"`);
+    }
+    if (order.payoutStatus === 'paid') {
+      throw conflict('Partner already paid out — cannot change the order total');
+    }
+
+    const lines = body.items.map((l) => ({
+      orderId: id,
+      code: l.code,
+      label: l.label,
+      quantityLabel: l.quantityLabel,
+      quantity: l.quantity.toFixed(2),
+      unitPriceCents: l.unitPriceCents,
+      subtotalCents: Math.round(l.quantity * l.unitPriceCents),
+    }));
+    const newSubtotal = lines.reduce((a, l) => a + l.subtotalCents, 0);
+    const book = getPriceBook(request.company!.slug);
+    const minOrderCents =
+      order.kind === 'teppichreinigung'
+        ? (book?.carpetCleaning?.minOrderCents ?? 0)
+        : order.kind === 'polsterreinigung'
+          ? (book?.upholstery?.minOrderCents ?? 0)
+          : 0;
+    const grossBeforeMin = newSubtotal + order.pickupFeeCents;
+    const minOrderTopUpCents = grossBeforeMin < minOrderCents ? minOrderCents - grossBeforeMin : 0;
+    const newTotal = grossBeforeMin + minOrderTopUpCents;
+    const deltaCents = newTotal - order.totalCents;
+    const commission = await commissionPatch(tables, order, newTotal);
+
+    const updated = await db.transaction(async (tx) => {
+      await tx.delete(orderItems).where(eq(orderItems.orderId, id));
+      await tx.insert(orderItems).values(lines);
+      const [u] = await tx
+        .update(orders)
+        .set({
+          subtotalCents: newSubtotal,
+          minOrderTopUpCents,
+          totalCents: newTotal,
+          ...commission,
+          updatedAt: now,
+        })
+        .where(eq(orders.id, id))
+        .returning();
+      await tx.insert(orderStatusLog).values({
+        orderId: id,
+        fromStatus: order.status,
+        toStatus: order.status,
+        changedByUserId: adminId,
+        reason: `Korrektur (${deltaCents >= 0 ? '+' : ''}${formatEurFromCents(deltaCents)})${body.reason ? ` · ${body.reason}` : ''}`,
+      });
+      return u!;
+    });
+
+    const isPaid = order.paidAt != null;
+    return {
+      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      deltaCents,
+      refundDueCents: isPaid && deltaCents < 0 ? -deltaCents : 0,
+    };
+  });
 };
 
 const crossListQuerySchema = z.object({
@@ -1172,6 +1658,7 @@ const crossListQuerySchema = z.object({
       'delivered',
       'completed',
       'cancelled',
+      'partially_refunded',
       'refunded',
     ])
     .optional(),
@@ -1182,7 +1669,20 @@ export const ordersAdminCrossRoutes: FastifyPluginAsync = async (app) => {
     const { limit, status } = crossListQuerySchema.parse(request.query);
     const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
     const { getTenantTables } = await import('../../db/schema/tenant.js');
-    const companies = await loadAllActiveCompanies();
+    const { membership } = await import('../../db/schema/shared.js');
+
+    const allCompanies = await loadAllActiveCompanies();
+    const isSuperAdmin =
+      (request.authUser as unknown as { accessLevel?: string }).accessLevel === 'super_admin';
+    let companies = allCompanies;
+    if (!isSuperAdmin) {
+      const mine = await db
+        .select({ slug: membership.companySlug })
+        .from(membership)
+        .where(eq(membership.userId, request.authUser!.id));
+      const allowed = new Set(mine.map((m) => m.slug));
+      companies = allCompanies.filter((c) => allowed.has(c.slug));
+    }
 
     type EnrichedOrder = Awaited<ReturnType<typeof fetchOrdersForCompany>>[number];
     async function fetchOrdersForCompany(c: (typeof companies)[number]) {
@@ -1213,5 +1713,153 @@ export const ordersAdminCrossRoutes: FastifyPluginAsync = async (app) => {
       orders: all.slice(0, limit),
       nextCursor: null,
     };
+  });
+};
+
+const partnerTransitionSchema = z.object({
+  toStatus: z.enum(['picked_up', 'in_cleaning', 'ready', 'delivered']),
+  reason: z.string().trim().max(500).optional(),
+});
+
+export const ordersPartnerRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', app.requireCompany);
+
+  async function resolvePartnerId(userId: string, tables: TenantTables): Promise<number | null> {
+    const [p] = await db
+      .select({ id: tables.partners.id })
+      .from(tables.partners)
+      .where(eq(tables.partners.userId, userId))
+      .limit(1);
+    return p?.id ?? null;
+  }
+
+  function toPartnerView(row: Record<string, unknown>) {
+    const {
+      customerEmail: _e,
+      internalNotes: _n,
+      ipAddress: _i,
+      userAgent: _u,
+      stripeSessionId: _s,
+      stripePaymentIntentId: _p,
+      stripeTransferId: _t,
+      ...safe
+    } = row;
+    return { ...safe, orderNumber: orderNumberFor(Number(row.id)) };
+  }
+
+  app.get('/', async (request, reply) => {
+    const userId = request.authUser!.id;
+    const tables = request.company!.tables;
+    const partnerId = await resolvePartnerId(userId, tables);
+    if (!partnerId) {
+      reply.send({ orders: [] });
+      return;
+    }
+    const { limit, cursor, status } = listQuerySchema.parse(request.query);
+    const { orders } = tables;
+    const decoded = cursor ? decodeCursor(cursor) : null;
+    const conds = [eq(orders.assignedPartnerId, partnerId)];
+    if (status) conds.push(eq(orders.status, status));
+    if (decoded) {
+      const cursorWhere = or(
+        lt(orders.createdAt, sql`${decoded.createdAt}::timestamptz`),
+        and(
+          sql`${orders.createdAt} = ${decoded.createdAt}::timestamptz`,
+          lt(orders.id, decoded.id),
+        ),
+      );
+      if (cursorWhere) conds.push(cursorWhere);
+    }
+    const rows = await db
+      .select()
+      .from(orders)
+      .where(and(...conds))
+      .orderBy(desc(orders.createdAt), desc(orders.id))
+      .limit(limit + 1);
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
+        : null;
+    reply.send({ orders: page.map(toPartnerView), nextCursor });
+  });
+
+  app.get('/:id', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const userId = request.authUser!.id;
+    const tables = request.company!.tables;
+    const partnerId = await resolvePartnerId(userId, tables);
+    const { orders, orderItems, orderStatusLog } = tables;
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row || row.assignedPartnerId !== partnerId) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+    const items = await db.select().from(orderItems).where(eq(orderItems.orderId, id));
+    const log = await db
+      .select()
+      .from(orderStatusLog)
+      .where(eq(orderStatusLog.orderId, id))
+      .orderBy(desc(orderStatusLog.createdAt));
+    reply.send({
+      order: toPartnerView(row),
+      items,
+      statusLog: log,
+      allowedNextStatuses: allowedNextStatuses(row.status as OrderStatus).filter((s) =>
+        (['picked_up', 'in_cleaning', 'ready', 'delivered'] as OrderStatus[]).includes(s),
+      ),
+    });
+  });
+
+  app.post('/:id/transition', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { toStatus, reason } = partnerTransitionSchema.parse(request.body);
+    const userId = request.authUser!.id;
+    const tables = request.company!.tables;
+    const partnerId = await resolvePartnerId(userId, tables);
+    const { orders, orderStatusLog } = tables;
+    const now = new Date();
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row || row.assignedPartnerId !== partnerId) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+    if (!canTransition(row.status as OrderStatus, toStatus)) {
+      reply.code(409).send({
+        error: `Cannot transition from ${row.status} to ${toStatus}`,
+        allowedNextStatuses: allowedNextStatuses(row.status as OrderStatus),
+      });
+      return;
+    }
+
+    const timestampCol = statusTimestampColumn(toStatus);
+    const patch: Record<string, unknown> = { status: toStatus, updatedAt: now };
+    if (timestampCol) patch[timestampCol] = now;
+
+    const updated = await db.transaction(async (tx) => {
+      const [u] = await tx.update(orders).set(patch).where(eq(orders.id, id)).returning();
+      if (!u) throw new Error('Order row vanished mid-transition');
+      await tx.insert(orderStatusLog).values({
+        orderId: id,
+        fromStatus: row.status,
+        toStatus,
+        changedByUserId: userId,
+        reason: reason ?? 'Partner update',
+      });
+      return u;
+    });
+
+    void notifyCustomerStatusChange({
+      log: request.log,
+      companySlug: request.company!.slug,
+      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      fromStatus: row.status as OrderStatus,
+      toStatus,
+    }).catch(() => null);
+
+    reply.send({ order: toPartnerView(updated) });
   });
 };

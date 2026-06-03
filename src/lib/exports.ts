@@ -21,6 +21,9 @@ function csvField(v: unknown): string {
   if (v instanceof Date) s = v.toISOString();
   else if (typeof v === 'object') s = JSON.stringify(v);
   else s = String(v);
+  if (/^[=+\-@\t\r]/.test(s)) {
+    s = `'${s}`;
+  }
   if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
     return `"${s.replace(/"/g, '""')}"`;
   }

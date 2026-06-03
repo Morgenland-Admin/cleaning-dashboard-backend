@@ -11,8 +11,12 @@ import adminRoutes from './routes/admin.js';
 import partnerRoutes from './routes/partner.js';
 import storefrontRoutes from './routes/storefront.js';
 import { loadAllActiveCompanies } from './lib/company-loader.js';
+import { db } from './db/index.js';
+import { sql } from 'drizzle-orm';
+import { initObservability } from './lib/observability.js';
 
 export async function buildApp(opts: FastifyServerOptions = {}) {
+  await initObservability();
   const redactPaths = [
     'req.headers.authorization',
     'req.headers.cookie',
@@ -88,7 +92,16 @@ export async function buildApp(opts: FastifyServerOptions = {}) {
   await app.register(authPlugin);
   await app.register(companyContext);
 
-  app.get('/health', async () => ({ status: 'ok', time: new Date().toISOString() }));
+  app.get('/health', async (_req, reply) => {
+    try {
+      await db.execute(sql`SELECT 1`);
+      return { status: 'ok', db: 'up', time: new Date().toISOString() };
+    } catch (err) {
+      app.log.error({ err }, 'health check: database unreachable');
+      reply.code(503);
+      return { status: 'degraded', db: 'down', time: new Date().toISOString() };
+    }
+  });
 
   await app.register(adminRoutes, { prefix: '/admin' });
   await app.register(partnerRoutes, { prefix: '/partner' });

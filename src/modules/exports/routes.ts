@@ -30,6 +30,8 @@ async function userBrandSlugs(userId: string): Promise<string[]> {
 }
 
 export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', app.requireAccess('super_admin', 'admin', 'manager'));
+
   app.post('/', async (request, reply) => {
     if (!s3Configured) {
       reply.code(503).send({ error: 'S3 not configured — exports are disabled' });

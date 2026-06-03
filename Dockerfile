@@ -12,7 +12,7 @@ FROM node:22-alpine AS build
 WORKDIR /app
 RUN corepack enable
 COPY --from=deps /app/node_modules ./node_modules
-COPY package.json pnpm-lock.yaml .npmrc tsconfig.json drizzle.config.ts ./
+COPY package.json pnpm-lock.yaml .npmrc tsconfig.json tsconfig.build.json drizzle.config.ts ./
 COPY src ./src
 COPY drizzle ./drizzle
 RUN pnpm run build && pnpm prune --prod --config.minimum-release-age=0 --config.minimumReleaseAge=0

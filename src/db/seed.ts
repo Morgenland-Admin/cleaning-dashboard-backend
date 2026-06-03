@@ -1,8 +1,9 @@
 import { eq, sql } from 'drizzle-orm';
+import { nanoid } from 'nanoid';
 import { auth } from '../auth/index.js';
 import { LEGACY_COMPANY_SLUGS, type LegacyCompanySlug } from '../config/companies.js';
 import { db, pool } from './index.js';
-import { company, membership, user, userSettings } from './schema/shared.js';
+import { account, company, membership, user, userSettings } from './schema/shared.js';
 import { getTenantTables } from './schema/tenant.js';
 
 type CompanySlug = LegacyCompanySlug;
@@ -168,19 +169,14 @@ async function ensureUser(seed: SeedUser) {
     return updated;
   }
 
-  const created = await auth.api.signUpEmail({
-    body: {
+  const userId = nanoid();
+  const hashed = await auth.$context.then((ctx) => ctx.password.hash(seed.password));
+  const [createdUser] = await db
+    .insert(user)
+    .values({
+      id: userId,
+      name: `${seed.firstName} ${seed.lastName}`.trim() || seed.email,
       email: seed.email,
-      password: seed.password,
-      name: `${seed.firstName} ${seed.lastName}`.trim(),
-    },
-  });
-  if (!created?.user?.id) {
-    throw new Error(`signUpEmail did not return a user id for ${seed.email}`);
-  }
-  const [updated] = await db
-    .update(user)
-    .set({
       firstName: seed.firstName,
       lastName: seed.lastName,
       phone: seed.phone,
@@ -188,12 +184,17 @@ async function ensureUser(seed: SeedUser) {
       accessLevel: seed.accessLevel,
       emailVerified: true,
       isActive: true,
-      updatedAt: new Date(),
     })
-    .where(eq(user.id, created.user.id))
     .returning();
-  if (!updated) throw new Error(`Failed to enrich user ${seed.email}`);
-  return updated;
+  if (!createdUser) throw new Error(`Failed to create user ${seed.email}`);
+  await db.insert(account).values({
+    id: nanoid(),
+    userId,
+    providerId: 'credential',
+    accountId: userId,
+    password: hashed,
+  });
+  return createdUser;
 }
 
 async function ensureMemberships(userId: string, seed: SeedUser) {

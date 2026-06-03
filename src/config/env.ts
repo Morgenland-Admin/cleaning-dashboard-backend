@@ -39,6 +39,7 @@ const envSchema = z.object({
   VAPID_PUBLIC_KEY: optionalString,
   VAPID_PRIVATE_KEY: optionalString,
   VAPID_SUBJECT: z.string().default('mailto:admin@reinigungs-portal.com'),
+  SENTRY_DSN: optionalString,
 });
 
 const parsed = envSchema.safeParse(process.env);

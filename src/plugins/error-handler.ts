@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import fp from 'fastify-plugin';
 import { ZodError } from 'zod';
 import { HttpError } from '../lib/http-errors.js';
+import { captureException } from '../lib/observability.js';
 
 const errorHandler: FastifyPluginAsync = async (app) => {
   app.setErrorHandler((error, request, reply) => {
@@ -18,6 +19,9 @@ const errorHandler: FastifyPluginAsync = async (app) => {
     request.log.error({ err: error }, 'unhandled error');
     const fastifyErr = error as { statusCode?: number; message: string };
     const status = fastifyErr.statusCode ?? 500;
+    if (status >= 500) {
+      captureException(error, { method: request.method, url: request.url });
+    }
     return reply.code(status).send({
       error: status >= 500 ? 'Internal Server Error' : fastifyErr.message,
       code: 'INTERNAL',

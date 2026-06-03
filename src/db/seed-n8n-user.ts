@@ -1,8 +1,9 @@
 import { eq } from 'drizzle-orm';
+import { nanoid } from 'nanoid';
 import { auth } from '../auth/index.js';
 import { LEGACY_COMPANY_SLUGS } from '../config/companies.js';
 import { db, pool } from './index.js';
-import { company, membership, user, userSettings } from './schema/shared.js';
+import { account, company, membership, user, userSettings } from './schema/shared.js';
 
 const EMAIL = process.env.N8N_ROBOT_EMAIL ?? 'n8n@morgenland-teppiche.de';
 const PASSWORD = process.env.N8N_ROBOT_PASSWORD ?? '';
@@ -36,28 +37,32 @@ async function ensureRobotUser() {
     );
   }
 
-  const created = await auth.api.signUpEmail({
-    body: { email: EMAIL, password: PASSWORD, name: 'n8n Automation' },
-  });
-  if (!created?.user?.id) {
-    throw new Error(`signUpEmail did not return a user id for ${EMAIL}`);
-  }
-  const [updated] = await db
-    .update(user)
-    .set({
+  const userId = nanoid();
+  const hashed = await auth.$context.then((ctx) => ctx.password.hash(PASSWORD));
+  const [created] = await db
+    .insert(user)
+    .values({
+      id: userId,
+      name: 'n8n Automation',
+      email: EMAIL,
       firstName: 'n8n',
       lastName: 'Automation',
       audience: 'admin',
       accessLevel: 'admin',
       emailVerified: true,
       isActive: true,
-      updatedAt: new Date(),
     })
-    .where(eq(user.id, created.user.id))
     .returning();
-  if (!updated) throw new Error(`Failed to enrich robot user ${EMAIL}`);
+  if (!created) throw new Error(`Failed to create robot user ${EMAIL}`);
+  await db.insert(account).values({
+    id: nanoid(),
+    userId,
+    providerId: 'credential',
+    accountId: userId,
+    password: hashed,
+  });
   console.info(`   ✓ created user ${EMAIL}`);
-  return updated;
+  return created;
 }
 
 async function ensureMemberships(userId: string) {

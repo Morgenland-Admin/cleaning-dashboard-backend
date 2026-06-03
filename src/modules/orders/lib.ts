@@ -28,6 +28,7 @@ export type OrderStatus =
   | 'delivered'
   | 'completed'
   | 'cancelled'
+  | 'partially_refunded'
   | 'refunded';
 
 export const ORDER_STATUSES: readonly OrderStatus[] = [
@@ -41,21 +42,35 @@ export const ORDER_STATUSES: readonly OrderStatus[] = [
   'delivered',
   'completed',
   'cancelled',
+  'partially_refunded',
   'refunded',
 ];
 
-/** Allowed forward + side transitions. Any status can move to cancelled/refunded. */
+/**
+ * Allowed forward + side transitions. Any paid state can move to
+ * partially_refunded (some money back, order continues) or refunded (terminal).
+ * A partially_refunded order can still be fully refunded later.
+ */
 const FORWARD: Record<OrderStatus, OrderStatus[]> = {
   pending: ['payment_pending', 'cancelled'],
   payment_pending: ['paid', 'cancelled'],
-  paid: ['accepted', 'cancelled', 'refunded'],
-  accepted: ['picked_up', 'cancelled', 'refunded'],
-  picked_up: ['in_cleaning', 'cancelled', 'refunded'],
-  in_cleaning: ['ready', 'cancelled', 'refunded'],
-  ready: ['delivered', 'cancelled', 'refunded'],
-  delivered: ['completed', 'refunded'],
-  completed: ['refunded'],
+  paid: ['accepted', 'cancelled', 'partially_refunded', 'refunded'],
+  accepted: ['picked_up', 'cancelled', 'partially_refunded', 'refunded'],
+  picked_up: ['in_cleaning', 'cancelled', 'partially_refunded', 'refunded'],
+  in_cleaning: ['ready', 'cancelled', 'partially_refunded', 'refunded'],
+  ready: ['delivered', 'cancelled', 'partially_refunded', 'refunded'],
+  delivered: ['completed', 'partially_refunded', 'refunded'],
+  completed: ['partially_refunded', 'refunded'],
   cancelled: [],
+  partially_refunded: [
+    'accepted',
+    'picked_up',
+    'in_cleaning',
+    'ready',
+    'delivered',
+    'completed',
+    'refunded',
+  ],
   refunded: [],
 };
 

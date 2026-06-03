@@ -547,6 +547,7 @@ type StatusKey =
   | 'delivered'
   | 'completed'
   | 'cancelled'
+  | 'partially_refunded'
   | 'refunded';
 
 interface StatusCopy {
@@ -597,6 +598,12 @@ const STATUS_COPY: Record<StatusKey, StatusCopy> = {
     subject: 'Auftrag storniert',
     headline: 'Stornierung bestätigt',
     body: 'Wir haben Ihren Auftrag wie besprochen storniert. Falls Sie eine Rückerstattung erhalten, sehen Sie diese in 5–10 Werktagen auf Ihrem Konto.',
+    ctaLabel: 'Auftragsdetails',
+  },
+  partially_refunded: {
+    subject: 'Teilrückerstattung veranlasst',
+    headline: 'Teilrückerstattung',
+    body: 'Wir haben eine Teilrückerstattung für Ihren Auftrag veranlasst. Der Betrag erscheint in 5–10 Werktagen auf Ihrem Zahlungsmittel.',
     ctaLabel: 'Auftragsdetails',
   },
   refunded: {

@@ -114,6 +114,13 @@ export const checkoutSchema = quoteSchema.and(
       .max(3)
       .optional(),
     customerNotes: z.string().trim().max(2000).optional(),
+    voucherCode: z
+      .string()
+      .trim()
+      .min(2)
+      .max(80)
+      .regex(/^[A-Z0-9_-]+$/i, 'Code may only contain letters, digits, _, -')
+      .optional(),
     consentPrivacy: z.literal(true, {
       errorMap: () => ({ message: 'Privacy consent is required' }),
     }),
