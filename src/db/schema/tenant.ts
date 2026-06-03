@@ -479,6 +479,33 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
+  const seoPages = s.table(
+    'seo_pages',
+    {
+      id: serial('id').primaryKey(),
+      type: varchar('type', { length: 16 }).notNull().default('service'),
+      path: text('path').notNull().unique(),
+      city: text('city'),
+      region: text('region'),
+      title: text('title'),
+      metaTitle: text('meta_title'),
+      metaDescription: text('meta_description'),
+      h1: text('h1'),
+      bodyHtml: text('body_html'),
+      schemaJsonld: jsonb('schema_jsonld').$type<Record<string, unknown> | unknown[]>(),
+      faq: jsonb('faq').$type<Array<{ question: string; answer: string }>>().notNull().default([]),
+      status: varchar('status', { length: 16 }).notNull().default('draft'), // draft | live | protected
+      gscPosition: numeric('gsc_position', { precision: 5, scale: 2 }),
+      source: varchar('source', { length: 64 }),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      pathUnique: uniqueIndex('seo_pages_path_unique').on(table.path),
+      statusTypeIdx: index('seo_pages_status_type_idx').on(table.status, table.type),
+    }),
+  );
+
   return {
     schema: s,
     newsletterSubscribers,
@@ -497,6 +524,7 @@ function buildTenantTables(schemaName: string) {
     invoices,
     cityStatus,
     priceAdjustments,
+    seoPages,
   };
 }
 
@@ -926,5 +954,27 @@ CREATE TABLE IF NOT EXISTS ${q}."price_adjustments" (
   "created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 CREATE INDEX IF NOT EXISTS "price_adjustments_active_idx" ON ${q}."price_adjustments" ("active");
+
+CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "type" varchar(16) DEFAULT 'service' NOT NULL,
+  "path" text NOT NULL,
+  "city" text,
+  "region" text,
+  "title" text,
+  "meta_title" text,
+  "meta_description" text,
+  "h1" text,
+  "body_html" text,
+  "schema_jsonld" jsonb,
+  "faq" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "status" varchar(16) DEFAULT 'draft' NOT NULL,
+  "gsc_position" numeric(5, 2),
+  "source" varchar(64),
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+  CONSTRAINT "${schemaName}_seo_pages_path_unique" UNIQUE("path")
+);
+CREATE INDEX IF NOT EXISTS "seo_pages_status_type_idx" ON ${q}."seo_pages" ("status", "type");
 `;
 }
