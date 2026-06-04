@@ -485,6 +485,7 @@ function buildTenantTables(schemaName: string) {
       id: serial('id').primaryKey(),
       type: varchar('type', { length: 16 }).notNull().default('service'),
       path: text('path').notNull().unique(),
+      category: varchar('category', { length: 64 }),
       city: text('city'),
       region: text('region'),
       title: text('title'),
@@ -959,6 +960,7 @@ CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
   "id" serial PRIMARY KEY NOT NULL,
   "type" varchar(16) DEFAULT 'service' NOT NULL,
   "path" text NOT NULL,
+  "category" varchar(64),
   "city" text,
   "region" text,
   "title" text,
@@ -976,5 +978,7 @@ CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
   CONSTRAINT "${schemaName}_seo_pages_path_unique" UNIQUE("path")
 );
 CREATE INDEX IF NOT EXISTS "seo_pages_status_type_idx" ON ${q}."seo_pages" ("status", "type");
+ALTER TABLE ${q}."seo_pages" ADD COLUMN IF NOT EXISTS "category" varchar(64);
+CREATE INDEX IF NOT EXISTS "seo_pages_category_idx" ON ${q}."seo_pages" ("category");
 `;
 }

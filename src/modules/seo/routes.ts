@@ -17,6 +17,7 @@ const faqSchema = z
 const createSchema = z.object({
   type: z.enum(['service', 'city']).default('service'),
   path: z.string().trim().regex(PATH_RE, 'path must be a lowercase slug, optionally with "/"'),
+  category: z.string().max(64).optional(),
   city: z.string().max(120).optional(),
   region: z.string().max(120).optional(),
   title: z.string().max(300).optional(),
@@ -52,18 +53,20 @@ const listQuerySchema = z.object({
   cursor: z.string().min(1).max(500).optional(),
   type: z.enum(['service', 'city']).optional(),
   status: z.enum(['draft', 'live', 'protected']).optional(),
+  category: z.string().max(64).optional(),
 });
 
 export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
 
   app.get('/', async (request) => {
-    const { limit, cursor, type, status } = listQuerySchema.parse(request.query);
+    const { limit, cursor, type, status, category } = listQuerySchema.parse(request.query);
     const { seoPages } = request.company!.tables;
     const decoded = cursor ? decodeCursor(cursor) : null;
     const conds = [];
     if (type) conds.push(eq(seoPages.type, type));
     if (status) conds.push(eq(seoPages.status, status));
+    if (category) conds.push(eq(seoPages.category, category));
     if (decoded) {
       const cw = or(
         lt(seoPages.createdAt, sql`${decoded.createdAt}::timestamptz`),
@@ -112,6 +115,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
       .values({
         type: body.type,
         path: body.path,
+        category: body.category,
         city: body.city,
         region: body.region,
         title: body.title,
@@ -127,6 +131,41 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
       })
       .returning();
     reply.code(201).send({ page: row });
+  });
+
+  const bulkSchema = z.object({ pages: z.array(createSchema).min(1).max(2000) });
+  app.post('/bulk', { bodyLimit: 8 * 1024 * 1024 }, async (request, reply) => {
+    const { pages } = bulkSchema.parse(request.body);
+    const { seoPages } = request.company!.tables;
+    const rows = pages.map((p) => ({
+      type: p.type,
+      path: p.path,
+      category: p.category,
+      city: p.city,
+      region: p.region,
+      title: p.title,
+      metaTitle: p.metaTitle,
+      metaDescription: p.metaDescription,
+      h1: p.h1,
+      bodyHtml: p.bodyHtml,
+      schemaJsonld: p.schemaJsonld ?? null,
+      faq: p.faq ?? [],
+      status: p.status, // defaults to 'draft'
+      gscPosition: p.gscPosition != null ? p.gscPosition.toFixed(2) : null,
+      source: p.source,
+    }));
+    let inserted = 0;
+    const BATCH = 500;
+    for (let i = 0; i < rows.length; i += BATCH) {
+      const chunk = rows.slice(i, i + BATCH);
+      const res = await db
+        .insert(seoPages)
+        .values(chunk)
+        .onConflictDoNothing({ target: seoPages.path })
+        .returning({ id: seoPages.id });
+      inserted += res.length;
+    }
+    reply.code(201).send({ total: pages.length, inserted, skipped: pages.length - inserted });
   });
 
   /**
@@ -169,6 +208,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     for (const k of [
       'type',
       'path',
+      'category',
       'city',
       'region',
       'title',
@@ -226,6 +266,7 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
       .select({
         type: seoPages.type,
         path: seoPages.path,
+        category: seoPages.category,
         city: seoPages.city,
         region: seoPages.region,
         title: seoPages.title,
