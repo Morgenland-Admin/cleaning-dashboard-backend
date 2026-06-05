@@ -38,6 +38,8 @@ interface LegacyConfig {
   senderEmail: string;
   senderName: string;
   websiteUrl: string;
+  resendApiKey: string | null;
+  logoUrl: string | null;
 }
 
 const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConfig> = {
@@ -50,6 +52,8 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     senderEmail: 'hello@cleanilo.de',
     senderName: 'CLEANILO',
     websiteUrl: 'https://cleanilo.de',
+    resendApiKey: env.RESEND_API_KEY_CLEANILO ?? null,
+    logoUrl: 'https://reinigungs-portal.com/cleanilo.png',
   },
   hamburg_teppichreinigung: {
     slug: 'hamburg_teppichreinigung',
@@ -57,9 +61,11 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     schemaName: 'hamburg_teppichreinigung',
     keyPrefix: 'hamburg-teppichreinigung',
     storefrontOrigin: 'https://hamburg-teppichreinigung.de',
-    senderEmail: 'hallo@hamburg-teppichreinigung.de',
+    senderEmail: 'info@hamburg-teppichreinigung.de',
     senderName: 'Hamburg Teppichreinigung',
     websiteUrl: 'https://hamburg-teppichreinigung.de',
+    resendApiKey: env.RESEND_API_KEY_HAMBURG ?? null,
+    logoUrl: 'https://reinigungs-portal.com/hamburg-teppichreinigung.png',
   },
   teppichreinigen_lassen: {
     slug: 'teppichreinigen_lassen',
@@ -70,6 +76,8 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     senderEmail: 'kontakt@teppichreinigen-lassen.de',
     senderName: 'teppichreinigen-lassen.de',
     websiteUrl: 'https://teppichreinigen-lassen.de',
+    resendApiKey: env.RESEND_API_KEY_TRL ?? null,
+    logoUrl: null,
   },
 };
 
@@ -92,6 +100,16 @@ async function main(): Promise<void> {
 
   console.log('[migrate] upserting legacy company rows…');
   for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
+    const updateSet: Record<string, unknown> = {
+      senderEmail: cfg.senderEmail,
+      senderName: cfg.senderName,
+      email: cfg.senderEmail,
+      updatedAt: new Date(),
+    };
+    if (cfg.resendApiKey) updateSet.resendApiKey = cfg.resendApiKey;
+    // Only set a default logo when none exists — never clobber an admin upload.
+    if (cfg.logoUrl) updateSet.logoUrl = sql`coalesce(${company.logoUrl}, ${cfg.logoUrl})`;
+
     await db
       .insert(company)
       .values({
@@ -102,11 +120,13 @@ async function main(): Promise<void> {
         storefrontOrigin: cfg.storefrontOrigin,
         senderEmail: cfg.senderEmail,
         senderName: cfg.senderName,
+        resendApiKey: cfg.resendApiKey,
+        logoUrl: cfg.logoUrl,
         websiteUrl: cfg.websiteUrl,
         email: cfg.senderEmail,
         isActive: true,
       })
-      .onConflictDoNothing({ target: company.slug });
+      .onConflictDoUpdate({ target: company.slug, set: updateSet });
   }
 
   await pool.end();

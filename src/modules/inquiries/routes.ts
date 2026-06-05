@@ -127,6 +127,7 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
             await sendEmail({
               to: row.email,
               from: brandSender(companyRow),
+              apiKey: companyRow.resendApiKey ?? undefined,
               replyTo: companyRow.email ?? undefined,
               email: contactAckEmail({
                 name: row.name,
@@ -146,6 +147,7 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
               await sendEmail({
                 to: companyRow.email,
                 from: brandSender(companyRow),
+                apiKey: companyRow.resendApiKey ?? undefined,
                 replyTo: row.email,
                 email: adminInboxNotificationEmail({
                   brand,
@@ -340,6 +342,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       await sendEmail({
         to: inquiry.email,
         from: brandSender(companyRow),
+        apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
         email: inquiryQuoteEmail({
           recipientName: inquiry.name,

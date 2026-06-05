@@ -124,6 +124,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
             await sendEmail({
               to: row.email,
               from: brandSender(companyRow),
+              apiKey: companyRow.resendApiKey ?? undefined,
               replyTo: companyRow.email ?? undefined,
               email: newsletterConfirmEmail({
                 firstName: row.firstName,

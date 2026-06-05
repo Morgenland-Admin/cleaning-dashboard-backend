@@ -8,6 +8,13 @@
       "when": 1780481882319,
       "tag": "0000_normal_alex_power",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1780663205637,
+      "tag": "0001_rare_ultragirl",
+      "breakpoints": true
     }
   ]
 }

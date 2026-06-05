@@ -2,7 +2,18 @@ import { Resend } from 'resend';
 import { env } from '../config/env.js';
 import type { BrandInfo, RenderedEmail } from './templates.js';
 
-const resend = env.RESEND_API_KEY ? new Resend(env.RESEND_API_KEY) : null;
+const clients = new Map<string, Resend>();
+
+function getResend(apiKey?: string | null): Resend | null {
+  const key = apiKey || env.RESEND_API_KEY;
+  if (!key) return null;
+  let client = clients.get(key);
+  if (!client) {
+    client = new Resend(key);
+    clients.set(key, client);
+  }
+  return client;
+}
 
 interface CompanyLike {
   name: string;
@@ -32,6 +43,9 @@ export interface SendOptions {
   from: string;
   email: RenderedEmail;
   replyTo?: string;
+  apiKey?: string | null;
+  /** Optional file attachments (e.g. an invoice PDF). */
+  attachments?: Array<{ filename: string; content: Buffer }>;
 }
 
 export async function sendEmail(opts: SendOptions): Promise<{
@@ -40,9 +54,10 @@ export async function sendEmail(opts: SendOptions): Promise<{
   id?: string;
   error?: string;
 }> {
+  const resend = getResend(opts.apiKey);
   if (!resend) {
     console.info(
-      `[email] (skipped — no RESEND_API_KEY) to=${
+      `[email] (skipped — no Resend API key) to=${
         Array.isArray(opts.to) ? opts.to.join(',') : opts.to
       } subject="${opts.email.subject}"`,
     );
@@ -56,6 +71,7 @@ export async function sendEmail(opts: SendOptions): Promise<{
       subject: opts.email.subject,
       html: opts.email.html,
       replyTo: opts.replyTo,
+      attachments: opts.attachments,
     });
     if (res.error) {
       console.error('[email] send failed:', res.error);
@@ -71,10 +87,13 @@ export async function sendEmail(opts: SendOptions): Promise<{
 }
 
 /** Convenience: a BrandInfo shape used by the templates, from a Company row. */
-export function brandInfoFromCompany(c: CompanyLike & { primaryColor?: string | null }): BrandInfo {
+export function brandInfoFromCompany(
+  c: CompanyLike & { primaryColor?: string | null; logoUrl?: string | null },
+): BrandInfo {
   return {
     name: c.name,
     domain: c.senderEmail?.split('@')[1] ?? '',
     primaryColor: c.primaryColor ?? undefined,
+    logoUrl: c.logoUrl ?? null,
   };
 }

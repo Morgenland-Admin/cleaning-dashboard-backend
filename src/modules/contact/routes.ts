@@ -106,6 +106,7 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
             await sendEmail({
               to: row.email,
               from: brandSender(companyRow),
+              apiKey: companyRow.resendApiKey ?? undefined,
               replyTo: companyRow.email ?? undefined,
               email: contactAckEmail({
                 name: row.name,
@@ -119,6 +120,7 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
               await sendEmail({
                 to: companyRow.email,
                 from: brandSender(companyRow),
+                apiKey: companyRow.resendApiKey ?? undefined,
                 replyTo: row.email,
                 email: adminInboxNotificationEmail({
                   brand,
@@ -289,6 +291,7 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       const result = await sendEmail({
         to: msg.email,
         from: brandSender(companyRow),
+        apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
         email: contactReplyEmail({
           recipientName: msg.name,

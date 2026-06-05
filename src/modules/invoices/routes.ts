@@ -3,8 +3,13 @@ import { and, desc, eq, inArray, lt, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
+import { company } from '../../db/schema/shared.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { formatEurFromCents } from '../../lib/pricing.js';
+import { renderInvoicePdf } from '../../lib/invoice-pdf.js';
+import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
+import { invoiceEmail } from '../../email/templates.js';
 
 const lineItemSchema = z.object({
   label: z.string().min(1).max(200),
@@ -152,7 +157,115 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       .set({ status: 'sent', sentAt: now, dueAt, updatedAt: now })
       .where(eq(invoices.id, id))
       .returning();
-    return { invoice: row };
+
+    // Email the invoice to the recipient via the brand's Resend account.
+    // Best-effort: a mail failure must not undo the "sent" transition.
+    let emailSent = false;
+    let emailSkipped = false;
+    if (row?.recipientEmail) {
+      try {
+        const [companyRow] = await db
+          .select()
+          .from(company)
+          .where(eq(company.slug, request.company!.slug))
+          .limit(1);
+        if (companyRow) {
+          const fmtDate = (d: Date) =>
+            d.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
+          const taxRate =
+            row.subtotalCents > 0 && row.taxCents > 0
+              ? Math.round((row.taxCents / row.subtotalCents) * 100)
+              : 0;
+          const addressLines = [
+            companyRow.addressLine1,
+            companyRow.addressLine2,
+            [companyRow.postalCode, companyRow.city].filter(Boolean).join(' ') || null,
+          ].filter((x): x is string => Boolean(x));
+
+          // Shared, pre-formatted values — used by both the HTML email and the PDF.
+          const invoiceNumber = row.number ?? `#${row.id}`;
+          const invoiceDate = fmtDate(now);
+          const dueDate = fmtDate(dueAt);
+          const taxFormatted = row.taxCents > 0 ? formatEurFromCents(row.taxCents) : null;
+          const taxRateLabel = taxRate > 0 ? `${taxRate} %` : null;
+          const subtotalFormatted = formatEurFromCents(row.subtotalCents);
+          const totalFormatted = formatEurFromCents(row.totalCents);
+          const lineItems = row.lineItems.map((li) => ({
+            label: li.label,
+            quantity: li.quantity.toLocaleString('de-DE'),
+            unitPrice: formatEurFromCents(li.unitPriceCents),
+            lineTotal: formatEurFromCents(Math.round(li.quantity * li.unitPriceCents)),
+          }));
+          const seller = {
+            name: companyRow.legalName ?? companyRow.name,
+            addressLines,
+            vatId: companyRow.vatId,
+            registrationNumber: companyRow.registrationNumber,
+            email: companyRow.email,
+            phone: companyRow.phone,
+          };
+
+          // Render the PDF attachment (best-effort — fall back to HTML-only).
+          let attachments: Array<{ filename: string; content: Buffer }> | undefined;
+          try {
+            const pdf = await renderInvoicePdf({
+              brandName: companyRow.name,
+              invoiceNumber,
+              invoiceDate,
+              dueDate,
+              paymentTermsDays: row.paymentTermsDays,
+              recipientName: row.recipientName,
+              recipientEmail: row.recipientEmail,
+              lineItems,
+              subtotal: subtotalFormatted,
+              tax: taxFormatted,
+              taxRateLabel,
+              total: totalFormatted,
+              notes: row.notes,
+              accentColor: companyRow.primaryColor ?? '#bd5b3e',
+              seller,
+            });
+            attachments = [{ filename: `Rechnung-${invoiceNumber}.pdf`, content: pdf }];
+          } catch (err) {
+            request.log.error({ err, invoiceId: id }, 'Failed to render invoice PDF');
+          }
+
+          const result = await sendEmail({
+            to: row.recipientEmail,
+            from: brandSender(companyRow),
+            apiKey: companyRow.resendApiKey ?? undefined,
+            replyTo: companyRow.email ?? undefined,
+            attachments,
+            email: invoiceEmail({
+              brand: brandInfoFromCompany(companyRow),
+              recipientName: row.recipientName,
+              invoiceNumber,
+              invoiceDateFormatted: invoiceDate,
+              dueDateFormatted: dueDate,
+              paymentTermsDays: row.paymentTermsDays,
+              lineItems: lineItems.map((li) => ({
+                label: li.label,
+                quantityLabel: li.quantity,
+                unitPriceFormatted: li.unitPrice,
+                lineTotalFormatted: li.lineTotal,
+              })),
+              subtotalFormatted,
+              taxFormatted,
+              taxRateLabel,
+              totalFormatted,
+              notes: row.notes,
+              seller,
+            }),
+          });
+          emailSent = result.ok && !result.skipped;
+          emailSkipped = result.skipped ?? false;
+        }
+      } catch (err) {
+        request.log.error({ err, invoiceId: id }, 'Failed to send invoice email');
+      }
+    }
+
+    return { invoice: row, emailSent, emailSkipped };
   });
 
   app.post('/:id/mark-paid', async (request) => {

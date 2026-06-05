@@ -117,6 +117,7 @@ export const company = pgTable('company', {
   primaryColor: varchar('primary_color', { length: 9 }),
   senderEmail: text('sender_email'),
   senderName: text('sender_name'),
+  resendApiKey: text('resend_api_key'),
   keyPrefix: varchar('key_prefix', { length: 64 }),
   storefrontOrigin: text('storefront_origin'),
   isActive: boolean('is_active').notNull().default(true),

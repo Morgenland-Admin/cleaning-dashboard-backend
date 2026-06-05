@@ -1,0 +1,1 @@
+ALTER TABLE "company" ADD COLUMN "resend_api_key" text;

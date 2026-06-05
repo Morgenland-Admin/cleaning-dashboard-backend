@@ -91,6 +91,7 @@ async function notifyCustomerStatusChange(args: NotifyCustomerArgs): Promise<voi
     await sendEmail({
       to: args.order.customerEmail,
       from: brandSender(companyRow),
+      apiKey: companyRow.resendApiKey ?? undefined,
       replyTo: companyRow.email ?? undefined,
       email: orderStatusUpdateEmail({
         brand,
@@ -705,6 +706,7 @@ async function markOrderPaid(
     await sendEmail({
       to: order.customerEmail,
       from: brandSender(companyRow),
+      apiKey: companyRow.resendApiKey ?? undefined,
       replyTo: companyRow.email ?? undefined,
       email: orderConfirmationEmail({
         brand,
@@ -729,6 +731,7 @@ async function markOrderPaid(
       await sendEmail({
         to: companyRow.email,
         from: brandSender(companyRow),
+        apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: order.customerEmail,
         email: newOrderAdminEmail({
           brand,
@@ -1221,6 +1224,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         await sendEmail({
           to: row.customerEmail,
           from: brandSender(companyRow),
+          apiKey: companyRow.resendApiKey ?? undefined,
           replyTo: companyRow.email ?? undefined,
           email: appointmentConfirmedEmail({
             brand: brandInfoFromCompany(companyRow),

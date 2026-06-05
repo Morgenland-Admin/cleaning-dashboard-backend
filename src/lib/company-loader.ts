@@ -10,7 +10,9 @@ export interface CompanyRow {
   storefrontOrigin: string | null;
   senderEmail: string | null;
   senderName: string | null;
+  resendApiKey: string | null;
   primaryColor: string | null;
+  logoUrl: string | null;
   email: string | null;
   isActive: boolean;
 }
@@ -41,7 +43,9 @@ function normalize(row: typeof company.$inferSelect): CompanyRow {
     storefrontOrigin: row.storefrontOrigin ?? null,
     senderEmail: row.senderEmail ?? null,
     senderName: row.senderName ?? null,
+    resendApiKey: row.resendApiKey ?? null,
     primaryColor: row.primaryColor ?? null,
+    logoUrl: row.logoUrl ?? null,
     email: row.email ?? null,
     isActive: row.isActive,
   };

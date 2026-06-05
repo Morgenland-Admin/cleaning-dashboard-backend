@@ -12,6 +12,14 @@ export interface BrandInfo {
   domain: string;
   /** Optional accent colour for the header bar. Defaults to rust. */
   primaryColor?: string;
+  /** Optional absolute logo URL shown in the header. */
+  logoUrl?: string | null;
+}
+
+/** Email clients (Gmail, Outlook) don't render SVG — only allow raster logos. */
+function emailSafeLogo(url?: string | null): string | null {
+  if (!url) return null;
+  return /^https?:\/\/.+\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(url) ? url : null;
 }
 
 const ADMIN_BRAND: BrandInfo = {
@@ -40,6 +48,12 @@ function layout(opts: {
   footerNote?: string;
 }): string {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
+  const logo = emailSafeLogo(opts.brand.logoUrl);
+  const header = logo
+    ? `<img src="${escapeHtml(logo)}" alt="${escapeHtml(opts.brand.name)}" height="36" style="display:block;height:36px;max-height:36px;width:auto;border:0;outline:none;text-decoration:none;" />`
+    : `<div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:${accent};font-weight:700;">
+                  ${escapeHtml(opts.brand.name)}
+                </div>`;
   return `<!DOCTYPE html>
 <html lang="de">
   <head>
@@ -54,10 +68,8 @@ function layout(opts: {
         <td align="center">
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="max-width:560px;width:100%;background:#fefaf0;border-radius:16px;overflow:hidden;border:1px solid #e2d3b6;">
             <tr>
-              <td style="padding:24px 32px 0;border-bottom:1px solid #e2d3b6;">
-                <div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:${accent};font-weight:700;">
-                  ${escapeHtml(opts.brand.name)}
-                </div>
+              <td style="padding:24px 32px 20px;border-bottom:1px solid #e2d3b6;">
+                ${header}
               </td>
             </tr>
             <tr>
@@ -445,6 +457,148 @@ export function orderConfirmationEmail(opts: {
         </p>
       `,
       footerNote: `Auftrag bei ${opts.brand.domain} · ${opts.brand.name}.`,
+    }),
+  };
+}
+
+export function invoiceEmail(opts: {
+  brand: BrandInfo;
+  recipientName: string;
+  invoiceNumber: string;
+  invoiceDateFormatted: string;
+  dueDateFormatted: string | null;
+  paymentTermsDays: number;
+  lineItems: Array<{
+    label: string;
+    quantityLabel: string;
+    unitPriceFormatted: string;
+    lineTotalFormatted: string;
+  }>;
+  subtotalFormatted: string;
+  taxFormatted: string | null;
+  taxRateLabel: string | null;
+  totalFormatted: string;
+  notes?: string | null;
+  seller: {
+    name: string;
+    addressLines: string[];
+    vatId?: string | null;
+    registrationNumber?: string | null;
+    email?: string | null;
+    phone?: string | null;
+  };
+}): RenderedEmail {
+  const itemRowsHtml = opts.lineItems
+    .map(
+      (l) => `<tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;">${escapeHtml(l.label)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:center;white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:right;white-space:nowrap;">${escapeHtml(l.unitPriceFormatted)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.lineTotalFormatted)}</td>
+      </tr>`,
+    )
+    .join('');
+
+  const totalsHtml =
+    opts.taxFormatted && opts.taxRateLabel
+      ? `<tr>
+            <td colspan="3" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">Zwischensumme (netto)</td>
+            <td style="padding:8px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(opts.subtotalFormatted)}</td>
+          </tr>
+          <tr>
+            <td colspan="3" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">zzgl. USt. (${escapeHtml(opts.taxRateLabel)})</td>
+            <td style="padding:8px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(opts.taxFormatted)}</td>
+          </tr>
+          <tr>
+            <td colspan="3" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
+            <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
+          </tr>`
+      : `<tr>
+            <td colspan="3" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
+            <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
+          </tr>`;
+
+  const paymentLine = opts.dueDateFormatted
+    ? `Bitte überweisen Sie den Gesamtbetrag bis zum <strong>${escapeHtml(opts.dueDateFormatted)}</strong> (Zahlungsziel ${opts.paymentTermsDays} Tage).`
+    : `Bitte überweisen Sie den Gesamtbetrag innerhalb von <strong>${opts.paymentTermsDays} Tagen</strong>.`;
+
+  const notesHtml = opts.notes
+    ? `<p style="margin:16px 0 0;font-size:13px;color:#6b5b48;">${nl2br(opts.notes)}</p>`
+    : '';
+
+  const sellerLines = [
+    `<strong>${escapeHtml(opts.seller.name)}</strong>`,
+    ...opts.seller.addressLines.map(escapeHtml),
+    opts.seller.vatId ? `USt-IdNr.: ${escapeHtml(opts.seller.vatId)}` : '',
+    opts.seller.registrationNumber ? `Reg-Nr.: ${escapeHtml(opts.seller.registrationNumber)}` : '',
+    opts.seller.email ? `E-Mail: ${escapeHtml(opts.seller.email)}` : '',
+    opts.seller.phone ? `Tel.: ${escapeHtml(opts.seller.phone)}` : '',
+  ]
+    .filter(Boolean)
+    .join('<br />');
+
+  return {
+    subject: `Rechnung ${opts.invoiceNumber} · ${opts.brand.name}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `Ihre Rechnung ${opts.invoiceNumber} von ${opts.brand.name}.`,
+      contentHtml: `
+        <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.recipientName)},</p>
+        <p style="margin:0 0 16px;">
+          anbei erhalten Sie Ihre Rechnung von <strong>${escapeHtml(opts.brand.name)}</strong>.
+        </p>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 16px;">
+          <tr>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsnummer</td>
+            <td style="font-size:13px;font-family:monospace;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceNumber)}</td>
+          </tr>
+          <tr>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsdatum</td>
+            <td style="font-size:13px;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceDateFormatted)}</td>
+          </tr>
+          ${
+            opts.dueDateFormatted
+              ? `<tr>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Fällig bis</td>
+            <td style="font-size:13px;text-align:right;padding:2px 0;">${escapeHtml(opts.dueDateFormatted)}</td>
+          </tr>`
+              : ''
+          }
+        </table>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border:1px solid #e2d3b6;border-radius:8px;overflow:hidden;">
+          <thead>
+            <tr style="background:#f4ebdc;">
+              <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Bezeichnung</th>
+              <th align="center" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Menge</th>
+              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Einzelpreis</th>
+              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Betrag</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itemRowsHtml}
+            ${totalsHtml}
+          </tbody>
+        </table>
+
+        <p style="margin:16px 0 0;font-size:14px;">${paymentLine}</p>
+        ${notesHtml}
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e2d3b6;">
+          <tr>
+            <td style="padding:16px 0 0;font-size:12px;color:#6b5b48;line-height:1.6;">
+              <span style="text-transform:uppercase;letter-spacing:1px;font-size:11px;">Rechnungssteller</span><br />
+              ${sellerLines}
+            </td>
+          </tr>
+        </table>
+
+        <p style="margin:20px 0 0;font-size:12px;color:#6b5b48;">
+          Bei Fragen zu dieser Rechnung antworten Sie einfach auf diese E-Mail.
+        </p>
+      `,
+      footerNote: `Rechnung von ${opts.brand.name} · ${opts.brand.domain}.`,
     }),
   };
 }
