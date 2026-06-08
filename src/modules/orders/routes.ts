@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync, FastifyInstance } from 'fastify';
-import { and, desc, eq, inArray, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type Stripe from 'stripe';
 
@@ -14,6 +14,7 @@ import {
   appointmentConfirmedEmail,
   orderConfirmationEmail,
   orderStatusUpdateEmail,
+  paymentRequestEmail,
 } from '../../email/templates.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
@@ -212,6 +213,11 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           : null;
 
       const now = new Date();
+      // 'after_service' orders skip Stripe checkout entirely — they go straight
+      // into the service pipeline (status 'accepted') and payment is collected
+      // by an admin once the work is done (cash / EC card / credit-card link).
+      const paymentMode = body.paymentMode ?? 'upfront';
+      const isAfterService = paymentMode === 'after_service';
 
       const orderRow = await db.transaction(async (tx) => {
         const inserted = await tx
@@ -219,7 +225,9 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           .values({
             publicToken,
             kind: body.kind,
-            status: 'pending',
+            status: isAfterService ? 'accepted' : 'pending',
+            paymentMode,
+            acceptedAt: isAfterService ? now : null,
             currency: 'EUR',
             subtotalCents: quote.subtotalCents,
             pickupFeeCents: quote.pickupFeeCents,
@@ -270,15 +278,91 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         await tx.insert(orderStatusLog).values({
           orderId: order.id,
           fromStatus: null,
-          toStatus: 'pending',
-          reason: 'Order created',
+          toStatus: isAfterService ? 'accepted' : 'pending',
+          reason: isAfterService ? 'Auftrag erstellt · Zahlung nach Leistung' : 'Order created',
         });
         return order;
       });
 
-      const stripe = getStripe();
       const appBase = env.APP_BASE_URL.replace(/\/$/, '');
       const storefrontOrigin = (companyRow.storefrontOrigin ?? appBase).replace(/\/$/, '');
+
+      // --- Pay-after-service: no Stripe checkout, just confirm the booking. ---
+      if (isAfterService) {
+        try {
+          const brand = brandInfoFromCompany(companyRow);
+          const orderNumber = orderNumberFor(orderRow.id);
+          const trackerUrl = `${storefrontOrigin}/bestellung?token=${encodeURIComponent(publicToken)}`;
+          const baseNote =
+            pickupMode === 'drop_off'
+              ? 'Sie können Ihren Teppich nach Voranmeldung in unserer Werkstatt in der Hamburg-Speicherstadt abgeben.'
+              : pickupMode === 'onsite'
+                ? 'Wir melden uns innerhalb eines Werktages, um den Vor-Ort-Termin zu bestätigen.'
+                : 'Unser Fahrer holt Ihren Teppich ab. Wir melden uns mit dem genauen Termin.';
+          const fulfillmentNote = `${baseNote} Die Bezahlung erfolgt nach erbrachter Leistung — Sie müssen jetzt nichts zahlen.`;
+
+          await sendEmail({
+            to: body.customer.email,
+            from: brandSender(companyRow),
+            apiKey: companyRow.resendApiKey ?? undefined,
+            replyTo: companyRow.email ?? undefined,
+            email: orderConfirmationEmail({
+              brand,
+              customerName: body.customer.name,
+              orderNumber,
+              trackerUrl,
+              totalFormatted: formatEurFromCents(quote.totalCents),
+              lines: quote.lines.map((l) => ({
+                label: l.label,
+                quantityLabel: l.quantityLabel,
+                subtotalFormatted: formatEurFromCents(l.subtotalCents),
+              })),
+              pickupLabel: quote.pickupLabel,
+              pickupFeeFormatted:
+                quote.pickupFeeCents > 0 ? formatEurFromCents(quote.pickupFeeCents) : null,
+              fulfillmentNote,
+            }),
+          });
+
+          if (companyRow.email) {
+            const adminUrl = `${appBase}/auftraege?id=${orderRow.id}`;
+            await sendEmail({
+              to: companyRow.email,
+              from: brandSender(companyRow),
+              apiKey: companyRow.resendApiKey ?? undefined,
+              replyTo: body.customer.email,
+              email: newOrderAdminEmail({
+                brand,
+                orderNumber,
+                customerName: body.customer.name,
+                customerEmail: body.customer.email,
+                customerPhone: body.customer.phone ?? null,
+                kindLabel: `${KIND_LABEL[body.kind] ?? body.kind} · Zahlung nach Leistung`,
+                totalFormatted: formatEurFromCents(quote.totalCents),
+                pickupLabel: quote.pickupLabel,
+                preferredDate: body.preferredSlots?.[0]?.slice(0, 10) ?? body.preferredDate ?? null,
+                adminUrl,
+              }),
+            });
+          }
+        } catch (err) {
+          request.log.error(
+            { err, orderId: orderRow.id },
+            'after-service confirmation emails failed',
+          );
+        }
+
+        reply.code(201).send({
+          ok: true,
+          orderId: orderRow.id,
+          publicToken,
+          checkoutUrl: null,
+          sessionId: null,
+        });
+        return;
+      }
+
+      const stripe = getStripe();
 
       if (
         env.NODE_ENV === 'production' &&
@@ -477,6 +561,12 @@ async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Pro
           { orderId, status: session.payment_status },
           'Checkout completed but not paid yet',
         );
+        return;
+      }
+      // A payment-link for an already-running "pay after service" order: just
+      // record the payment, don't run the new-order onboarding (emails sent at booking).
+      if (session.metadata?.afterService === '1') {
+        await markAfterServicePaid(app, companySlug, orderId, session);
         return;
       }
       await markOrderPaid(app, companySlug, orderId, session);
@@ -765,6 +855,123 @@ async function markOrderPaid(
   }
 }
 
+/**
+ * Roll a paid order into the customers table (lifetime totals + loyalty tier).
+ * Best-effort: logs and swallows errors so it never blocks a payment.
+ */
+async function aggregateCustomerOnPaid(
+  app: FastifyInstance,
+  tables: TenantTables,
+  order: {
+    customerEmail: string;
+    customerName: string;
+    customerPhone: string | null;
+    consentMarketing: boolean;
+  },
+  paidTotal: number,
+  now: Date,
+): Promise<void> {
+  try {
+    const { customers } = tables;
+    const [cust] = await db
+      .insert(customers)
+      .values({
+        email: order.customerEmail,
+        name: order.customerName,
+        phone: order.customerPhone,
+        totalOrders: 1,
+        totalSpentCents: paidTotal,
+        loyaltyTier: computeLoyaltyTier(1, paidTotal),
+        firstOrderAt: now,
+        lastOrderAt: now,
+        marketingOptIn: order.consentMarketing,
+      })
+      .onConflictDoUpdate({
+        target: customers.email,
+        set: {
+          totalOrders: sql`${customers.totalOrders} + 1`,
+          totalSpentCents: sql`${customers.totalSpentCents} + ${paidTotal}`,
+          name: sql`coalesce(${customers.name}, ${order.customerName})`,
+          phone: sql`coalesce(${customers.phone}, ${order.customerPhone})`,
+          lastOrderAt: now,
+          updatedAt: now,
+        },
+      })
+      .returning();
+    if (cust) {
+      const tier = computeLoyaltyTier(cust.totalOrders, cust.totalSpentCents);
+      if (tier !== cust.loyaltyTier) {
+        await db
+          .update(customers)
+          .set({ loyaltyTier: tier, updatedAt: now })
+          .where(eq(customers.id, cust.id));
+      }
+    }
+  } catch (err) {
+    app.log.warn({ err }, 'customer aggregate update failed');
+  }
+}
+
+/**
+ * Record a credit-card payment for a "pay after service" order paid via a
+ * payment link. Idempotent on paidAt. Unlike markOrderPaid it does NOT change
+ * the service status (the admin drives that) and does NOT resend booking emails
+ * (those were sent at checkout time).
+ */
+async function markAfterServicePaid(
+  app: FastifyInstance,
+  companySlug: string,
+  orderId: number,
+  session: Stripe.Checkout.Session,
+): Promise<void> {
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  const { loadCompany } = await import('../../lib/company-loader.js');
+  const companyRow = await loadCompany(companySlug);
+  if (!companyRow) return;
+  const tables = getTenantTables(companyRow.schemaName);
+
+  const [order] = await db
+    .select()
+    .from(tables.orders)
+    .where(eq(tables.orders.id, orderId))
+    .limit(1);
+  if (!order) {
+    app.log.warn({ orderId, companySlug }, 'after-service webhook for unknown order');
+    return;
+  }
+  if (order.paidAt) return; // already settled — idempotent
+
+  const paymentIntentId =
+    typeof session.payment_intent === 'string' ? session.payment_intent : null;
+  const now = new Date();
+  const paidTotal =
+    typeof session.amount_total === 'number' ? session.amount_total : order.totalCents;
+
+  const claimed = await db.transaction(async (tx) => {
+    const rows = await tx
+      .update(tables.orders)
+      .set({
+        paidAt: now,
+        paymentMethod: 'credit_card',
+        stripePaymentIntentId: paymentIntentId,
+        updatedAt: now,
+      })
+      .where(and(eq(tables.orders.id, orderId), isNull(tables.orders.paidAt)))
+      .returning({ id: tables.orders.id });
+    if (rows.length === 0) return false;
+    await tx.insert(tables.orderStatusLog).values({
+      orderId,
+      fromStatus: order.status,
+      toStatus: order.status,
+      reason: 'Zahlung erhalten · Kreditkarte (Online)',
+    });
+    return true;
+  });
+  if (!claimed) return;
+
+  await aggregateCustomerOnPaid(app, tables, order, paidTotal, now);
+}
+
 async function markOrderCancelled(
   app: FastifyInstance,
   companySlug: string,
@@ -1043,6 +1250,165 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     }).catch(() => null);
 
     return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+  });
+
+  // --- Pay-after-service collection ----------------------------------------
+
+  const recordPaymentSchema = z.object({
+    /** Offline methods settled in person on handover. */
+    method: z.enum(['cash', 'ec_card']),
+  });
+
+  /** Mark an after-service order paid in cash or by EC card (collected in person). */
+  app.post('/:id/record-payment', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { method } = recordPaymentSchema.parse(request.body);
+    const { orders, orderStatusLog } = request.company!.tables;
+    const adminId = request.authUser!.id;
+    const now = new Date();
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+    if (row.paymentMode !== 'after_service') {
+      reply.code(400).send({ error: 'Nur für Aufträge mit Zahlung nach Leistung.' });
+      return;
+    }
+    if (row.paidAt) {
+      reply.code(409).send({ error: 'Auftrag ist bereits als bezahlt markiert.' });
+      return;
+    }
+
+    const methodLabel = method === 'cash' ? 'Barzahlung' : 'EC-Kartenzahlung';
+    const updated = await db.transaction(async (tx) => {
+      const [u] = await tx
+        .update(orders)
+        .set({ paidAt: now, paymentMethod: method, handledByUserId: adminId, updatedAt: now })
+        .where(eq(orders.id, id))
+        .returning();
+      if (!u) throw new Error('Order row vanished while recording payment');
+      await tx.insert(orderStatusLog).values({
+        orderId: id,
+        fromStatus: row.status,
+        toStatus: row.status,
+        changedByUserId: adminId,
+        reason: `Zahlung erhalten · ${methodLabel}`,
+      });
+      return u;
+    });
+
+    await aggregateCustomerOnPaid(app, request.company!.tables, row, updated.totalCents, now);
+
+    return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+  });
+
+  /**
+   * Create a Stripe credit-card payment link for an after-service order and
+   * email it to the customer. The webhook marks the order paid on completion.
+   */
+  app.post('/:id/payment-link', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { orders, orderStatusLog } = request.company!.tables;
+    const adminId = request.authUser!.id;
+    const now = new Date();
+
+    if (!stripeConfigured) {
+      reply.code(503).send({ error: 'Stripe not configured on this server' });
+      return;
+    }
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+    if (row.paymentMode !== 'after_service') {
+      reply.code(400).send({ error: 'Nur für Aufträge mit Zahlung nach Leistung.' });
+      return;
+    }
+    if (row.paidAt) {
+      reply.code(409).send({ error: 'Auftrag ist bereits als bezahlt markiert.' });
+      return;
+    }
+
+    const [companyRow] = await db
+      .select()
+      .from(company)
+      .where(eq(company.slug, request.company!.slug))
+      .limit(1);
+    if (!companyRow) throw notFound('Company not found');
+
+    const appBase = env.APP_BASE_URL.replace(/\/$/, '');
+    const storefrontOrigin = (companyRow.storefrontOrigin ?? appBase).replace(/\/$/, '');
+    const orderNumber = orderNumberFor(row.id);
+
+    const session = await getStripe().checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      currency: 'eur',
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: 'eur',
+            unit_amount: row.totalCents,
+            product_data: {
+              name: `${companyRow.name} · ${KIND_LABEL[row.kind] ?? row.kind}`,
+              description: `Auftrag ${orderNumber}`,
+            },
+            tax_behavior: 'inclusive',
+          },
+        },
+      ],
+      customer_email: row.customerEmail,
+      client_reference_id: String(row.id),
+      metadata: {
+        orderId: String(row.id),
+        companySlug: request.company!.slug,
+        publicToken: row.publicToken,
+        kind: row.kind,
+        afterService: '1',
+      },
+      success_url: `${storefrontOrigin}/buchung/erfolg?token=${row.publicToken}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${storefrontOrigin}/bestellung?token=${row.publicToken}`,
+      locale: 'de',
+      billing_address_collection: 'auto',
+    });
+
+    await db
+      .update(orders)
+      .set({ stripeSessionId: session.id, updatedAt: now })
+      .where(eq(orders.id, id));
+    await db.insert(orderStatusLog).values({
+      orderId: id,
+      fromStatus: row.status,
+      toStatus: row.status,
+      changedByUserId: adminId,
+      reason: 'Zahlungslink (Kreditkarte) erstellt & versendet',
+    });
+
+    try {
+      const brand = brandInfoFromCompany(companyRow);
+      await sendEmail({
+        to: row.customerEmail,
+        from: brandSender(companyRow),
+        apiKey: companyRow.resendApiKey ?? undefined,
+        replyTo: companyRow.email ?? undefined,
+        email: paymentRequestEmail({
+          brand,
+          customerName: row.customerName,
+          orderNumber,
+          totalFormatted: formatEurFromCents(row.totalCents),
+          payUrl: session.url ?? storefrontOrigin,
+        }),
+      });
+    } catch (err) {
+      request.log.error({ err, orderId: id }, 'payment-link email failed');
+    }
+
+    return { checkoutUrl: session.url };
   });
 
   app.get('/:id/cancel-preview', async (request, reply) => {

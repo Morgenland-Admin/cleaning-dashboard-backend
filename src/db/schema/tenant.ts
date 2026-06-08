@@ -257,6 +257,9 @@ function buildTenantTables(schemaName: string) {
       stripeSessionId: text('stripe_session_id'),
       stripePaymentIntentId: text('stripe_payment_intent_id'),
 
+      paymentMode: varchar('payment_mode', { length: 16 }).notNull().default('upfront'),
+      paymentMethod: varchar('payment_method', { length: 24 }),
+
       paidAt: timestamp('paid_at', { withTimezone: true }),
       acceptedAt: timestamp('accepted_at', { withTimezone: true }),
       pickedUpAt: timestamp('picked_up_at', { withTimezone: true }),
@@ -765,6 +768,8 @@ CREATE TABLE IF NOT EXISTS ${q}."orders" (
   "internal_notes" text,
   "stripe_session_id" text,
   "stripe_payment_intent_id" text,
+  "payment_mode" varchar(16) DEFAULT 'upfront' NOT NULL,
+  "payment_method" varchar(24),
   "paid_at" timestamp with time zone,
   "accepted_at" timestamp with time zone,
   "picked_up_at" timestamp with time zone,
@@ -831,6 +836,8 @@ ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "partner_payout_cents" intege
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payout_status" varchar(16) DEFAULT 'none' NOT NULL;
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "stripe_transfer_id" text;
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payout_at" timestamp with time zone;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payment_mode" varchar(16) DEFAULT 'upfront' NOT NULL;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payment_method" varchar(24);
 CREATE INDEX IF NOT EXISTS "orders_assigned_partner_idx" ON ${q}."orders" ("assigned_partner_id");
 
 ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "tier" varchar(16) DEFAULT 'basic' NOT NULL;

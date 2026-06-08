@@ -839,6 +839,32 @@ export function appointmentConfirmedEmail(opts: {
   };
 }
 
+export function paymentRequestEmail(opts: {
+  brand: BrandInfo;
+  customerName: string;
+  orderNumber: string;
+  totalFormatted: string;
+  payUrl: string;
+}): RenderedEmail {
+  return {
+    subject: `Zahlung für Ihren Auftrag · ${opts.orderNumber}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `Bitte begleichen Sie Ihren Auftrag über ${opts.totalFormatted}.`,
+      contentHtml: `
+        <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
+        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Zahlung per Kreditkarte</p>
+        <p style="margin:0 0 16px;font-size:16px;font-weight:600;">${escapeHtml(opts.brand.name)} — ${escapeHtml(opts.orderNumber)}</p>
+        <p style="margin:0 0 16px;font-size:14px;">Ihr Service ist abgeschlossen — vielen Dank! Sie können Ihren Auftrag jetzt bequem und sicher online per Kreditkarte bezahlen.</p>
+        <p style="margin:0 0 16px;padding:14px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:16px;font-weight:600;">Zu zahlender Betrag: ${escapeHtml(opts.totalFormatted)}</p>
+        ${button(opts.payUrl, 'Jetzt sicher bezahlen', opts.brand.primaryColor)}
+        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">Die Zahlung wird sicher über Stripe abgewickelt. Bei Rückfragen antworten Sie einfach auf diese E-Mail.</p>
+      `,
+      footerNote: `Zahlungsaufforderung zu Ihrem Auftrag bei ${opts.brand.domain}.`,
+    }),
+  };
+}
+
 const PRIORITY_LABEL: Record<string, string> = {
   low: 'niedrig',
   normal: 'normal',

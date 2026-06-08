@@ -127,6 +127,7 @@ export const checkoutSchema = quoteSchema.and(
     consentMarketing: z.boolean().optional(),
     website: z.string().max(200).optional(),
     source: z.string().trim().max(64).optional(),
+    paymentMode: z.enum(['upfront', 'after_service']).optional(),
   }),
 );
 
