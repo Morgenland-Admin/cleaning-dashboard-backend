@@ -312,7 +312,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
 
       const session = await stripe.checkout.sessions.create({
         mode: 'payment',
-        payment_method_types: ['card', 'klarna', 'sepa_debit'],
+        payment_method_types: ['card', 'paypal', 'amazon_pay', 'link'],
         currency: 'eur',
         line_items: [
           {
