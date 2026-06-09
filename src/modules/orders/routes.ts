@@ -21,6 +21,7 @@ import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-error
 import { computeCommission, parseCommissionRate } from '../../lib/commission.js';
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
 import { captureException } from '../../lib/observability.js';
+import { fireN8nWebhook } from '../../lib/n8n.js';
 import { formatEurFromCents, priceOrder } from '../../lib/pricing.js';
 import { getPriceBook } from '../../lib/price-books/index.js';
 import { getStripe, stripeConfigured } from '../../lib/stripe.js';
@@ -1527,6 +1528,28 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       toStatus: 'cancelled',
       refundCents,
     }).catch(() => null);
+
+    // Notify n8n on cancel (ALL_06), fire-and-forget.
+    void fireN8nWebhook(
+      env.N8N_CANCEL_WEBHOOK_URL,
+      {
+        event: 'order.cancelled',
+        companySlug: request.company!.slug,
+        orderId: updated.id,
+        orderNumber: orderNumberFor(updated.id),
+        publicToken: updated.publicToken,
+        fromStatus: row.status,
+        toStatus: 'cancelled',
+        refundCents,
+        reason: body.reason ?? null,
+        reasonCode: decision.reasonCode,
+        customerName: updated.customerName,
+        customerEmail: updated.customerEmail,
+        customerPhone: updated.customerPhone,
+        cancelledAt: now.toISOString(),
+      },
+      request.log,
+    );
 
     return {
       order: { ...updated, orderNumber: orderNumberFor(updated.id) },

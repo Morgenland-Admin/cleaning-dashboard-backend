@@ -39,6 +39,7 @@ const envSchema = z.object({
   STRIPE_SECRET_KEY: optionalString,
   STRIPE_WEBHOOK_SECRET: optionalString,
   STRIPE_PUBLISHABLE_KEY: optionalString,
+  N8N_CANCEL_WEBHOOK_URL: optionalUrl,
   VAPID_PUBLIC_KEY: optionalString,
   VAPID_PRIVATE_KEY: optionalString,
   VAPID_SUBJECT: z.string().default('mailto:admin@reinigungs-portal.com'),

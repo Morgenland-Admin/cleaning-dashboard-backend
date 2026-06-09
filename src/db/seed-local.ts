@@ -176,6 +176,80 @@ async function seedBrandSamples(schemaName: string, name: string) {
   });
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// n8n test data (ALL_09/96/18/95), idempotent via source='n8n-test'.
+async function seedBrandTestFlows(schemaName: string) {
+  const t = getTenantTables(schemaName);
+  const [{ n } = { n: 0 }] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(t.orders)
+    .where(eq(t.orders.source, 'n8n-test'));
+  if (Number(n) > 0) return; // already seeded
+
+  const now = new Date();
+  const baseOrder = {
+    kind: 'teppichreinigung',
+    currency: 'EUR',
+    subtotalCents: 8900,
+    totalCents: 8900,
+    pickupMode: 'pickup' as const,
+    customerName: 'Test Kunde',
+    consentPrivacy: true,
+    locale: 'de',
+    source: 'n8n-test',
+  };
+
+  await db.insert(t.orders).values([
+    {
+      ...baseOrder,
+      publicToken: nanoid(24),
+      status: 'accepted',
+      customerEmail: 'test.accepted@example.com',
+      customerPhone: '+491700000001',
+      paidAt: now,
+      acceptedAt: now,
+    },
+    {
+      ...baseOrder,
+      publicToken: nanoid(24),
+      status: 'paid',
+      customerEmail: 'test.paid@example.com',
+      customerPhone: '+491700000002',
+      paidAt: now,
+    },
+    {
+      ...baseOrder,
+      publicToken: nanoid(24),
+      status: 'accepted',
+      customerEmail: 'test.stuck@example.com',
+      customerPhone: '+491700000003',
+      createdAt: new Date(now.getTime() - 16 * DAY_MS),
+      paidAt: new Date(now.getTime() - 16 * DAY_MS),
+      acceptedAt: new Date(now.getTime() - 15 * DAY_MS),
+    },
+  ]);
+
+  await db.insert(t.serviceInquiries).values({
+    name: 'Foto Testkunde',
+    email: 'test.photo@example.com',
+    phone: '+491700000004',
+    service: 'Teppichreinigung',
+    message: 'Test-Anfrage mit Teppich-Foto für die Carpet-Identifier-Tests (ALL_95).',
+    locale: 'de',
+    source: 'n8n-test',
+    consentPrivacy: true,
+    attachments: [
+      {
+        key: 'n8n-test/carpet-sample.jpg',
+        name: 'carpet-sample.jpg',
+        size: 482000,
+        contentType: 'image/jpeg',
+      },
+    ],
+  });
+}
+
 async function main() {
   console.info('→ Local seed: users…');
   for (const u of USERS) {
@@ -189,6 +263,7 @@ async function main() {
     .from(company);
   for (const c of companies) {
     await seedBrandSamples(c.schemaName, c.name);
+    await seedBrandTestFlows(c.schemaName);
     console.info(`   ✓ ${c.name}`);
   }
   console.info(`\nDone. Login: admin@reinigungs-portal.com / ${DEFAULT_PW}`);
