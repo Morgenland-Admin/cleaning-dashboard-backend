@@ -81,9 +81,18 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
   },
 };
 
+// pg_advisory_lock key, shared by all replicas.
+const MIGRATION_LOCK_KEY = 7_421_001;
+
 async function main(): Promise<void> {
   const pool = new Pool({ connectionString: env.DATABASE_URL });
   const db = drizzle(pool);
+
+  // Serialize migrations across replicas. Advisory locks are session-level,
+  // so lock and unlock must run on the same pinned client.
+  console.log('[migrate] acquiring advisory lock…');
+  const lockClient = await pool.connect();
+  await lockClient.query(`SELECT pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
 
   console.log('[migrate] ensuring tenant schemas…');
   for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
@@ -129,6 +138,8 @@ async function main(): Promise<void> {
       .onConflictDoUpdate({ target: company.slug, set: updateSet });
   }
 
+  await lockClient.query(`SELECT pg_advisory_unlock(${MIGRATION_LOCK_KEY})`);
+  lockClient.release();
   await pool.end();
   console.log('[migrate] done.');
 }

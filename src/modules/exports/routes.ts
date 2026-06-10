@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, desc, eq, lt } from 'drizzle-orm';
+import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
@@ -8,11 +8,26 @@ import { exportJobs, membership } from '../../db/schema/shared.js';
 import { parseIntId } from '../../lib/http-errors.js';
 import { s3Configured, signObjectDownload } from '../../lib/s3.js';
 
+// Strict: a silently ignored filter key would produce a mislabelled full PII dump.
+const filterSchema = z
+  .object({
+    createdFrom: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional(),
+    createdTo: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional(),
+    status: z.string().max(32).optional(),
+  })
+  .strict();
+
 const createSchema = z.object({
   companySlug: z.string().min(1).max(63),
   kind: z.enum(['orders', 'inquiries', 'contacts', 'newsletter']),
   format: z.enum(['csv']).default('csv'),
-  filter: z.record(z.unknown()).default({}),
+  filter: filterSchema.default({}),
 });
 
 const listQuerySchema = z.object({
@@ -65,7 +80,17 @@ export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
     if (q.status !== 'all') conds.push(eq(exportJobs.status, q.status));
     if (q.cursor) {
       const cur = decodeCursor(q.cursor);
-      if (cur) conds.push(lt(exportJobs.id, cur.id));
+      // Tuple predicate matching the (createdAt DESC, id DESC) ordering.
+      if (cur) {
+        const cw = or(
+          lt(exportJobs.createdAt, sql`${cur.createdAt}::timestamptz`),
+          and(
+            sql`${exportJobs.createdAt} = ${cur.createdAt}::timestamptz`,
+            lt(exportJobs.id, cur.id),
+          ),
+        );
+        if (cw) conds.push(cw);
+      }
     }
     const rows = await db
       .select()

@@ -15,6 +15,10 @@ export interface InvoicePdfData {
   paymentTermsDays: number;
   recipientName: string;
   recipientEmail?: string | null;
+  /** §14 UStG: recipient postal address lines (street, "PLZ Ort", country). */
+  recipientAddressLines?: string[];
+  /** §14 UStG: pre-formatted Leistungsdatum or "von – bis" Leistungszeitraum. */
+  serviceDateLabel?: string | null;
   lineItems: Array<{
     label: string;
     quantity: string;
@@ -83,12 +87,18 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       .font('Helvetica-Bold')
       .fontSize(11)
       .text(data.recipientName, PAGE_LEFT, y + 14);
+    let recipientY = y + 30;
+    for (const line of data.recipientAddressLines ?? []) {
+      doc.fillColor(INK).font('Helvetica').fontSize(9).text(line, PAGE_LEFT, recipientY);
+      recipientY += 13;
+    }
     if (data.recipientEmail) {
       doc
         .fillColor(MUTED)
         .font('Helvetica')
         .fontSize(9)
-        .text(data.recipientEmail, PAGE_LEFT, y + 30);
+        .text(data.recipientEmail, PAGE_LEFT, recipientY);
+      recipientY += 13;
     }
 
     const metaX = 330;
@@ -98,6 +108,7 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       ['Rechnungsnummer', data.invoiceNumber],
       ['Rechnungsdatum', data.invoiceDate],
     ];
+    if (data.serviceDateLabel) meta.push(['Leistungsdatum', data.serviceDateLabel]);
     if (data.dueDate) meta.push(['Fällig bis', data.dueDate]);
     let my = y;
     for (const [label, value] of meta) {
@@ -114,7 +125,7 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       my += 16;
     }
 
-    y = Math.max(y + 50, my + 10);
+    y = Math.max(recipientY + 10, my + 10);
 
     // Items table header
     doc.rect(PAGE_LEFT, y, PAGE_RIGHT - PAGE_LEFT, 22).fill('#f4ebdc');
@@ -176,6 +187,21 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     doc.moveTo(totalsLabelX, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
     y += 6;
     drawTotal('Gesamtbetrag', data.total, true);
+
+    if (!data.tax) {
+      // §19 UStG note is mandatory when no VAT is shown.
+      doc
+        .font('Helvetica')
+        .fontSize(8)
+        .fillColor(MUTED)
+        .text(
+          'Gemäß §19 UStG wird keine Umsatzsteuer berechnet (Kleinunternehmerregelung).',
+          PAGE_LEFT,
+          y,
+          { width: PAGE_RIGHT - PAGE_LEFT },
+        );
+      y = doc.y + 6;
+    }
 
     // Payment terms
     y += 10;

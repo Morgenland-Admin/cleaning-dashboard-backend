@@ -20,7 +20,15 @@ export const priceAdjustmentsAdminRoutes: FastifyPluginAsync = async (app) => {
 
   app.get('/', async (request) => {
     const { priceAdjustments } = request.company!.tables;
-    const q = z.object({ active: z.coerce.boolean().optional() }).parse(request.query);
+    // Not z.coerce.boolean() — "false" would coerce to true.
+    const q = z
+      .object({
+        active: z
+          .enum(['true', 'false'])
+          .transform((v) => v === 'true')
+          .optional(),
+      })
+      .parse(request.query);
     const rows = await db
       .select()
       .from(priceAdjustments)

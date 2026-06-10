@@ -61,6 +61,8 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
     '/sign-upload',
     {
       config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+      // Viewers are read-only.
+      preHandler: app.requireAccess('super_admin', 'admin', 'manager'),
     },
     async (request, reply) => {
       if (!s3Configured) {

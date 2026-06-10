@@ -215,6 +215,8 @@ function buildTenantTables(schemaName: string) {
     {
       id: serial('id').primaryKey(),
       publicToken: text('public_token').notNull().unique(),
+      /** Customer-facing "YYYY/000123", stamped at creation (year never drifts). */
+      orderNumber: varchar('order_number', { length: 20 }),
       kind: varchar('kind', { length: 32 }).notNull(),
       status: varchar('status', { length: 24 }).notNull().default('pending'),
 
@@ -290,6 +292,10 @@ function buildTenantTables(schemaName: string) {
       createdAtIdx: index('orders_created_at_idx').on(table.createdAt),
       statusIdx: index('orders_status_idx').on(table.status),
       stripeSessionIdx: index('orders_stripe_session_id_idx').on(table.stripeSessionId),
+      stripePaymentIntentIdx: index('orders_stripe_payment_intent_idx').on(
+        table.stripePaymentIntentId,
+      ),
+      stripeTransferIdx: index('orders_stripe_transfer_idx').on(table.stripeTransferId),
       assignedPartnerIdx: index('orders_assigned_partner_idx').on(table.assignedPartnerId),
     }),
   );
@@ -414,9 +420,20 @@ function buildTenantTables(schemaName: string) {
       customerType: varchar('customer_type', { length: 8 }).notNull().default('b2c'),
       recipientName: text('recipient_name').notNull(),
       recipientEmail: text('recipient_email'),
+      // §14 UStG: recipient postal address is mandatory on invoices > 250 EUR.
+      recipientAddressLine1: text('recipient_address_line1'),
+      recipientAddressLine2: text('recipient_address_line2'),
+      recipientPostalCode: varchar('recipient_postal_code', { length: 16 }),
+      recipientCity: text('recipient_city'),
+      recipientCountry: varchar('recipient_country', { length: 2 }).default('DE'),
+      // §14 UStG: Leistungsdatum / Leistungszeitraum.
+      serviceDate: date('service_date'),
+      serviceDateEnd: date('service_date_end'),
       status: varchar('status', { length: 16 }).notNull().default('draft'),
       currency: varchar('currency', { length: 3 }).notNull().default('EUR'),
       subtotalCents: integer('subtotal_cents').notNull().default(0),
+      /** VAT rate in percent (0 | 7 | 19). */
+      taxRatePercent: integer('tax_rate_percent').notNull().default(19),
       taxCents: integer('tax_cents').notNull().default(0),
       totalCents: integer('total_cents').notNull().default(0),
       lineItems: jsonb('line_items')
@@ -437,6 +454,25 @@ function buildTenantTables(schemaName: string) {
     (table) => ({
       statusIdx: index('invoices_status_idx').on(table.status),
       dueIdx: index('invoices_due_idx').on(table.dueAt),
+    }),
+  );
+
+  // GoBD: append-only audit trail of invoice state changes.
+  const invoiceStatusLog = s.table(
+    'invoice_status_log',
+    {
+      id: serial('id').primaryKey(),
+      invoiceId: integer('invoice_id')
+        .notNull()
+        .references(() => invoices.id, { onDelete: 'cascade' }),
+      fromStatus: varchar('from_status', { length: 16 }),
+      toStatus: varchar('to_status', { length: 16 }).notNull(),
+      changedByUserId: text('changed_by_user_id'),
+      reason: text('reason'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      invoiceIdx: index('invoice_status_log_invoice_id_idx').on(table.invoiceId),
     }),
   );
 
@@ -526,6 +562,7 @@ function buildTenantTables(schemaName: string) {
     reviews,
     subscriptions,
     invoices,
+    invoiceStatusLog,
     cityStatus,
     priceAdjustments,
     seoPages,
@@ -734,6 +771,7 @@ CREATE INDEX IF NOT EXISTS "chat_messages_created_at_idx" ON ${q}."chat_messages
 CREATE TABLE IF NOT EXISTS ${q}."orders" (
   "id" serial PRIMARY KEY NOT NULL,
   "public_token" text NOT NULL,
+  "order_number" varchar(20),
   "kind" varchar(32) NOT NULL,
   "status" varchar(24) DEFAULT 'pending' NOT NULL,
   "currency" varchar(3) DEFAULT 'EUR' NOT NULL,
@@ -794,6 +832,7 @@ CREATE TABLE IF NOT EXISTS ${q}."orders" (
 CREATE INDEX IF NOT EXISTS "orders_created_at_idx" ON ${q}."orders" ("created_at");
 CREATE INDEX IF NOT EXISTS "orders_status_idx" ON ${q}."orders" ("status");
 CREATE INDEX IF NOT EXISTS "orders_stripe_session_id_idx" ON ${q}."orders" ("stripe_session_id");
+CREATE INDEX IF NOT EXISTS "orders_stripe_payment_intent_idx" ON ${q}."orders" ("stripe_payment_intent_id");
 
 CREATE TABLE IF NOT EXISTS ${q}."order_items" (
   "id" serial PRIMARY KEY NOT NULL,
@@ -839,6 +878,14 @@ ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payout_at" timestamp with ti
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payment_mode" varchar(16) DEFAULT 'upfront' NOT NULL;
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payment_method" varchar(24);
 CREATE INDEX IF NOT EXISTS "orders_assigned_partner_idx" ON ${q}."orders" ("assigned_partner_id");
+-- Keep AFTER the stripe_transfer_id ALTER above or the batch aborts on legacy schemas.
+CREATE INDEX IF NOT EXISTS "orders_stripe_transfer_idx" ON ${q}."orders" ("stripe_transfer_id");
+
+-- Backfill order numbers from the creation year; greatest() avoids lpad truncation.
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "order_number" varchar(20);
+UPDATE ${q}."orders"
+  SET "order_number" = to_char("created_at" AT TIME ZONE 'UTC', 'YYYY') || '/' || lpad("id"::text, greatest(6, length("id"::text)), '0')
+  WHERE "order_number" IS NULL;
 
 ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "tier" varchar(16) DEFAULT 'basic' NOT NULL;
 ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "monthly_fee_cents" integer DEFAULT 0 NOT NULL;
@@ -911,9 +958,17 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
   "customer_type" varchar(8) DEFAULT 'b2c' NOT NULL,
   "recipient_name" text NOT NULL,
   "recipient_email" text,
+  "recipient_address_line1" text,
+  "recipient_address_line2" text,
+  "recipient_postal_code" varchar(16),
+  "recipient_city" text,
+  "recipient_country" varchar(2) DEFAULT 'DE',
+  "service_date" date,
+  "service_date_end" date,
   "status" varchar(16) DEFAULT 'draft' NOT NULL,
   "currency" varchar(3) DEFAULT 'EUR' NOT NULL,
   "subtotal_cents" integer DEFAULT 0 NOT NULL,
+  "tax_rate_percent" integer DEFAULT 19 NOT NULL,
   "tax_cents" integer DEFAULT 0 NOT NULL,
   "total_cents" integer DEFAULT 0 NOT NULL,
   "line_items" jsonb DEFAULT '[]'::jsonb NOT NULL,
@@ -930,6 +985,27 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
 );
 CREATE INDEX IF NOT EXISTS "invoices_status_idx" ON ${q}."invoices" ("status");
 CREATE INDEX IF NOT EXISTS "invoices_due_idx" ON ${q}."invoices" ("due_at");
+
+-- §14 UStG fields for schemas predating these columns.
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_address_line1" text;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_address_line2" text;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_postal_code" varchar(16);
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_city" text;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_country" varchar(2) DEFAULT 'DE';
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "service_date" date;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "service_date_end" date;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "tax_rate_percent" integer DEFAULT 19 NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ${q}."invoice_status_log" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "invoice_id" integer NOT NULL REFERENCES ${q}."invoices"("id") ON DELETE CASCADE,
+  "from_status" varchar(16),
+  "to_status" varchar(16) NOT NULL,
+  "changed_by_user_id" text,
+  "reason" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "invoice_status_log_invoice_id_idx" ON ${q}."invoice_status_log" ("invoice_id");
 
 CREATE TABLE IF NOT EXISTS ${q}."city_status" (
   "id" serial PRIMARY KEY NOT NULL,

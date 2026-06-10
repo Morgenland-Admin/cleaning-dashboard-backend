@@ -66,7 +66,19 @@ export async function buildApp(opts: FastifyServerOptions = {}) {
   app.addHook('onClose', async () => clearInterval(corsRefreshInterval));
   app.decorate('refreshCorsOrigins', refreshCorsOrigins);
 
-  await app.register(helmet, { contentSecurityPolicy: false });
+  // CSP sized for the few HTML pages (inline styles + same-origin form).
+  await app.register(helmet, {
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        styleSrc: ["'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:'],
+        formAction: ["'self'"],
+        baseUri: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
+  });
   await app.register(cors, {
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);

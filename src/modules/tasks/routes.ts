@@ -11,8 +11,11 @@ import { notifyTaskAssigned, notifyTaskComment, spawnTask } from '../../lib/task
 const listQuerySchema = z.object({
   status: z.enum(['open', 'in_progress', 'done', 'dismissed', 'all']).default('open'),
   brand: z.string().min(1).max(63).optional(),
-  /** When true, only the tasks assigned to me. */
-  mine: z.coerce.boolean().default(false),
+  /** When true, only the tasks assigned to me. Not z.coerce.boolean() — "false" would coerce to true. */
+  mine: z
+    .enum(['true', 'false'])
+    .transform((v) => v === 'true')
+    .default('false'),
   limit: z.coerce.number().int().min(1).max(100).default(20),
   cursor: z.string().optional(),
 });

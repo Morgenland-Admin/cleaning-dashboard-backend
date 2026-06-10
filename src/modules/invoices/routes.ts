@@ -17,36 +17,79 @@ const lineItemSchema = z.object({
   unitPriceCents: z.number().int().min(0).max(100_000_000),
 });
 
+const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+
+const recipientAddressFields = {
+  recipientAddressLine1: z.string().max(200).nullable().optional(),
+  recipientAddressLine2: z.string().max(200).nullable().optional(),
+  recipientPostalCode: z.string().max(16).nullable().optional(),
+  recipientCity: z.string().max(120).nullable().optional(),
+  recipientCountry: z.string().length(2).optional(),
+};
+
 const createSchema = z.object({
   orderId: z.number().int().positive().optional(),
   partnerId: z.number().int().positive().optional(),
   customerType: z.enum(['b2c', 'b2b']).default('b2c'),
   recipientName: z.string().min(1).max(200),
   recipientEmail: z.string().email().optional(),
+  ...recipientAddressFields,
+  serviceDate: dateStr.nullable().optional(),
+  serviceDateEnd: dateStr.nullable().optional(),
   lineItems: z.array(lineItemSchema).min(1).max(100),
-  taxCents: z.number().int().min(0).max(100_000_000).default(0),
+  /** VAT rate; taxCents is computed server-side. */
+  taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).default(19),
   paymentTermsDays: z.number().int().min(0).max(120).default(14),
   notes: z.string().max(2000).optional(),
 });
 
-const updateSchema = z.object({
-  status: z.enum(['draft', 'sent', 'paid', 'overdue', 'void']).optional(),
-  odooInvoiceId: z.string().max(255).nullable().optional(),
-  notes: z.string().max(2000).nullable().optional(),
+const draftUpdateSchema = z.object({
+  recipientName: z.string().min(1).max(200).optional(),
   recipientEmail: z.string().email().nullable().optional(),
+  ...recipientAddressFields,
+  serviceDate: dateStr.nullable().optional(),
+  serviceDateEnd: dateStr.nullable().optional(),
+  lineItems: z.array(lineItemSchema).min(1).max(100).optional(),
+  taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).optional(),
+  paymentTermsDays: z.number().int().min(0).max(120).optional(),
+  notes: z.string().max(2000).nullable().optional(),
+  status: z.enum(['void']).optional(),
+  odooInvoiceId: z.string().max(255).nullable().optional(),
 });
+
+/** After issue, only status + external reference may change. */
+const issuedUpdateSchema = z.object({
+  status: z.enum(['paid', 'overdue', 'void']).optional(),
+  odooInvoiceId: z.string().max(255).nullable().optional(),
+});
+
+/** Allowed status transitions (GoBD). */
+const STATUS_TRANSITIONS: Record<string, string[]> = {
+  draft: ['sent', 'void'],
+  sent: ['paid', 'overdue', 'void'],
+  overdue: ['paid', 'void'],
+  paid: [],
+  void: [],
+};
 
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).max(500).optional(),
   status: z.enum(['draft', 'sent', 'paid', 'overdue', 'void']).optional(),
   customerType: z.enum(['b2c', 'b2b']).optional(),
-  overdue: z.coerce.boolean().optional(),
+  overdue: z
+    .enum(['true', 'false'])
+    .transform((v) => v === 'true')
+    .optional(),
 });
 
 function invoiceNumber(id: number): string {
   const year = new Date().getUTCFullYear();
   return `INV-${year}-${String(id).padStart(6, '0')}`;
+}
+
+function computeTaxCents(subtotalCents: number, taxRatePercent: number): number {
+  return Math.round((subtotalCents * taxRatePercent) / 100);
 }
 
 export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
@@ -100,12 +143,14 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/', async (request, reply) => {
     const body = createSchema.parse(request.body);
-    const { invoices } = request.company!.tables;
+    const { invoices, invoiceStatusLog } = request.company!.tables;
+    const adminId = request.authUser!.id;
     const subtotalCents = body.lineItems.reduce(
       (a, l) => a + Math.round(l.quantity * l.unitPriceCents),
       0,
     );
-    const totalCents = subtotalCents + body.taxCents;
+    const taxCents = computeTaxCents(subtotalCents, body.taxRatePercent);
+    const totalCents = subtotalCents + taxCents;
     const invoice = await db.transaction(async (tx) => {
       const [row] = await tx
         .insert(invoices)
@@ -115,9 +160,17 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           customerType: body.customerType,
           recipientName: body.recipientName,
           recipientEmail: body.recipientEmail,
+          recipientAddressLine1: body.recipientAddressLine1,
+          recipientAddressLine2: body.recipientAddressLine2,
+          recipientPostalCode: body.recipientPostalCode,
+          recipientCity: body.recipientCity,
+          recipientCountry: body.recipientCountry ?? 'DE',
+          serviceDate: body.serviceDate ?? null,
+          serviceDateEnd: body.serviceDateEnd ?? null,
           lineItems: body.lineItems,
           subtotalCents,
-          taxCents: body.taxCents,
+          taxRatePercent: body.taxRatePercent,
+          taxCents,
           totalCents,
           paymentTermsDays: body.paymentTermsDays,
           notes: body.notes,
@@ -129,34 +182,132 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         .set({ number: invoiceNumber(row!.id) })
         .where(eq(invoices.id, row!.id))
         .returning();
+      await tx.insert(invoiceStatusLog).values({
+        invoiceId: row!.id,
+        fromStatus: null,
+        toStatus: 'draft',
+        changedByUserId: adminId,
+        reason: 'Rechnung erstellt',
+      });
       return withNumber!;
     });
     reply.code(201).send({ invoice });
   });
 
-  app.patch('/:id', async (request) => {
+  app.patch('/:id', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const body = updateSchema.parse(request.body);
-    const { invoices } = request.company!.tables;
-    const set: Record<string, unknown> = { ...body, updatedAt: new Date() };
-    if (body.status === 'paid') set.paidAt = new Date();
-    const [row] = await db.update(invoices).set(set).where(eq(invoices.id, id)).returning();
+    const { invoices, invoiceStatusLog } = request.company!.tables;
+    const adminId = request.authUser!.id;
+    const now = new Date();
+
+    const [current] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+    if (!current) throw notFound('Invoice not found');
+
+    // GoBD: issued invoices are content-frozen.
+    const isDraft = current.status === 'draft';
+    const body = (isDraft ? draftUpdateSchema : issuedUpdateSchema).parse(request.body);
+
+    if (body.status && !STATUS_TRANSITIONS[current.status]?.includes(body.status)) {
+      reply.code(409).send({
+        error: `Statuswechsel ${current.status} → ${body.status} ist nicht zulässig.`,
+        allowed: STATUS_TRANSITIONS[current.status] ?? [],
+      });
+      return;
+    }
+
+    const set: Record<string, unknown> = { ...body, updatedAt: now };
+    if (body.status === 'paid') set.paidAt = now;
+    if (isDraft && ('lineItems' in body || 'taxRatePercent' in body)) {
+      const draftBody = body as z.infer<typeof draftUpdateSchema>;
+      const lineItems = draftBody.lineItems ?? current.lineItems;
+      const taxRatePercent = draftBody.taxRatePercent ?? current.taxRatePercent;
+      const subtotalCents = lineItems.reduce(
+        (a, l) => a + Math.round(l.quantity * l.unitPriceCents),
+        0,
+      );
+      const taxCents = computeTaxCents(subtotalCents, taxRatePercent);
+      set.subtotalCents = subtotalCents;
+      set.taxCents = taxCents;
+      set.totalCents = subtotalCents + taxCents;
+    }
+
+    const [row] = await db
+      .update(invoices)
+      .set(set)
+      .where(and(eq(invoices.id, id), eq(invoices.status, current.status)))
+      .returning();
     if (!row) throw notFound('Invoice not found');
+    if (body.status && body.status !== current.status) {
+      await db.insert(invoiceStatusLog).values({
+        invoiceId: id,
+        fromStatus: current.status,
+        toStatus: body.status,
+        changedByUserId: adminId,
+        reason: 'Status geändert (PATCH)',
+      });
+    }
     return { invoice: row };
   });
 
-  app.post('/:id/send', async (request) => {
+  app.post('/:id/send', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const { invoices } = request.company!.tables;
+    const { invoices, invoiceStatusLog } = request.company!.tables;
+    const adminId = request.authUser!.id;
     const [current] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
     if (!current) throw notFound('Invoice not found');
+    if (current.status === 'paid' || current.status === 'void') {
+      reply.code(409).send({
+        error: `Eine Rechnung im Status "${current.status}" kann nicht versendet werden.`,
+      });
+      return;
+    }
+
     const now = new Date();
-    const dueAt = new Date(now.getTime() + current.paymentTermsDays * 24 * 60 * 60 * 1000);
-    const [row] = await db
-      .update(invoices)
-      .set({ status: 'sent', sentAt: now, dueAt, updatedAt: now })
-      .where(eq(invoices.id, id))
-      .returning();
+    let row = current;
+    if (current.status === 'draft') {
+      // §14 UStG: mandatory before issue.
+      const missing: string[] = [];
+      if (!current.recipientAddressLine1) missing.push('Empfänger-Straße');
+      if (!current.recipientPostalCode) missing.push('Empfänger-PLZ');
+      if (!current.recipientCity) missing.push('Empfänger-Ort');
+      if (!current.serviceDate) missing.push('Leistungsdatum');
+      if (missing.length > 0) {
+        reply.code(400).send({
+          error: `Pflichtangaben fehlen (§14 UStG): ${missing.join(', ')}`,
+          missing,
+        });
+        return;
+      }
+      // dueAt is set once at first issue; re-sends never move it.
+      const dueAt = new Date(now.getTime() + current.paymentTermsDays * 24 * 60 * 60 * 1000);
+      const [issued] = await db
+        .update(invoices)
+        .set({ status: 'sent', sentAt: now, dueAt, updatedAt: now })
+        .where(and(eq(invoices.id, id), eq(invoices.status, 'draft')))
+        .returning();
+      if (!issued) {
+        reply.code(409).send({ error: 'Rechnung wurde zwischenzeitlich geändert.' });
+        return;
+      }
+      await db.insert(invoiceStatusLog).values({
+        invoiceId: id,
+        fromStatus: 'draft',
+        toStatus: 'sent',
+        changedByUserId: adminId,
+        reason: 'Rechnung ausgestellt & versendet',
+      });
+      row = issued;
+    } else {
+      // sent/overdue: re-send the unchanged document.
+      await db.insert(invoiceStatusLog).values({
+        invoiceId: id,
+        fromStatus: current.status,
+        toStatus: current.status,
+        changedByUserId: adminId,
+        reason: 'Rechnung erneut versendet',
+      });
+    }
+    const dueAt = row.dueAt ?? now;
 
     // Email the invoice to the recipient via the brand's Resend account.
     // Best-effort: a mail failure must not undo the "sent" transition.
@@ -172,10 +323,11 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         if (companyRow) {
           const fmtDate = (d: Date) =>
             d.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
-          const taxRate =
-            row.subtotalCents > 0 && row.taxCents > 0
-              ? Math.round((row.taxCents / row.subtotalCents) * 100)
-              : 0;
+          const fmtDateStr = (s: string) => {
+            const [y, m, d] = s.split('-');
+            return y && m && d ? `${d}.${m}.${y}` : s;
+          };
+          const taxRate = row.taxCents > 0 ? row.taxRatePercent : 0;
           const addressLines = [
             companyRow.addressLine1,
             companyRow.addressLine2,
@@ -184,8 +336,18 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
 
           // Shared, pre-formatted values — used by both the HTML email and the PDF.
           const invoiceNumber = row.number ?? `#${row.id}`;
-          const invoiceDate = fmtDate(now);
+          const invoiceDate = fmtDate(row.sentAt ?? now);
           const dueDate = fmtDate(dueAt);
+          const serviceDateLabel = row.serviceDate
+            ? row.serviceDateEnd
+              ? `${fmtDateStr(row.serviceDate)} – ${fmtDateStr(row.serviceDateEnd)}`
+              : fmtDateStr(row.serviceDate)
+            : null;
+          const recipientAddressLines = [
+            row.recipientAddressLine1,
+            row.recipientAddressLine2,
+            [row.recipientPostalCode, row.recipientCity].filter(Boolean).join(' ') || null,
+          ].filter((x): x is string => Boolean(x));
           const taxFormatted = row.taxCents > 0 ? formatEurFromCents(row.taxCents) : null;
           const taxRateLabel = taxRate > 0 ? `${taxRate} %` : null;
           const subtotalFormatted = formatEurFromCents(row.subtotalCents);
@@ -216,6 +378,8 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
               paymentTermsDays: row.paymentTermsDays,
               recipientName: row.recipientName,
               recipientEmail: row.recipientEmail,
+              recipientAddressLines,
+              serviceDateLabel,
               lineItems,
               subtotal: subtotalFormatted,
               tax: taxFormatted,
@@ -268,23 +432,51 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     return { invoice: row, emailSent, emailSkipped };
   });
 
-  app.post('/:id/mark-paid', async (request) => {
+  app.post('/:id/mark-paid', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const { invoices } = request.company!.tables;
+    const { invoices, invoiceStatusLog } = request.company!.tables;
     const now = new Date();
+    const [current] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+    if (!current) throw notFound('Invoice not found');
+    // Only issued invoices can be paid.
+    if (current.status !== 'sent' && current.status !== 'overdue') {
+      reply.code(409).send({
+        error: `Rechnung im Status "${current.status}" kann nicht als bezahlt markiert werden.`,
+      });
+      return;
+    }
     const [row] = await db
       .update(invoices)
       .set({ status: 'paid', paidAt: now, updatedAt: now })
-      .where(eq(invoices.id, id))
+      .where(and(eq(invoices.id, id), eq(invoices.status, current.status)))
       .returning();
-    if (!row) throw notFound('Invoice not found');
+    if (!row) {
+      reply.code(409).send({ error: 'Rechnung wurde zwischenzeitlich geändert.' });
+      return;
+    }
+    await db.insert(invoiceStatusLog).values({
+      invoiceId: id,
+      fromStatus: current.status,
+      toStatus: 'paid',
+      changedByUserId: request.authUser!.id,
+      reason: 'Als bezahlt markiert',
+    });
     return { invoice: row };
   });
 
-  app.post('/:id/dunning', async (request) => {
+  app.post('/:id/dunning', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const { invoices } = request.company!.tables;
+    const { invoices, invoiceStatusLog } = request.company!.tables;
     const now = new Date();
+    const [current] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+    if (!current) throw notFound('Invoice not found');
+    // Only issued, unpaid invoices can be dunned.
+    if (current.status !== 'sent' && current.status !== 'overdue') {
+      reply.code(409).send({
+        error: `Mahnung ist für Rechnungen im Status "${current.status}" nicht möglich.`,
+      });
+      return;
+    }
     const [row] = await db
       .update(invoices)
       .set({
@@ -293,10 +485,32 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         status: 'overdue',
         updatedAt: now,
       })
-      .where(eq(invoices.id, id))
+      .where(and(eq(invoices.id, id), eq(invoices.status, current.status)))
       .returning();
-    if (!row) throw notFound('Invoice not found');
+    if (!row) {
+      reply.code(409).send({ error: 'Rechnung wurde zwischenzeitlich geändert.' });
+      return;
+    }
+    await db.insert(invoiceStatusLog).values({
+      invoiceId: id,
+      fromStatus: current.status,
+      toStatus: 'overdue',
+      changedByUserId: request.authUser!.id,
+      reason: `Mahnstufe ${row.dunningLevel}`,
+    });
     return { invoice: row };
+  });
+
+  /** GoBD audit trail for one invoice. */
+  app.get('/:id/log', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { invoiceStatusLog } = request.company!.tables;
+    const log = await db
+      .select()
+      .from(invoiceStatusLog)
+      .where(eq(invoiceStatusLog.invoiceId, id))
+      .orderBy(desc(invoiceStatusLog.createdAt));
+    return { log };
   });
 };
 

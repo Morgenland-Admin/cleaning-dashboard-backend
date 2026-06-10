@@ -84,11 +84,11 @@ export async function sendPushToBrandAdmins(
   return { sent, failed, pruned: deadIds.length };
 }
 
-export const sendPushToUser = sendTestPushToUser;
-
-export async function sendTestPushToUser(
+/** Push to all of one user's devices. 24h TTL so offline devices still get it. */
+export async function sendPushToUser(
   userId: string,
   payload: PushPayload,
+  opts: { ttlSeconds?: number } = {},
 ): Promise<{ sent: number; pruned: number }> {
   if (!configureOnce()) return { sent: 0, pruned: 0 };
 
@@ -106,7 +106,7 @@ export async function sendTestPushToUser(
           keys: { p256dh: sub.p256dh, auth: sub.auth },
         },
         body,
-        { TTL: 60 },
+        { TTL: opts.ttlSeconds ?? 60 * 60 * 24 },
       );
       sent += 1;
     } catch (err) {
@@ -120,4 +120,12 @@ export async function sendTestPushToUser(
   }
 
   return { sent, pruned: deadIds.length };
+}
+
+/** Short-TTL variant for the "test notification" button. */
+export async function sendTestPushToUser(
+  userId: string,
+  payload: PushPayload,
+): Promise<{ sent: number; pruned: number }> {
+  return sendPushToUser(userId, payload, { ttlSeconds: 60 });
 }

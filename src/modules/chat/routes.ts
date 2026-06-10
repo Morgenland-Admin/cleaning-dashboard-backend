@@ -186,6 +186,20 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
       adminId,
     );
 
+    // PWA push for the partner — the WS broadcast only reaches open tabs.
+    try {
+      const { sendPushToUser } = await import('../../lib/push.js');
+      await sendPushToUser(partnerUserId, {
+        title: `${request.company!.name} · Neue Nachricht`,
+        body: body.body ? body.body.slice(0, 120) : '📎 Anhang erhalten',
+        url: '/chat',
+        tag: `chat:${result.conversation.id}`,
+        brandSlug: slug,
+      });
+    } catch (err) {
+      request.log.warn({ err, partnerUserId }, 'chat push dispatch failed');
+    }
+
     reply.code(201);
     return { message: payload };
   });

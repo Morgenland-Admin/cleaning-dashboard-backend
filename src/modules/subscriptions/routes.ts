@@ -4,7 +4,8 @@ import { z } from 'zod';
 
 import { db } from '../../db/index.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
-import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { conflict, notFound, parseIntId } from '../../lib/http-errors.js';
+import { getStripe, stripeConfigured } from '../../lib/stripe.js';
 
 const createSchema = z.object({
   customerEmail: z.string().email().max(254),
@@ -36,7 +37,7 @@ const updateSchema = z.object({
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).max(500).optional(),
-  status: z.enum(['active', 'paused', 'cancelled']).optional(),
+  status: z.enum(['active', 'paused', 'past_due', 'cancelled']).optional(),
   email: z.string().email().optional(),
 });
 
@@ -116,25 +117,91 @@ export const subscriptionsAdminRoutes: FastifyPluginAsync = async (app) => {
     return { subscription: row };
   });
 
-  for (const [action, patch] of [
-    ['pause', { status: 'paused' as const, pausedAt: true }],
-    ['resume', { status: 'active' as const, pausedAt: false }],
-    ['cancel', { status: 'cancelled' as const, cancelledAt: true }],
-  ] as const) {
-    app.post(`/:id/${action}`, async (request) => {
+  // Stripe is updated BEFORE the local row — a dashboard cancel must always stop billing.
+  const LIFECYCLE: Record<
+    'pause' | 'resume' | 'cancel',
+    { from: string[]; to: 'paused' | 'active' | 'cancelled' }
+  > = {
+    pause: { from: ['active'], to: 'paused' },
+    resume: { from: ['paused', 'past_due'], to: 'active' },
+    cancel: { from: ['active', 'paused', 'past_due'], to: 'cancelled' },
+  };
+
+  async function syncStripeLifecycle(
+    action: 'pause' | 'resume' | 'cancel',
+    stripeSubscriptionId: string,
+  ): Promise<void> {
+    const stripe = getStripe();
+    if (action === 'cancel') {
+      await stripe.subscriptions.cancel(stripeSubscriptionId);
+      return;
+    }
+    await stripe.subscriptions.update(stripeSubscriptionId, {
+      pause_collection: action === 'pause' ? { behavior: 'void' } : null,
+    });
+  }
+
+  for (const action of ['pause', 'resume', 'cancel'] as const) {
+    const rule = LIFECYCLE[action];
+    app.post(`/:id/${action}`, async (request, reply) => {
       const id = parseIntId((request.params as { id: string }).id);
       const { subscriptions } = request.company!.tables;
       const now = new Date();
-      const set: Record<string, unknown> = { status: patch.status, updatedAt: now };
-      if ('pausedAt' in patch) set.pausedAt = patch.pausedAt ? now : null;
-      if ('cancelledAt' in patch && patch.cancelledAt) set.cancelledAt = now;
-      const [row] = await db
+
+      const [row] = await db.select().from(subscriptions).where(eq(subscriptions.id, id)).limit(1);
+      if (!row) throw notFound('Subscription not found');
+      if (!rule.from.includes(row.status)) {
+        throw conflict(`Aktion "${action}" ist im Status "${row.status}" nicht möglich.`);
+      }
+
+      if (row.stripeSubscriptionId) {
+        if (!stripeConfigured) {
+          reply.code(503).send({ error: 'Stripe not configured on this server' });
+          return;
+        }
+        try {
+          await syncStripeLifecycle(action, row.stripeSubscriptionId);
+        } catch (err) {
+          const code = (err as { code?: string }).code;
+          // Already cancelled at Stripe — just record the local cancel.
+          if (!(action === 'cancel' && code === 'resource_missing')) {
+            request.log.error(
+              { err, subscriptionId: id, action },
+              'Stripe subscription sync failed',
+            );
+            reply
+              .code(502)
+              .send({ error: 'Stripe-Synchronisation fehlgeschlagen — Aktion abgebrochen.' });
+            return;
+          }
+        }
+      }
+
+      const set: Record<string, unknown> = { status: rule.to, updatedAt: now };
+      if (rule.to === 'paused') set.pausedAt = now;
+      if (rule.to === 'active') set.pausedAt = null;
+      if (rule.to === 'cancelled') set.cancelledAt = now;
+
+      // CAS on the validated status.
+      const [updated] = await db
         .update(subscriptions)
         .set(set)
-        .where(eq(subscriptions.id, id))
+        .where(and(eq(subscriptions.id, id), eq(subscriptions.status, row.status)))
         .returning();
-      if (!row) throw notFound('Subscription not found');
-      return { subscription: row };
+      if (!updated) {
+        // The synchronous Stripe webhook may have already written the target
+        // status — that's success, not a conflict.
+        const [latest] = await db
+          .select()
+          .from(subscriptions)
+          .where(eq(subscriptions.id, id))
+          .limit(1);
+        if (latest?.status === rule.to) {
+          return { subscription: latest };
+        }
+        throw conflict('Abo wurde zwischenzeitlich geändert — bitte neu laden.');
+      }
+      return { subscription: updated };
     });
   }
 };

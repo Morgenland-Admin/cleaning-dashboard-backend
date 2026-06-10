@@ -72,6 +72,14 @@ function renderHtmlPage(
 }
 
 export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
+  // Unsubscribe form + RFC 8058 clients POST urlencoded bodies; the token is
+  // in the query string, so accept and discard the body.
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (_req, _body, done) => done(null, {}),
+  );
+
   app.post(
     '/subscribe',
     {
@@ -120,22 +128,26 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
           const apiBase = apiBaseUrl();
           const confirmUrl = `${apiBase}/storefront/newsletter/confirm?slug=${encodeURIComponent(slug)}&token=${encodeURIComponent(confirmToken)}`;
           const unsubscribeUrl = `${apiBase}/storefront/newsletter/unsubscribe?token=${encodeURIComponent(signUnsubscribeToken({ id: row.id, slug }))}`;
-          try {
-            await sendEmail({
-              to: row.email,
-              from: brandSender(companyRow),
-              apiKey: companyRow.resendApiKey ?? undefined,
-              replyTo: companyRow.email ?? undefined,
-              email: newsletterConfirmEmail({
-                firstName: row.firstName,
-                brand: brandInfoFromCompany(companyRow),
-                confirmUrl,
-                unsubscribeUrl,
-              }),
-            });
-          } catch (err) {
+          const result = await sendEmail({
+            to: row.email,
+            from: brandSender(companyRow),
+            apiKey: companyRow.resendApiKey ?? undefined,
+            replyTo: companyRow.email ?? undefined,
+            // RFC 8058 one-click unsubscribe (Gmail/Yahoo bulk-sender rules).
+            headers: {
+              'List-Unsubscribe': `<${unsubscribeUrl}>`,
+              'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+            },
+            email: newsletterConfirmEmail({
+              firstName: row.firstName,
+              brand: brandInfoFromCompany(companyRow),
+              confirmUrl,
+              unsubscribeUrl,
+            }),
+          });
+          if (!result.ok) {
             request.log.error(
-              { err, subscriberId: row.id, recipientEmail: row.email },
+              { error: result.error, subscriberId: row.id },
               'Failed to send newsletter confirm email',
             );
           }
@@ -228,12 +240,15 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
   const unsubscribeQuerySchema = z.object({
     token: z.string().min(8).max(500),
   });
+
+  /** Confirmation page only — mail scanners prefetch GETs, so POST does the work. */
   app.get(
     '/unsubscribe',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (request, reply) => {
       const q = unsubscribeQuerySchema.safeParse(request.query);
-      if (!q.success) {
+      const payload = q.success ? verifyUnsubscribeToken(q.data.token) : null;
+      if (!q.success || !payload) {
         return renderHtmlPage(reply, {
           title: 'Ungültiger Link',
           heading: 'Ungültiger Abmelde-Link',
@@ -241,8 +256,40 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
           status: 400,
         });
       }
-      const payload = verifyUnsubscribeToken(q.data.token);
-      if (!payload) {
+      const [companyRow] = await db
+        .select()
+        .from(company)
+        .where(eq(company.slug, payload.slug))
+        .limit(1);
+      if (!companyRow) {
+        return renderHtmlPage(reply, {
+          title: 'Unbekannt',
+          heading: 'Marke nicht gefunden',
+          bodyHtml: '<p>Diese Anmeldung gehört zu keiner aktiven Marke.</p>',
+          status: 404,
+        });
+      }
+      const safeName = escapeHtml(companyRow.name);
+      const action = `${apiBaseUrl()}/storefront/newsletter/unsubscribe?token=${encodeURIComponent(q.data.token)}`;
+      return renderHtmlPage(reply, {
+        title: 'Abmelden',
+        heading: `Newsletter abmelden · ${companyRow.name}`,
+        bodyHtml: `<p>Möchtest du keine Newsletter mehr von <strong>${safeName}</strong> erhalten?</p>
+        <form method="post" action="${escapeHtml(action)}" style="margin-top:16px;">
+          <button type="submit" style="background:#bd5b3e;color:#fff;border:0;border-radius:8px;padding:12px 24px;font-size:14px;cursor:pointer;">Jetzt abmelden</button>
+        </form>`,
+      });
+    },
+  );
+
+  /** Performs the unsubscribe. Also serves RFC 8058 one-click POSTs. */
+  app.post(
+    '/unsubscribe',
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const q = unsubscribeQuerySchema.safeParse(request.query);
+      const payload = q.success ? verifyUnsubscribeToken(q.data.token) : null;
+      if (!q.success || !payload) {
         return renderHtmlPage(reply, {
           title: 'Ungültig',
           heading: 'Abmelde-Link ungültig',
@@ -340,6 +387,11 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
     dryRun: z.boolean().default(false),
     tag: z.string().trim().max(64).optional(),
     source: z.string().trim().max(64).default('csv-import'),
+    /**
+     * UWG §7: the sender must prove consent. Rows import as confirmed only
+     * when the admin attests proof exists; otherwise they must double-opt-in.
+     */
+    attestConsent: z.boolean().default(false),
   });
 
   app.post('/import', { bodyLimit: 12 * 1024 * 1024 }, async (request, reply) => {
@@ -406,10 +458,10 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
                 firstName: r.firstName ?? null,
                 lastName: r.lastName ?? null,
                 locale: 'de',
-                source: body.source,
+                source: body.attestConsent ? `${body.source} (consent attested)` : body.source,
                 tags,
-                confirmed: true,
-                confirmedAt: now,
+                confirmed: body.attestConsent,
+                confirmedAt: body.attestConsent ? now : null,
                 ipAddress: request.ip,
                 userAgent: request.headers['user-agent'] ?? null,
               })),
@@ -426,6 +478,10 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(body.dryRun ? 200 : 201).send({
       summary: summarise(filtered, imported),
       dryRun: body.dryRun,
+      consentAttested: body.attestConsent,
+      note: body.attestConsent
+        ? 'Importiert als bestätigt — Einwilligungsnachweise müssen vorliegen (UWG §7).'
+        : 'Importiert als UNBESTÄTIGT — Empfänger erhalten erst nach Double-Opt-in Newsletter.',
     });
   });
 };

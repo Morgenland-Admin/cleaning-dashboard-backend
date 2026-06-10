@@ -47,9 +47,30 @@ const KIND_LABEL: Record<string, string> = {
   teppichbodenreinigung: 'Teppichbodenreinigung (Vor-Ort)',
 };
 
-function orderNumberFor(id: number): string {
-  const year = new Date().getUTCFullYear();
-  return `${year}/${String(id).padStart(6, '0')}`;
+/** "YYYY/000123" from the creation year — never the current year. */
+function formatOrderNumber(id: number, createdAt: Date): string {
+  return `${createdAt.getUTCFullYear()}/${String(id).padStart(6, '0')}`;
+}
+
+/** Persisted order number; createdAt-based fallback for legacy rows. */
+function orderNumberOf(row: {
+  id: number;
+  orderNumber?: string | null;
+  createdAt?: Date | null;
+}): string {
+  if (row.orderNumber) return row.orderNumber;
+  return formatOrderNumber(row.id, row.createdAt ?? new Date());
+}
+
+/** Per-brand card-statement suffix (Stripe: alnum + space, 22-char limit). */
+function statementSuffix(companyName: string): string | undefined {
+  const cleaned = companyName
+    .toUpperCase()
+    .replace(/[^A-Z0-9 ]/g, '')
+    .trim()
+    .slice(0, 12)
+    .trim();
+  return cleaned.length >= 2 ? cleaned : undefined;
 }
 
 /** "YYYY-MM-DDTHH:mm" → "DD.MM.YYYY · HH:mm Uhr" for German display. */
@@ -181,6 +202,44 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         .limit(1);
       if (!companyRow) throw notFound('Company not found');
 
+      const appBase = env.APP_BASE_URL.replace(/\/$/, '');
+      const storefrontOrigin = (companyRow.storefrontOrigin ?? appBase).replace(/\/$/, '');
+      const paymentMode = body.paymentMode ?? 'upfront';
+      const isAfterService = paymentMode === 'after_service';
+
+      // Validate everything fallible BEFORE the insert — no orphaned rows.
+      let discounts: Array<{ promotion_code: string }> | undefined;
+      if (!isAfterService) {
+        if (
+          env.NODE_ENV === 'production' &&
+          /^https?:\/\/(localhost|127\.0\.0\.1)/i.test(storefrontOrigin)
+        ) {
+          request.log.error(
+            { storefrontOrigin, companySlug: request.company!.slug },
+            'Refusing to create Stripe session — storefrontOrigin resolves to localhost in production',
+          );
+          reply.code(503).send({
+            error: 'Checkout temporarily unavailable. Please contact us if this persists.',
+          });
+          return;
+        }
+        if (body.voucherCode) {
+          const code = body.voucherCode.toUpperCase();
+          const promo = await getStripe().promotionCodes.list({ code, active: true, limit: 1 });
+          const promoCode = promo.data[0];
+          const stillRedeemable =
+            promoCode &&
+            (!promoCode.expires_at || promoCode.expires_at * 1000 > Date.now()) &&
+            (promoCode.max_redemptions == null ||
+              promoCode.times_redeemed < promoCode.max_redemptions);
+          if (!stillRedeemable) {
+            reply.code(400).send({ error: 'Gutscheincode ungültig oder abgelaufen.' });
+            return;
+          }
+          discounts = [{ promotion_code: promoCode.id }];
+        }
+      }
+
       const { orders, orderItems, orderStatusLog } = request.company!.tables;
       const publicToken = generateOrderToken();
       const pickupMode =
@@ -217,8 +276,6 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
       // 'after_service' orders skip Stripe checkout entirely — they go straight
       // into the service pipeline (status 'accepted') and payment is collected
       // by an admin once the work is done (cash / EC card / credit-card link).
-      const paymentMode = body.paymentMode ?? 'upfront';
-      const isAfterService = paymentMode === 'after_service';
 
       const orderRow = await db.transaction(async (tx) => {
         const inserted = await tx
@@ -244,7 +301,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
                 ? { preferredSlots: body.preferredSlots }
                 : {},
             customerName: body.customer.name,
-            customerEmail: body.customer.email,
+            customerEmail: body.customer.email.trim().toLowerCase(),
             customerPhone: body.customer.phone ?? null,
             addressLine1: addressForOrder?.line1 ?? null,
             addressLine2: addressForOrder?.line2 ?? null,
@@ -262,6 +319,11 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           .returning();
         const order = inserted[0];
         if (!order) throw new Error('Failed to insert order row');
+
+        // Stamp the order number from the creation year so it never drifts.
+        const stampedNumber = formatOrderNumber(order.id, order.createdAt);
+        await tx.update(orders).set({ orderNumber: stampedNumber }).where(eq(orders.id, order.id));
+        order.orderNumber = stampedNumber;
 
         const linesToInsert = quote.lines.map((l) => ({
           orderId: order.id,
@@ -285,14 +347,11 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return order;
       });
 
-      const appBase = env.APP_BASE_URL.replace(/\/$/, '');
-      const storefrontOrigin = (companyRow.storefrontOrigin ?? appBase).replace(/\/$/, '');
-
       // --- Pay-after-service: no Stripe checkout, just confirm the booking. ---
       if (isAfterService) {
         try {
           const brand = brandInfoFromCompany(companyRow);
-          const orderNumber = orderNumberFor(orderRow.id);
+          const orderNumber = orderNumberOf(orderRow);
           const trackerUrl = `${storefrontOrigin}/bestellung?token=${encodeURIComponent(publicToken)}`;
           const baseNote =
             pickupMode === 'drop_off'
@@ -353,6 +412,20 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           );
         }
 
+        // After-service orders skip the payment webhook — push fires here.
+        try {
+          const { sendPushToBrandAdmins } = await import('../../lib/push.js');
+          await sendPushToBrandAdmins(request.company!.slug, {
+            title: `${companyRow.name} · Neuer Auftrag (Zahlung nach Leistung)`,
+            body: `${orderNumberOf(orderRow)} · ${body.customer.name} · ${formatEurFromCents(quote.totalCents)}`,
+            url: `/auftraege?id=${orderRow.id}`,
+            tag: `order:${orderRow.id}`,
+            brandSlug: request.company!.slug,
+          });
+        } catch (err) {
+          request.log.warn({ err, orderId: orderRow.id }, 'push dispatch failed for new order');
+        }
+
         reply.code(201).send({
           ok: true,
           orderId: orderRow.id,
@@ -365,84 +438,77 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
 
       const stripe = getStripe();
 
-      if (
-        env.NODE_ENV === 'production' &&
-        /^https?:\/\/(localhost|127\.0\.0\.1)/i.test(storefrontOrigin)
-      ) {
-        request.log.error(
-          { storefrontOrigin, companySlug: request.company!.slug },
-          'Refusing to create Stripe session — storefrontOrigin resolves to localhost in production',
+      const suffix = statementSuffix(companyRow.name);
+      let session: Stripe.Checkout.Session;
+      try {
+        session = await stripe.checkout.sessions.create(
+          {
+            mode: 'payment',
+            payment_method_types: ['card', 'paypal', 'amazon_pay', 'link'],
+            currency: 'eur',
+            line_items: [
+              {
+                quantity: 1,
+                price_data: {
+                  currency: 'eur',
+                  unit_amount: quote.totalCents,
+                  product_data: {
+                    name: `${companyRow.name} · ${KIND_LABEL[body.kind] ?? body.kind}`,
+                    description: `Auftrag ${orderNumberOf(orderRow)}`,
+                  },
+                  tax_behavior: 'inclusive',
+                },
+              },
+            ],
+            ...(discounts ? { discounts } : {}),
+            ...(suffix ? { payment_intent_data: { statement_descriptor_suffix: suffix } } : {}),
+            customer_email: body.customer.email.trim().toLowerCase(),
+            client_reference_id: String(orderRow.id),
+            metadata: {
+              orderId: String(orderRow.id),
+              companySlug: request.company!.slug,
+              publicToken,
+              kind: body.kind,
+            },
+            success_url: `${storefrontOrigin}/buchung/erfolg?token=${publicToken}&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${storefrontOrigin}/buchung/storno?token=${publicToken}`,
+            locale: 'de',
+            expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
+            billing_address_collection: 'auto',
+          },
+          { idempotencyKey: `checkout_${request.company!.slug}_${orderRow.id}` },
         );
-        reply.code(503).send({
-          error: 'Checkout temporarily unavailable. Please contact us if this persists.',
+      } catch (err) {
+        // Don't strand the fresh row as an orphaned 'pending' order.
+        request.log.error({ err, orderId: orderRow.id }, 'Stripe session creation failed');
+        await markOrderCancelled(
+          app,
+          request.company!.slug,
+          orderRow.id,
+          'Stripe Checkout Session konnte nicht erstellt werden',
+        );
+        reply.code(502).send({
+          error: 'Die Zahlung konnte nicht gestartet werden. Bitte versuchen Sie es erneut.',
         });
         return;
       }
-      let discounts: Array<{ promotion_code: string }> | undefined;
-      if (body.voucherCode) {
-        const code = body.voucherCode.toUpperCase();
-        const promo = await stripe.promotionCodes.list({ code, active: true, limit: 1 });
-        const promoCode = promo.data[0];
-        const stillRedeemable =
-          promoCode &&
-          (!promoCode.expires_at || promoCode.expires_at * 1000 > Date.now()) &&
-          (promoCode.max_redemptions == null ||
-            promoCode.times_redeemed < promoCode.max_redemptions);
-        if (!stillRedeemable) {
-          reply.code(400).send({ error: 'Gutscheincode ungültig oder abgelaufen.' });
-          return;
-        }
-        discounts = [{ promotion_code: promoCode.id }];
-      }
 
-      const session = await stripe.checkout.sessions.create({
-        mode: 'payment',
-        payment_method_types: ['card', 'paypal', 'amazon_pay', 'link'],
-        currency: 'eur',
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency: 'eur',
-              unit_amount: quote.totalCents,
-              product_data: {
-                name: `${companyRow.name} · ${KIND_LABEL[body.kind] ?? body.kind}`,
-                description: `Auftrag ${orderNumberFor(orderRow.id)}`,
-              },
-              tax_behavior: 'inclusive',
-            },
-          },
-        ],
-        ...(discounts ? { discounts } : {}),
-        customer_email: body.customer.email,
-        client_reference_id: String(orderRow.id),
-        metadata: {
-          orderId: String(orderRow.id),
-          companySlug: request.company!.slug,
-          publicToken,
-          kind: body.kind,
-        },
-        success_url: `${storefrontOrigin}/buchung/erfolg?token=${publicToken}&session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${storefrontOrigin}/buchung/storno?token=${publicToken}`,
-        locale: 'de',
-        expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
-        billing_address_collection: 'auto',
-      });
-
-      await db
-        .update(orders)
-        .set({
-          stripeSessionId: session.id,
-          voucherCode: body.voucherCode ? body.voucherCode.toUpperCase() : null,
-          status: 'payment_pending',
-          updatedAt: now,
-        })
-        .where(eq(orders.id, orderRow.id));
-      await db.insert(orderStatusLog).values({
-        orderId: orderRow.id,
-        fromStatus: 'pending',
-        toStatus: 'payment_pending',
-        reason: 'Stripe Checkout Session created',
+      await db.transaction(async (tx) => {
+        await tx
+          .update(orders)
+          .set({
+            stripeSessionId: session.id,
+            voucherCode: body.voucherCode ? body.voucherCode.toUpperCase() : null,
+            status: 'payment_pending',
+            updatedAt: now,
+          })
+          .where(eq(orders.id, orderRow.id));
+        await tx.insert(orderStatusLog).values({
+          orderId: orderRow.id,
+          fromStatus: 'pending',
+          toStatus: 'payment_pending',
+          reason: 'Stripe Checkout Session created',
+        });
       });
 
       reply.code(201).send({
@@ -485,8 +551,10 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         stripePaymentIntentId: _p,
         ...safe
       } = row;
+      // Dispute details are internal — not for the public tracker.
+      const { dispute: _dispute, ...publicMeta } = safe.metadata ?? {};
       reply.send({
-        order: { ...safe, orderNumber: orderNumberFor(row.id) },
+        order: { ...safe, metadata: publicMeta, orderNumber: orderNumberOf(row) },
         items,
         statusLog: log,
       });
@@ -581,6 +649,42 @@ async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Pro
       await markOrderCancelled(app, companySlug, Number(orderIdStr), 'SEPA payment failed');
       return;
     }
+    case 'checkout.session.expired': {
+      const session = event.data.object;
+      const companySlug = session.metadata?.companySlug;
+      const orderIdStr = session.metadata?.orderId;
+      if (!companySlug || !orderIdStr) return;
+      // An expired after-service payment link must not cancel a running order.
+      if (session.metadata?.afterService === '1') {
+        app.log.info(
+          { orderId: orderIdStr, companySlug },
+          'After-service payment link expired — order untouched',
+        );
+        return;
+      }
+      await markOrderCancelled(
+        app,
+        companySlug,
+        Number(orderIdStr),
+        'Stripe Checkout Session abgelaufen (Zahlung nicht abgeschlossen)',
+      );
+      return;
+    }
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted': {
+      await syncSubscriptionFromStripe(app, event.data.object);
+      return;
+    }
+    case 'charge.dispute.created': {
+      const dispute = event.data.object;
+      const pi =
+        typeof dispute.payment_intent === 'string'
+          ? dispute.payment_intent
+          : (dispute.payment_intent?.id ?? null);
+      if (!pi) return;
+      await markOrderDisputedByPaymentIntent(app, pi, dispute);
+      return;
+    }
     case 'charge.refunded': {
       const charge = event.data.object;
       const pi = typeof charge.payment_intent === 'string' ? charge.payment_intent : null;
@@ -659,6 +763,110 @@ async function markPayoutFailedByTransfer(app: FastifyInstance, transferId: stri
   }
 }
 
+/** Mirror Stripe subscription status locally — never show 'active' for a dead sub. */
+async function syncSubscriptionFromStripe(
+  app: FastifyInstance,
+  sub: Stripe.Subscription,
+): Promise<void> {
+  const statusMap: Record<string, string> = {
+    active: 'active',
+    trialing: 'active',
+    paused: 'paused',
+    past_due: 'past_due',
+    unpaid: 'past_due',
+    incomplete: 'past_due',
+    incomplete_expired: 'cancelled',
+    canceled: 'cancelled',
+  };
+  const localStatus = statusMap[sub.status] ?? sub.status;
+  const now = new Date();
+  const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  for (const c of await loadAllActiveCompanies()) {
+    const tables = getTenantTables(c.schemaName);
+    const [row] = await db
+      .select()
+      .from(tables.subscriptions)
+      .where(eq(tables.subscriptions.stripeSubscriptionId, sub.id))
+      .limit(1);
+    if (!row) continue;
+    if (row.status === localStatus) return;
+    await db
+      .update(tables.subscriptions)
+      .set({
+        status: localStatus,
+        ...(localStatus === 'cancelled' && !row.cancelledAt ? { cancelledAt: now } : {}),
+        ...(localStatus === 'paused' && !row.pausedAt ? { pausedAt: now } : {}),
+        ...(localStatus === 'active' ? { pausedAt: null } : {}),
+        updatedAt: now,
+      })
+      .where(eq(tables.subscriptions.id, row.id));
+    app.log.info(
+      { subscriptionId: row.id, companySlug: c.slug, stripeStatus: sub.status, localStatus },
+      'Subscription synced from Stripe webhook',
+    );
+    return;
+  }
+  app.log.warn({ stripeSubscriptionId: sub.id }, 'Subscription webhook for unknown subscription');
+}
+
+/** Flag the affected order when a chargeback/dispute is opened. */
+async function markOrderDisputedByPaymentIntent(
+  app: FastifyInstance,
+  paymentIntentId: string,
+  dispute: Stripe.Dispute,
+): Promise<void> {
+  const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  for (const c of await loadAllActiveCompanies()) {
+    const tables = getTenantTables(c.schemaName);
+    const [order] = await db
+      .select()
+      .from(tables.orders)
+      .where(eq(tables.orders.stripePaymentIntentId, paymentIntentId))
+      .limit(1);
+    if (!order) continue;
+    const now = new Date();
+    const meta = order.metadata ?? {};
+    await db.transaction(async (tx) => {
+      await tx
+        .update(tables.orders)
+        .set({
+          metadata: {
+            ...meta,
+            dispute: { id: dispute.id, reason: dispute.reason, openedAt: now.toISOString() },
+          },
+          updatedAt: now,
+        })
+        .where(eq(tables.orders.id, order.id));
+      await tx.insert(tables.orderStatusLog).values({
+        orderId: order.id,
+        fromStatus: order.status,
+        toStatus: order.status,
+        reason: `Stripe-Zahlungsstreit (Chargeback) eröffnet · ${dispute.reason}`,
+      });
+    });
+    app.log.error(
+      { orderId: order.id, companySlug: c.slug, disputeId: dispute.id, reason: dispute.reason },
+      'Chargeback opened for order',
+    );
+    try {
+      const { sendPushToBrandAdmins } = await import('../../lib/push.js');
+      await sendPushToBrandAdmins(c.slug, {
+        title: `${c.name} · Chargeback eröffnet`,
+        body: `${orderNumberOf(order)} · ${order.customerName} · ${formatEurFromCents(dispute.amount ?? order.totalCents)}`,
+        url: `/auftraege?id=${order.id}`,
+        tag: `dispute:${order.id}`,
+        brandSlug: c.slug,
+      });
+    } catch (err) {
+      app.log.warn({ err, orderId: order.id }, 'push dispatch failed for dispute');
+    }
+    return;
+  }
+  app.log.warn({ paymentIntentId }, 'Dispute webhook for unknown payment intent');
+}
+
 async function markOrderPaid(
   app: FastifyInstance,
   companySlug: string,
@@ -694,6 +902,25 @@ async function markOrderPaid(
   const paymentIntentId =
     typeof session.payment_intent === 'string' ? session.payment_intent : null;
   const now = new Date();
+
+  if (order.status === 'cancelled' || order.status === 'refunded') {
+    // Payment landed after cancellation — record loudly, never silent-drop money.
+    app.log.error(
+      { orderId, companySlug, status: order.status },
+      'Payment received on a cancelled order — refund required',
+    );
+    await db
+      .update(tables.orders)
+      .set({ stripePaymentIntentId: paymentIntentId, updatedAt: now })
+      .where(eq(tables.orders.id, orderId));
+    await db.insert(tables.orderStatusLog).values({
+      orderId,
+      fromStatus: order.status,
+      toStatus: order.status,
+      reason: '⚠ Zahlung auf stornierten Auftrag eingegangen — Rückerstattung erforderlich',
+    });
+    return;
+  }
 
   const amountTotal = typeof session.amount_total === 'number' ? session.amount_total : null;
   const discountCents = session.total_details?.amount_discount ?? 0;
@@ -738,45 +965,7 @@ async function markOrderPaid(
   if (!claimed) return;
   order.totalCents = paidTotal;
 
-  try {
-    const { customers } = tables;
-    const [cust] = await db
-      .insert(customers)
-      .values({
-        email: order.customerEmail,
-        name: order.customerName,
-        phone: order.customerPhone,
-        totalOrders: 1,
-        totalSpentCents: paidTotal,
-        loyaltyTier: computeLoyaltyTier(1, paidTotal),
-        firstOrderAt: now,
-        lastOrderAt: now,
-        marketingOptIn: order.consentMarketing,
-      })
-      .onConflictDoUpdate({
-        target: customers.email,
-        set: {
-          totalOrders: sql`${customers.totalOrders} + 1`,
-          totalSpentCents: sql`${customers.totalSpentCents} + ${paidTotal}`,
-          name: sql`coalesce(${customers.name}, ${order.customerName})`,
-          phone: sql`coalesce(${customers.phone}, ${order.customerPhone})`,
-          lastOrderAt: now,
-          updatedAt: now,
-        },
-      })
-      .returning();
-    if (cust) {
-      const tier = computeLoyaltyTier(cust.totalOrders, cust.totalSpentCents);
-      if (tier !== cust.loyaltyTier) {
-        await db
-          .update(customers)
-          .set({ loyaltyTier: tier, updatedAt: now })
-          .where(eq(customers.id, cust.id));
-      }
-    }
-  } catch (err) {
-    app.log.warn({ err, orderId }, 'customer aggregate update failed');
-  }
+  await aggregateCustomerOnPaid(app, tables, order, paidTotal, now);
 
   try {
     const items = await db
@@ -785,7 +974,7 @@ async function markOrderPaid(
       .where(eq(tables.orderItems.orderId, orderId));
 
     const brand = brandInfoFromCompany(companyRow);
-    const orderNumber = orderNumberFor(orderId);
+    const orderNumber = orderNumberOf(order);
     const trackerUrl = `${(companyRow.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '')}/bestellung?token=${encodeURIComponent(order.publicToken)}`;
     const fulfillmentNote =
       order.pickupMode === 'drop_off'
@@ -794,7 +983,7 @@ async function markOrderPaid(
           ? 'Wir melden uns innerhalb eines Werktages, um den Vor-Ort-Termin zu bestätigen.'
           : 'Unser Fahrer holt Ihren Teppich ab. Wir melden uns mit dem genauen Termin.';
 
-    await sendEmail({
+    const confirmRes = await sendEmail({
       to: order.customerEmail,
       from: brandSender(companyRow),
       apiKey: companyRow.resendApiKey ?? undefined,
@@ -816,10 +1005,23 @@ async function markOrderPaid(
         fulfillmentNote,
       }),
     });
+    if (!confirmRes.ok) {
+      // Surface in the order's status log, not just a log line.
+      app.log.error(
+        { orderId, error: confirmRes.error },
+        'Order confirmation email failed to send',
+      );
+      await db.insert(tables.orderStatusLog).values({
+        orderId,
+        fromStatus: 'paid',
+        toStatus: 'paid',
+        reason: '⚠ Bestätigungs-E-Mail an Kunden fehlgeschlagen — bitte manuell senden',
+      });
+    }
 
     if (companyRow.email) {
       const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/auftraege?id=${orderId}`;
-      await sendEmail({
+      const adminRes = await sendEmail({
         to: companyRow.email,
         from: brandSender(companyRow),
         apiKey: companyRow.resendApiKey ?? undefined,
@@ -837,6 +1039,9 @@ async function markOrderPaid(
           adminUrl,
         }),
       });
+      if (!adminRes.ok) {
+        app.log.error({ orderId, error: adminRes.error }, 'New-order admin email failed to send');
+      }
     }
   } catch (err) {
     app.log.error({ err, orderId }, 'Failed to send order confirmation emails');
@@ -846,7 +1051,7 @@ async function markOrderPaid(
     const { sendPushToBrandAdmins } = await import('../../lib/push.js');
     await sendPushToBrandAdmins(companySlug, {
       title: `${companyRow.name} · Neuer Auftrag`,
-      body: `${orderNumberFor(orderId)} · ${order.customerName} · ${formatEurFromCents(order.totalCents)}`,
+      body: `${orderNumberOf(order)} · ${order.customerName} · ${formatEurFromCents(order.totalCents)}`,
       url: `/auftraege?id=${orderId}`,
       tag: `order:${orderId}`,
       brandSlug: companySlug,
@@ -874,10 +1079,12 @@ async function aggregateCustomerOnPaid(
 ): Promise<void> {
   try {
     const { customers } = tables;
+    // Normalize so "Max@Web.de" and "max@web.de" aggregate into one customer.
+    const email = order.customerEmail.trim().toLowerCase();
     const [cust] = await db
       .insert(customers)
       .values({
-        email: order.customerEmail,
+        email,
         name: order.customerName,
         phone: order.customerPhone,
         totalOrders: 1,
@@ -941,6 +1148,35 @@ async function markAfterServicePaid(
     return;
   }
   if (order.paidAt) return; // already settled — idempotent
+  if (order.status === 'cancelled' || order.status === 'refunded') {
+    // Payment on a cancelled order — record loudly, skip loyalty aggregation.
+    app.log.error(
+      { orderId, companySlug, status: order.status },
+      'Payment received on a cancelled order — refund required',
+    );
+    const now = new Date();
+    const claimedRows = await db
+      .update(tables.orders)
+      .set({
+        paidAt: now,
+        paymentMethod: 'credit_card',
+        stripePaymentIntentId:
+          typeof session.payment_intent === 'string' ? session.payment_intent : null,
+        updatedAt: now,
+      })
+      .where(and(eq(tables.orders.id, orderId), isNull(tables.orders.paidAt)))
+      .returning({ id: tables.orders.id });
+    // Log only on a successful claim so webhook retries don't duplicate it.
+    if (claimedRows.length > 0) {
+      await db.insert(tables.orderStatusLog).values({
+        orderId,
+        fromStatus: order.status,
+        toStatus: order.status,
+        reason: '⚠ Zahlung auf stornierten Auftrag eingegangen — Rückerstattung erforderlich',
+      });
+    }
+    return;
+  }
 
   const paymentIntentId =
     typeof session.payment_intent === 'string' ? session.payment_intent : null;
@@ -1038,11 +1274,22 @@ async function markOrderRefundedByPaymentIntent(
       .where(eq(tables.orders.stripePaymentIntentId, paymentIntentId))
       .limit(1);
     if (!order) continue;
-    if (order.status === 'refunded') return;
     const now = new Date();
     const fromStatus = order.status as OrderStatus;
     const refundedTotal = refundAmountCents ?? order.totalCents;
     if (refundedTotal <= order.refundedAmountCents) return;
+    if (order.status === 'refunded' || order.status === 'cancelled') {
+      // Status already terminal — just record the refunded amount.
+      await db
+        .update(tables.orders)
+        .set({
+          refundedAmountCents: refundedTotal,
+          ...(order.refundedAt ? {} : { refundedAt: now }),
+          updatedAt: now,
+        })
+        .where(eq(tables.orders.id, order.id));
+      return;
+    }
     const isFull = refundedTotal >= order.totalCents;
     const toStatus: OrderStatus = isFull ? 'refunded' : 'partially_refunded';
     await db.transaction(async (tx) => {
@@ -1067,7 +1314,7 @@ async function markOrderRefundedByPaymentIntent(
       companySlug: c.slug,
       order: {
         id: order.id,
-        orderNumber: orderNumberFor(order.id),
+        orderNumber: orderNumberOf(order),
         customerName: order.customerName,
         customerEmail: order.customerEmail,
         publicToken: order.publicToken,
@@ -1120,6 +1367,33 @@ const updateInternalNotesSchema = z.object({
   internalNotes: z.string().trim().max(4000).nullable(),
 });
 
+const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
+
+/** Viewers don't see IP/UA, internal notes, or Stripe IDs (same rule as contact/inquiries). */
+function redactOrderPii<
+  T extends {
+    ipAddress?: unknown;
+    userAgent?: unknown;
+    internalNotes?: unknown;
+    stripeSessionId?: unknown;
+    stripePaymentIntentId?: unknown;
+  },
+>(row: T, accessLevel: string | undefined): T {
+  if (accessLevel && PRIVILEGED_LEVELS.has(accessLevel)) return row;
+  return {
+    ...row,
+    ipAddress: null,
+    userAgent: null,
+    internalNotes: null,
+    stripeSessionId: null,
+    stripePaymentIntentId: null,
+  };
+}
+
+function accessLevelOf(request: { authUser: unknown }): string | undefined {
+  return (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+}
+
 export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
 
@@ -1155,8 +1429,9 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
+    const accessLevel = accessLevelOf(request);
     return {
-      orders: page.map((r) => ({ ...r, orderNumber: orderNumberFor(r.id) })),
+      orders: page.map((r) => redactOrderPii({ ...r, orderNumber: orderNumberOf(r) }, accessLevel)),
       nextCursor,
     };
   });
@@ -1176,7 +1451,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(orderStatusLog.orderId, id))
       .orderBy(desc(orderStatusLog.createdAt));
     return {
-      order: { ...row, orderNumber: orderNumberFor(row.id) },
+      order: redactOrderPii({ ...row, orderNumber: orderNumberOf(row) }, accessLevelOf(request)),
       items,
       statusLog: log,
       allowedNextStatuses: allowedNextStatuses(row.status as OrderStatus),
@@ -1213,7 +1488,11 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
       try {
-        await getStripe().refunds.create({ payment_intent: row.stripePaymentIntentId });
+        // Idempotency key dedupes double-submits at Stripe.
+        await getStripe().refunds.create(
+          { payment_intent: row.stripePaymentIntentId },
+          { idempotencyKey: `refund_full_${request.company!.slug}_${id}` },
+        );
       } catch (err) {
         request.log.error({ err, orderId: id }, 'Stripe refund failed');
         reply.code(502).send({ error: 'Stripe refund failed' });
@@ -1228,10 +1507,16 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       handledByUserId: adminId,
     };
     if (timestampCol) patch[timestampCol] = now;
+    if (toStatus === 'refunded') patch.refundedAmountCents = row.totalCents;
 
+    // CAS on the validated status — concurrent transitions can't bypass the FSM.
     const updated = await db.transaction(async (tx) => {
-      const [u] = await tx.update(orders).set(patch).where(eq(orders.id, id)).returning();
-      if (!u) throw new Error('Order row vanished mid-transition');
+      const [u] = await tx
+        .update(orders)
+        .set(patch)
+        .where(and(eq(orders.id, id), eq(orders.status, row.status)))
+        .returning();
+      if (!u) return null;
       await tx.insert(orderStatusLog).values({
         orderId: id,
         fromStatus: row.status,
@@ -1241,16 +1526,29 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       });
       return u;
     });
+    if (!updated) {
+      if (toStatus === 'refunded') {
+        // Refund already issued; the charge.refunded webhook reconciles the row.
+        request.log.error(
+          { orderId: id },
+          'Refund issued but status CAS lost a concurrent transition — webhook will reconcile',
+        );
+      }
+      reply.code(409).send({
+        error: 'Auftrag wurde zwischenzeitlich geändert — bitte neu laden.',
+      });
+      return;
+    }
 
     void notifyCustomerStatusChange({
       log: request.log,
       companySlug: request.company!.slug,
-      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
       fromStatus: row.status as OrderStatus,
       toStatus,
     }).catch(() => null);
 
-    return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+    return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
 
   // --- Pay-after-service collection ----------------------------------------
@@ -1283,13 +1581,14 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const methodLabel = method === 'cash' ? 'Barzahlung' : 'EC-Kartenzahlung';
+    // Claim on paidAt IS NULL — double-submits can't aggregate loyalty twice.
     const updated = await db.transaction(async (tx) => {
       const [u] = await tx
         .update(orders)
         .set({ paidAt: now, paymentMethod: method, handledByUserId: adminId, updatedAt: now })
-        .where(eq(orders.id, id))
+        .where(and(eq(orders.id, id), isNull(orders.paidAt)))
         .returning();
-      if (!u) throw new Error('Order row vanished while recording payment');
+      if (!u) return null;
       await tx.insert(orderStatusLog).values({
         orderId: id,
         fromStatus: row.status,
@@ -1299,10 +1598,14 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       });
       return u;
     });
+    if (!updated) {
+      reply.code(409).send({ error: 'Auftrag ist bereits als bezahlt markiert.' });
+      return;
+    }
 
     await aggregateCustomerOnPaid(app, request.company!.tables, row, updated.totalCents, now);
 
-    return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+    return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
 
   /**
@@ -1343,7 +1646,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     const appBase = env.APP_BASE_URL.replace(/\/$/, '');
     const storefrontOrigin = (companyRow.storefrontOrigin ?? appBase).replace(/\/$/, '');
-    const orderNumber = orderNumberFor(row.id);
+    const orderNumber = orderNumberOf(row);
 
     const session = await getStripe().checkout.sessions.create({
       mode: 'payment',
@@ -1363,6 +1666,9 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
           },
         },
       ],
+      ...(statementSuffix(companyRow.name)
+        ? { payment_intent_data: { statement_descriptor_suffix: statementSuffix(companyRow.name) } }
+        : {}),
       customer_email: row.customerEmail,
       client_reference_id: String(row.id),
       metadata: {
@@ -1423,8 +1729,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     const decision = evaluateCancellation({
       status: row.status as OrderStatus,
       totalCents: row.totalCents ?? 0,
+      refundedAmountCents: row.refundedAmountCents ?? 0,
       paidAt: row.paidAt ?? null,
       preferredDate: row.preferredDate ? new Date(row.preferredDate) : null,
+      confirmedSlot:
+        typeof (row.metadata ?? {}).confirmedSlot === 'string'
+          ? ((row.metadata as { confirmedSlot: string }).confirmedSlot ?? null)
+          : null,
       now: new Date(),
     });
     reply.send({ decision });
@@ -1453,8 +1764,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     const decision: CancellationDecision = evaluateCancellation({
       status: row.status as OrderStatus,
       totalCents: row.totalCents ?? 0,
+      refundedAmountCents: row.refundedAmountCents ?? 0,
       paidAt: row.paidAt ?? null,
       preferredDate: row.preferredDate ? new Date(row.preferredDate) : null,
+      confirmedSlot:
+        typeof (row.metadata ?? {}).confirmedSlot === 'string'
+          ? ((row.metadata as { confirmedSlot: string }).confirmedSlot ?? null)
+          : null,
       now,
     });
 
@@ -1462,9 +1778,17 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       reply.code(409).send({ error: decision.message, decision });
       return;
     }
+    if (!canTransition(row.status as OrderStatus, 'cancelled')) {
+      reply.code(409).send({
+        error: `Cannot transition from ${row.status} to cancelled`,
+        allowedNextStatuses: allowedNextStatuses(row.status as OrderStatus),
+      });
+      return;
+    }
 
+    // Cap at what has not been refunded yet — never at the raw total.
     const refundCents = Math.min(
-      row.totalCents ?? 0,
+      decision.maxRefundCents,
       Math.max(0, body.refundCentsOverride ?? decision.suggestedRefundCents),
     );
 
@@ -1481,10 +1805,15 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
       try {
-        await getStripe().refunds.create({
-          payment_intent: row.stripePaymentIntentId,
-          amount: refundCents,
-        });
+        // One key per order: same-amount retries dedupe at Stripe, different
+        // amounts are rejected — either way, never a second refund.
+        await getStripe().refunds.create(
+          {
+            payment_intent: row.stripePaymentIntentId,
+            amount: refundCents,
+          },
+          { idempotencyKey: `cancel_${request.company!.slug}_${id}` },
+        );
       } catch (err) {
         request.log.error({ err, orderId: id, refundCents }, 'Stripe refund failed');
         reply.code(502).send({ error: 'Stripe refund failed' });
@@ -1492,6 +1821,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
+    // CAS on the evaluated status — concurrent updates become a 409.
     const updated = await db.transaction(async (tx) => {
       const [u] = await tx
         .update(orders)
@@ -1500,10 +1830,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
           cancelledAt: now,
           updatedAt: now,
           handledByUserId: adminId,
+          ...(refundCents > 0
+            ? { refundedAmountCents: (row.refundedAmountCents ?? 0) + refundCents }
+            : {}),
         })
-        .where(eq(orders.id, id))
+        .where(and(eq(orders.id, id), eq(orders.status, row.status)))
         .returning();
-      if (!u) throw new Error('Order row vanished mid-cancel');
+      if (!u) return null;
       await tx.insert(orderStatusLog).values({
         orderId: id,
         fromStatus: row.status,
@@ -1519,11 +1852,33 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       });
       return u;
     });
+    if (!updated) {
+      if (refundCents > 0) {
+        request.log.error(
+          { orderId: id, refundCents },
+          'Refund issued but cancel CAS lost a concurrent update — webhook will reconcile',
+        );
+      }
+      reply.code(409).send({
+        error: 'Auftrag wurde zwischenzeitlich geändert — bitte neu laden.',
+      });
+      return;
+    }
+
+    // Expire the open session so the customer can't pay after cancellation.
+    if (row.status === 'payment_pending' && row.stripeSessionId && stripeConfigured) {
+      try {
+        await getStripe().checkout.sessions.expire(row.stripeSessionId);
+      } catch (err) {
+        // Already expired/completed — markOrderPaid guards late payments.
+        request.log.warn({ err, orderId: id }, 'Could not expire Stripe session on cancel');
+      }
+    }
 
     void notifyCustomerStatusChange({
       log: request.log,
       companySlug: request.company!.slug,
-      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
       fromStatus: row.status as OrderStatus,
       toStatus: 'cancelled',
       refundCents,
@@ -1536,7 +1891,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         event: 'order.cancelled',
         companySlug: request.company!.slug,
         orderId: updated.id,
-        orderNumber: orderNumberFor(updated.id),
+        orderNumber: orderNumberOf(updated),
         publicToken: updated.publicToken,
         fromStatus: row.status,
         toStatus: 'cancelled',
@@ -1552,7 +1907,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     );
 
     return {
-      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
       decision,
       refundCents,
     };
@@ -1571,7 +1926,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       reply.code(404).send({ error: 'Order not found' });
       return;
     }
-    return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+    return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
   app.post('/:id/confirm-appointment', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
@@ -1618,7 +1973,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
           email: appointmentConfirmedEmail({
             brand: brandInfoFromCompany(companyRow),
             customerName: row.customerName,
-            orderNumber: orderNumberFor(row.id),
+            orderNumber: orderNumberOf(row),
             trackerUrl,
             appointmentFormatted: formatSlotDe(slot),
           }),
@@ -1628,7 +1983,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       request.log.error({ err, orderId: id }, 'appointment confirmation email failed');
     }
 
-    return { order: { ...updated, orderNumber: orderNumberFor(updated.id) } };
+    return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
   app.post('/:id/sync-stripe', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
@@ -1678,7 +2033,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     ];
     if (terminalStatuses.includes(row.status as OrderStatus)) {
       reply.send({
-        order: { ...row, orderNumber: orderNumberFor(row.id) },
+        order: { ...row, orderNumber: orderNumberOf(row) },
         stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
         action: 'noop',
       });
@@ -1689,7 +2044,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       await markOrderPaid(app, companySlug, id, session);
       const [updated] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
       reply.send({
-        order: updated ? { ...updated, orderNumber: orderNumberFor(updated.id) } : null,
+        order: updated ? { ...updated, orderNumber: orderNumberOf(updated) } : null,
         stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
         action: 'marked_paid',
       });
@@ -1700,7 +2055,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       await markOrderCancelled(app, companySlug, id, 'Stripe session expired');
       const [updated] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
       reply.send({
-        order: updated ? { ...updated, orderNumber: orderNumberFor(updated.id) } : null,
+        order: updated ? { ...updated, orderNumber: orderNumberOf(updated) } : null,
         stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
         action: 'marked_cancelled',
       });
@@ -1708,7 +2063,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     reply.send({
-      order: { ...row, orderNumber: orderNumberFor(row.id) },
+      order: { ...row, orderNumber: orderNumberOf(row) },
       stripe: { sessionStatus: session.status, paymentStatus: session.payment_status },
       action: 'still_pending',
     });
@@ -1746,9 +2101,22 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(orders.id, id))
       .returning();
 
+    try {
+      const { sendPushToUser } = await import('../../lib/push.js');
+      await sendPushToUser(partner.userId, {
+        title: `${request.company!.name} · Neuer Auftrag zugewiesen`,
+        body: `${orderNumberOf(updated!)} · ${KIND_LABEL[order.kind] ?? order.kind} · Auszahlung ${formatEurFromCents(split.partnerPayoutCents)}`,
+        url: `/partner/auftraege?id=${id}`,
+        tag: `assign:${id}`,
+        brandSlug: request.company!.slug,
+      });
+    } catch (err) {
+      request.log.warn({ err, orderId: id }, 'assignment push dispatch failed');
+    }
+
     const payoutReady = partner.payoutsEnabled && partner.stripeConnectStatus === 'active';
     return {
-      order: { ...updated, orderNumber: orderNumberFor(updated!.id) },
+      order: { ...updated, orderNumber: orderNumberOf(updated!) },
       commission: split,
       payoutReady,
       warning: payoutReady
@@ -1777,7 +2145,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       })
       .where(eq(orders.id, id))
       .returning();
-    return { order: { ...updated, orderNumber: orderNumberFor(updated!.id) } };
+    return { order: { ...updated, orderNumber: orderNumberOf(updated!) } };
   });
 
   app.post(
@@ -1868,7 +2236,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         .where(eq(orders.id, id))
         .returning();
       return {
-        order: { ...updated, orderNumber: orderNumberFor(updated!.id) },
+        order: { ...updated, orderNumber: orderNumberOf(updated!) },
         transferId,
         payoutCents: order.partnerPayoutCents,
       };
@@ -1943,7 +2311,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     });
 
     return {
-      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
       topUpCents: addCents,
     };
   });
@@ -2030,7 +2398,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     const isPaid = order.paidAt != null;
     return {
-      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
       deltaCents,
       refundDueCents: isPaid && deltaCents < 0 ? -deltaCents : 0,
     };
@@ -2087,12 +2455,18 @@ export const ordersAdminCrossRoutes: FastifyPluginAsync = async (app) => {
         .where(where)
         .orderBy(desc(tables.orders.createdAt), desc(tables.orders.id))
         .limit(limit);
-      return rows.map((r) => ({
-        ...r,
-        orderNumber: orderNumberFor(r.id),
-        companySlug: c.slug,
-        companyName: c.name,
-      }));
+      const accessLevel = accessLevelOf(request);
+      return rows.map((r) =>
+        redactOrderPii(
+          {
+            ...r,
+            orderNumber: orderNumberOf(r),
+            companySlug: c.slug,
+            companyName: c.name,
+          },
+          accessLevel,
+        ),
+      );
     }
 
     const perCompany = await Promise.all(companies.map(fetchOrdersForCompany));
@@ -2137,7 +2511,17 @@ export const ordersPartnerRoutes: FastifyPluginAsync = async (app) => {
       stripeTransferId: _t,
       ...safe
     } = row;
-    return { ...safe, orderNumber: orderNumberFor(Number(row.id)) };
+    // Dispute details are internal — strip them from the partner view too.
+    const { dispute: _dispute, ...partnerMeta } = (safe.metadata ?? {}) as Record<string, unknown>;
+    return {
+      ...safe,
+      metadata: partnerMeta,
+      orderNumber: orderNumberOf({
+        id: Number(row.id),
+        orderNumber: row.orderNumber as string | null | undefined,
+        createdAt: row.createdAt as Date | null | undefined,
+      }),
+    };
   }
 
   app.get('/', async (request, reply) => {
@@ -2232,9 +2616,14 @@ export const ordersPartnerRoutes: FastifyPluginAsync = async (app) => {
     const patch: Record<string, unknown> = { status: toStatus, updatedAt: now };
     if (timestampCol) patch[timestampCol] = now;
 
+    // CAS: a concurrent admin cancel/refund wins, this becomes 409.
     const updated = await db.transaction(async (tx) => {
-      const [u] = await tx.update(orders).set(patch).where(eq(orders.id, id)).returning();
-      if (!u) throw new Error('Order row vanished mid-transition');
+      const [u] = await tx
+        .update(orders)
+        .set(patch)
+        .where(and(eq(orders.id, id), eq(orders.status, row.status)))
+        .returning();
+      if (!u) return null;
       await tx.insert(orderStatusLog).values({
         orderId: id,
         fromStatus: row.status,
@@ -2244,11 +2633,17 @@ export const ordersPartnerRoutes: FastifyPluginAsync = async (app) => {
       });
       return u;
     });
+    if (!updated) {
+      reply.code(409).send({
+        error: 'Auftrag wurde zwischenzeitlich geändert — bitte neu laden.',
+      });
+      return;
+    }
 
     void notifyCustomerStatusChange({
       log: request.log,
       companySlug: request.company!.slug,
-      order: { ...updated, orderNumber: orderNumberFor(updated.id) },
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
       fromStatus: row.status as OrderStatus,
       toStatus,
     }).catch(() => null);

@@ -95,7 +95,11 @@ const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).max(500).optional(),
   status: z.enum(['new', 'published', 'flagged', 'hidden']).optional(),
-  flagged: z.coerce.boolean().optional(),
+  // Not z.coerce.boolean() — "false" would coerce to true.
+  flagged: z
+    .enum(['true', 'false'])
+    .transform((v) => v === 'true')
+    .optional(),
 });
 
 export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
@@ -134,8 +138,11 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
     return { reviews: page, nextCursor };
   });
 
+  // Mutations need at least manager level — viewers stay read-only.
+  const canModerate = { preHandler: app.requireAccess('super_admin', 'admin', 'manager') };
+
   const respondSchema = z.object({ response: z.string().trim().min(1).max(4000) });
-  app.post('/:id/respond', async (request) => {
+  app.post('/:id/respond', canModerate, async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { response } = respondSchema.parse(request.body);
     const { reviews } = request.company!.tables;
@@ -155,7 +162,7 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   const flagSchema = z.object({ reason: z.string().trim().min(1).max(1000) });
-  app.post('/:id/flag', async (request) => {
+  app.post('/:id/flag', canModerate, async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { reason } = flagSchema.parse(request.body);
     const { reviews } = request.company!.tables;
@@ -170,7 +177,7 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   const statusSchema = z.object({ status: z.enum(['new', 'published', 'flagged', 'hidden']) });
-  app.patch('/:id', async (request) => {
+  app.patch('/:id', canModerate, async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { status } = statusSchema.parse(request.body);
     const { reviews } = request.company!.tables;
@@ -184,7 +191,7 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
     return { review: row };
   });
 
-  app.delete('/:id', async (request, reply) => {
+  app.delete('/:id', canModerate, async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { reviews } = request.company!.tables;
     const [row] = await db.delete(reviews).where(eq(reviews.id, id)).returning();

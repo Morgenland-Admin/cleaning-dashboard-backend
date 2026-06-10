@@ -63,47 +63,53 @@ export const qrAdminRoutes: FastifyPluginAsync = async (app) => {
 };
 
 export const qrPublicRoutes: FastifyPluginAsync = async (app) => {
-  app.get('/:token', async (request, reply) => {
-    const token = (request.params as { token: string }).token;
-    if (!token || token.length < 16 || token.length > 128) {
-      reply.code(404).send({ error: 'Not found' });
-      return;
-    }
-
-    const companies = await db.select().from(company);
-    for (const c of companies) {
-      const { getTenantTables } = await import('../../db/schema/tenant.js');
-      const tables = getTenantTables(c.schemaName);
-      const [row] = await db
-        .select({
-          id: tables.orders.id,
-          status: tables.orders.status,
-          customerName: tables.orders.customerName,
-          kind: tables.orders.kind,
-          totalCents: tables.orders.totalCents,
-          createdAt: tables.orders.createdAt,
-        })
-        .from(tables.orders)
-        .where(eq(tables.orders.publicToken, token))
-        .limit(1);
-      if (row) {
-        const lastNameOnly = row.customerName?.split(/\s+/).slice(-1)[0] ?? '—';
-        reply.send({
-          brand: { slug: c.slug, name: c.name },
-          order: {
-            id: row.id,
-            status: row.status,
-            customerLastName: lastNameOnly,
-            kind: row.kind,
-            totalCents: row.totalCents,
-            createdAt: row.createdAt,
-          },
-        });
+  app.get(
+    '/:token',
+    // One lookup fans out to every tenant schema — rate-limit the amplification.
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const token = (request.params as { token: string }).token;
+      if (!token || token.length < 16 || token.length > 128) {
+        reply.code(404).send({ error: 'Not found' });
         return;
       }
-    }
-    reply.code(404).send({ error: 'Order not found' });
-  });
+
+      const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
+      const companies = await loadAllActiveCompanies();
+      for (const c of companies) {
+        const { getTenantTables } = await import('../../db/schema/tenant.js');
+        const tables = getTenantTables(c.schemaName);
+        const [row] = await db
+          .select({
+            id: tables.orders.id,
+            status: tables.orders.status,
+            customerName: tables.orders.customerName,
+            kind: tables.orders.kind,
+            totalCents: tables.orders.totalCents,
+            createdAt: tables.orders.createdAt,
+          })
+          .from(tables.orders)
+          .where(eq(tables.orders.publicToken, token))
+          .limit(1);
+        if (row) {
+          const lastNameOnly = row.customerName?.split(/\s+/).slice(-1)[0] ?? '—';
+          reply.send({
+            brand: { slug: c.slug, name: c.name },
+            order: {
+              id: row.id,
+              status: row.status,
+              customerLastName: lastNameOnly,
+              kind: row.kind,
+              totalCents: row.totalCents,
+              createdAt: row.createdAt,
+            },
+          });
+          return;
+        }
+      }
+      reply.code(404).send({ error: 'Order not found' });
+    },
+  );
 };
 
 export default qrAdminRoutes;

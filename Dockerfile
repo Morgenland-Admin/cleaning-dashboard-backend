@@ -19,6 +19,8 @@ RUN pnpm run build && pnpm prune --prod --config.minimum-release-age=0 --config.
 
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
+# Must match EXPOSE/HEALTHCHECK — the app defaults to 3000 otherwise.
+ENV PORT=8000
 WORKDIR /app
 RUN addgroup -S app && adduser -S app -G app
 COPY --from=build --chown=app:app /app/node_modules ./node_modules

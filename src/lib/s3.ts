@@ -1,4 +1,9 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+} from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { nanoid } from 'nanoid';
 import { env } from '../config/env.js';
@@ -95,6 +100,14 @@ export async function putExportObject(opts: {
     }),
   );
   return { key, sizeBytes: body.length };
+}
+
+/** Remove an expired export object (PII cleanup). Only export keys are accepted. */
+export async function deleteExportObject(key: string): Promise<void> {
+  if (!key.includes('/exports/')) {
+    throw new Error(`Refusing to delete non-export key "${key}"`);
+  }
+  await client.send(new DeleteObjectCommand({ Bucket: getBucket(), Key: key }));
 }
 
 export async function signObjectDownload(opts: {

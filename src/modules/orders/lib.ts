@@ -69,6 +69,7 @@ const FORWARD: Record<OrderStatus, OrderStatus[]> = {
     'ready',
     'delivered',
     'completed',
+    'cancelled',
     'refunded',
   ],
   refunded: [],

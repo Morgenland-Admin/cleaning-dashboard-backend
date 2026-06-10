@@ -101,7 +101,10 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { page: row };
   });
 
-  app.post('/', async (request, reply) => {
+  // Mutations need at least manager level — viewers stay read-only.
+  const canEdit = { preHandler: app.requireAccess('super_admin', 'admin', 'manager') };
+
+  app.post('/', canEdit, async (request, reply) => {
     const body = createSchema.parse(request.body);
     const { seoPages } = request.company!.tables;
     const [existing] = await db
@@ -134,7 +137,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   const bulkSchema = z.object({ pages: z.array(createSchema).min(1).max(2000) });
-  app.post('/bulk', { bodyLimit: 8 * 1024 * 1024 }, async (request, reply) => {
+  app.post('/bulk', { bodyLimit: 8 * 1024 * 1024, ...canEdit }, async (request, reply) => {
     const { pages } = bulkSchema.parse(request.body);
     const { seoPages } = request.company!.tables;
     const rows = pages.map((p) => ({
@@ -173,7 +176,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
    * or gsc_position <= 5). status / gscPosition / source may still change (so a human
    * can un-protect). Automated jobs get a 409 and should file a suggestion instead.
    */
-  app.patch('/:id', async (request, reply) => {
+  app.patch('/:id', canEdit, async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const body = updateSchema.parse(request.body);
     const { seoPages } = request.company!.tables;
@@ -229,7 +232,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { page: row };
   });
 
-  app.delete('/:id', async (request, reply) => {
+  app.delete('/:id', canEdit, async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { seoPages } = request.company!.tables;
     const [row] = await db.delete(seoPages).where(eq(seoPages.id, id)).returning();

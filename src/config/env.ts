@@ -40,6 +40,8 @@ const envSchema = z.object({
   STRIPE_WEBHOOK_SECRET: optionalString,
   STRIPE_PUBLISHABLE_KEY: optionalString,
   N8N_CANCEL_WEBHOOK_URL: optionalUrl,
+  /** HMAC secret for signing outgoing n8n webhooks (falls back to BETTER_AUTH_SECRET). */
+  N8N_WEBHOOK_SECRET: optionalString,
   VAPID_PUBLIC_KEY: optionalString,
   VAPID_PRIVATE_KEY: optionalString,
   VAPID_SUBJECT: z.string().default('mailto:admin@reinigungs-portal.com'),
@@ -50,6 +52,15 @@ const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
   console.error('Invalid environment variables:', parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+// Publishable keys end up in browsers — never allow an sk_ here.
+if (parsed.data.STRIPE_PUBLISHABLE_KEY?.startsWith('sk_')) {
+  console.error(
+    'STRIPE_PUBLISHABLE_KEY contains a SECRET key (sk_...). ' +
+      'Set the pk_... publishable key here and rotate the leaked secret key.',
+  );
   process.exit(1);
 }
 
