@@ -22,6 +22,7 @@ import { computeCommission, parseCommissionRate } from '../../lib/commission.js'
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
 import { captureException } from '../../lib/observability.js';
 import { fireN8nWebhook } from '../../lib/n8n.js';
+import { spawnTask } from '../../lib/tasks.js';
 import { formatEurFromCents, priceOrder } from '../../lib/pricing.js';
 import { getPriceBook } from '../../lib/price-books/index.js';
 import { getStripe, stripeConfigured } from '../../lib/stripe.js';
@@ -1904,6 +1905,25 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         cancelledAt: now.toISOString(),
       },
       request.log,
+    );
+
+    spawnTask({
+      companySlug: request.company!.slug,
+      kind: 'order_cancellation',
+      refKind: 'order',
+      refId: updated.id,
+      title: `Stornierung: ${orderNumberOf(updated)}`,
+      body: [
+        `Kunde: ${updated.customerName}`,
+        `Rückerstattung: ${formatEurFromCents(refundCents)}`,
+        body.reason ? `Grund: ${body.reason}` : null,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      priority: 'normal',
+      metadata: { refundCents, reasonCode: decision.reasonCode },
+    }).catch((err) =>
+      request.log.warn({ err, orderId: updated.id }, 'cancellation task spawn failed'),
     );
 
     return {

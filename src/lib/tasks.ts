@@ -11,6 +11,7 @@ export type TaskKind =
   | 'contact_review'
   | 'inquiry_review'
   | 'order_dispute'
+  | 'order_cancellation'
   | 'bad_review_followup'
   | 'partner_application'
   | 'ad_hoc';
