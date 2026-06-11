@@ -19,6 +19,7 @@ function buildTenantTables(schemaName: string) {
   const newsletterSubscribers = s.table('newsletter_subscribers', {
     id: serial('id').primaryKey(),
     email: text('email').notNull().unique(),
+    customerId: integer('customer_id'),
     firstName: text('first_name'),
     lastName: text('last_name'),
     locale: varchar('locale', { length: 16 }).notNull().default('de'),
@@ -40,6 +41,7 @@ function buildTenantTables(schemaName: string) {
     'contact_messages',
     {
       id: serial('id').primaryKey(),
+      customerId: integer('customer_id'),
       name: text('name').notNull(),
       email: text('email').notNull(),
       phone: varchar('phone', { length: 32 }),
@@ -94,6 +96,7 @@ function buildTenantTables(schemaName: string) {
     'service_inquiries',
     {
       id: serial('id').primaryKey(),
+      customerId: integer('customer_id'),
       name: text('name').notNull(),
       email: text('email').notNull(),
       phone: varchar('phone', { length: 32 }),
@@ -215,6 +218,7 @@ function buildTenantTables(schemaName: string) {
     {
       id: serial('id').primaryKey(),
       publicToken: text('public_token').notNull().unique(),
+      customerId: integer('customer_id'),
       /** Customer-facing "YYYY/000123", stamped at creation (year never drifts). */
       orderNumber: varchar('order_number', { length: 20 }),
       kind: varchar('kind', { length: 32 }).notNull(),
@@ -346,9 +350,16 @@ function buildTenantTables(schemaName: string) {
       email: text('email').notNull().unique(),
       name: text('name'),
       phone: varchar('phone', { length: 32 }),
+      addressLine1: text('address_line1'),
+      addressLine2: text('address_line2'),
+      postalCode: varchar('postal_code', { length: 16 }),
+      city: text('city'),
+      country: varchar('country', { length: 2 }).default('DE'),
       totalOrders: integer('total_orders').notNull().default(0),
       totalSpentCents: integer('total_spent_cents').notNull().default(0),
       loyaltyTier: varchar('loyalty_tier', { length: 16 }).notNull().default('neukunde'),
+      tags: jsonb('tags').$type<string[]>().notNull().default([]),
+      internalNotes: text('internal_notes'),
       firstOrderAt: timestamp('first_order_at', { withTimezone: true }),
       lastOrderAt: timestamp('last_order_at', { withTimezone: true }),
       marketingOptIn: boolean('marketing_opt_in').notNull().default(false),
@@ -616,6 +627,7 @@ CREATE SCHEMA IF NOT EXISTS ${q};
 CREATE TABLE IF NOT EXISTS ${q}."newsletter_subscribers" (
   "id" serial PRIMARY KEY NOT NULL,
   "email" text NOT NULL,
+  "customer_id" integer,
   "first_name" text,
   "last_name" text,
   "locale" varchar(16) DEFAULT 'de' NOT NULL,
@@ -636,6 +648,7 @@ CREATE TABLE IF NOT EXISTS ${q}."newsletter_subscribers" (
 
 CREATE TABLE IF NOT EXISTS ${q}."contact_messages" (
   "id" serial PRIMARY KEY NOT NULL,
+  "customer_id" integer,
   "name" text NOT NULL,
   "email" text NOT NULL,
   "phone" varchar(32),
@@ -673,6 +686,7 @@ CREATE INDEX IF NOT EXISTS "contact_replies_contact_message_id_idx" ON ${q}."con
 
 CREATE TABLE IF NOT EXISTS ${q}."service_inquiries" (
   "id" serial PRIMARY KEY NOT NULL,
+  "customer_id" integer,
   "name" text NOT NULL,
   "email" text NOT NULL,
   "phone" varchar(32),
@@ -771,6 +785,7 @@ CREATE INDEX IF NOT EXISTS "chat_messages_created_at_idx" ON ${q}."chat_messages
 CREATE TABLE IF NOT EXISTS ${q}."orders" (
   "id" serial PRIMARY KEY NOT NULL,
   "public_token" text NOT NULL,
+  "customer_id" integer,
   "order_number" varchar(20),
   "kind" varchar(32) NOT NULL,
   "status" varchar(24) DEFAULT 'pending' NOT NULL,
@@ -898,9 +913,16 @@ CREATE TABLE IF NOT EXISTS ${q}."customers" (
   "email" text NOT NULL,
   "name" text,
   "phone" varchar(32),
+  "address_line1" text,
+  "address_line2" text,
+  "postal_code" varchar(16),
+  "city" text,
+  "country" varchar(2) DEFAULT 'DE',
   "total_orders" integer DEFAULT 0 NOT NULL,
   "total_spent_cents" integer DEFAULT 0 NOT NULL,
   "loyalty_tier" varchar(16) DEFAULT 'neukunde' NOT NULL,
+  "tags" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "internal_notes" text,
   "first_order_at" timestamp with time zone,
   "last_order_at" timestamp with time zone,
   "marketing_opt_in" boolean DEFAULT false NOT NULL,
@@ -1063,5 +1085,68 @@ CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
 CREATE INDEX IF NOT EXISTS "seo_pages_status_type_idx" ON ${q}."seo_pages" ("status", "type");
 ALTER TABLE ${q}."seo_pages" ADD COLUMN IF NOT EXISTS "category" varchar(64);
 CREATE INDEX IF NOT EXISTS "seo_pages_category_idx" ON ${q}."seo_pages" ("category");
+
+-- ── Customer 360: richer profile + customer_id links across source tables ──
+-- Self-healing for schemas predating these columns (idempotent).
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "address_line1" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "address_line2" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "postal_code" varchar(16);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "city" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "country" varchar(2) DEFAULT 'DE';
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "tags" jsonb DEFAULT '[]'::jsonb NOT NULL;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "internal_notes" text;
+
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "customer_id" integer;
+ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "customer_id" integer;
+ALTER TABLE ${q}."contact_messages" ADD COLUMN IF NOT EXISTS "customer_id" integer;
+ALTER TABLE ${q}."newsletter_subscribers" ADD COLUMN IF NOT EXISTS "customer_id" integer;
+-- Indexes AFTER the ALTERs above or the batch aborts on legacy schemas.
+CREATE INDEX IF NOT EXISTS "orders_customer_id_idx" ON ${q}."orders" ("customer_id");
+CREATE INDEX IF NOT EXISTS "service_inquiries_customer_id_idx" ON ${q}."service_inquiries" ("customer_id");
+CREATE INDEX IF NOT EXISTS "contact_messages_customer_id_idx" ON ${q}."contact_messages" ("customer_id");
+CREATE INDEX IF NOT EXISTS "newsletter_subscribers_customer_id_idx" ON ${q}."newsletter_subscribers" ("customer_id");
+
+-- Backfill: every email across the source tables becomes a customer (lower-cased,
+-- de-duplicated). ON CONFLICT keeps the existing row — never overwrites manual edits.
+INSERT INTO ${q}."customers" ("email", "name", "phone")
+  SELECT lower("customer_email"), max("customer_name"), max("customer_phone")
+  FROM ${q}."orders"
+  WHERE "customer_email" IS NOT NULL AND "customer_email" <> ''
+  GROUP BY lower("customer_email")
+  ON CONFLICT ("email") DO NOTHING;
+INSERT INTO ${q}."customers" ("email", "name", "phone")
+  SELECT lower("email"), max("name"), max("phone")
+  FROM ${q}."service_inquiries"
+  WHERE "email" IS NOT NULL AND "email" <> ''
+  GROUP BY lower("email")
+  ON CONFLICT ("email") DO NOTHING;
+INSERT INTO ${q}."customers" ("email", "name", "phone")
+  SELECT lower("email"), max("name"), max("phone")
+  FROM ${q}."contact_messages"
+  WHERE "email" IS NOT NULL AND "email" <> ''
+  GROUP BY lower("email")
+  ON CONFLICT ("email") DO NOTHING;
+INSERT INTO ${q}."customers" ("email", "name", "marketing_opt_in")
+  SELECT lower("email"),
+         max(nullif(trim(concat_ws(' ', "first_name", "last_name")), '')),
+         bool_or("confirmed" AND "unsubscribed_at" IS NULL)
+  FROM ${q}."newsletter_subscribers"
+  WHERE "email" IS NOT NULL AND "email" <> ''
+  GROUP BY lower("email")
+  ON CONFLICT ("email") DO NOTHING;
+
+-- Link source rows back to their customer (only fills NULLs — cheap on re-run).
+UPDATE ${q}."orders" o SET "customer_id" = c."id"
+  FROM ${q}."customers" c
+  WHERE o."customer_id" IS NULL AND lower(o."customer_email") = lower(c."email");
+UPDATE ${q}."service_inquiries" s SET "customer_id" = c."id"
+  FROM ${q}."customers" c
+  WHERE s."customer_id" IS NULL AND lower(s."email") = lower(c."email");
+UPDATE ${q}."contact_messages" m SET "customer_id" = c."id"
+  FROM ${q}."customers" c
+  WHERE m."customer_id" IS NULL AND lower(m."email") = lower(c."email");
+UPDATE ${q}."newsletter_subscribers" n SET "customer_id" = c."id"
+  FROM ${q}."customers" c
+  WHERE n."customer_id" IS NULL AND lower(n."email") = lower(c."email");
 `;
 }

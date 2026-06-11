@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
 import { company } from '../../db/schema/shared.js';
+import { linkCustomerByEmail } from '../../lib/customers.js';
 import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
 import { newsletterConfirmEmail } from '../../email/templates.js';
 import { parseIntId } from '../../lib/http-errors.js';
@@ -94,15 +95,22 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
         reply.code(201);
         return { ok: true, subscriber: null };
       }
-      const { newsletterSubscribers } = request.company!.tables;
+      const { newsletterSubscribers, customers } = request.company!.tables;
 
       const confirmToken = randomConfirmToken();
       const confirmTokenExpiresAt = new Date(Date.now() + CONFIRM_TOKEN_TTL_MS);
+
+      const customerId = await linkCustomerByEmail(db, customers, {
+        email: body.email,
+        name: [body.firstName, body.lastName].filter(Boolean).join(' ') || null,
+        marketingOptIn: true,
+      });
 
       const [row] = await db
         .insert(newsletterSubscribers)
         .values({
           email: body.email,
+          customerId,
           firstName: body.firstName,
           lastName: body.lastName,
           locale: body.locale ?? 'de',

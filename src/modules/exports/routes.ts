@@ -25,7 +25,7 @@ const filterSchema = z
 
 const createSchema = z.object({
   companySlug: z.string().min(1).max(63),
-  kind: z.enum(['orders', 'inquiries', 'contacts', 'newsletter']),
+  kind: z.enum(['orders', 'inquiries', 'contacts', 'newsletter', 'customers']),
   format: z.enum(['csv']).default('csv'),
   filter: filterSchema.default({}),
 });

@@ -5,6 +5,7 @@ import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
 import { company, user } from '../../db/schema/shared.js';
+import { linkCustomerByEmail } from '../../lib/customers.js';
 import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
 import {
   adminInboxNotificationEmail,
@@ -92,10 +93,17 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
           return;
         }
       }
-      const { serviceInquiries } = request.company!.tables;
+      const { serviceInquiries, customers } = request.company!.tables;
+      const customerId = await linkCustomerByEmail(db, customers, {
+        email: body.email,
+        name: body.name,
+        phone: body.phone,
+        marketingOptIn: body.consentMarketing ?? false,
+      });
       const [row] = await db
         .insert(serviceInquiries)
         .values({
+          customerId,
           name: body.name,
           email: body.email,
           phone: body.phone,

@@ -5,7 +5,7 @@ import { exportJobs, company } from '../db/schema/shared.js';
 import { deleteExportObject, putExportObject } from './s3.js';
 import { getTenantTables } from '../db/schema/tenant.js';
 
-export type ExportKind = 'orders' | 'inquiries' | 'contacts' | 'newsletter';
+export type ExportKind = 'orders' | 'inquiries' | 'contacts' | 'newsletter' | 'customers';
 
 /** Supported export filters — validated at job creation, applied at run time. */
 export interface ExportFilter {
@@ -183,6 +183,37 @@ async function fetchExportRows(
           'confirmed',
           'confirmedAt',
           'unsubscribedAt',
+          'createdAt',
+        ],
+        rows: rows.map((r) => ({ ...r })),
+      };
+    }
+    case 'customers': {
+      // No status column — date range only.
+      const conds = filterConds(filter, tables.customers.createdAt, null);
+      const rows = await db
+        .select()
+        .from(tables.customers)
+        .where(conds.length ? and(...conds) : undefined)
+        .orderBy(desc(tables.customers.createdAt));
+      return {
+        header: [
+          'id',
+          'email',
+          'name',
+          'phone',
+          'addressLine1',
+          'addressLine2',
+          'postalCode',
+          'city',
+          'country',
+          'totalOrders',
+          'totalSpentCents',
+          'loyaltyTier',
+          'tags',
+          'marketingOptIn',
+          'firstOrderAt',
+          'lastOrderAt',
           'createdAt',
         ],
         rows: rows.map((r) => ({ ...r })),

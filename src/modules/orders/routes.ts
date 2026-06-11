@@ -17,6 +17,7 @@ import {
   paymentRequestEmail,
 } from '../../email/templates.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { linkCustomerByEmail } from '../../lib/customers.js';
 import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
 import { computeCommission, parseCommissionRate } from '../../lib/commission.js';
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
@@ -241,7 +242,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      const { orders, orderItems, orderStatusLog } = request.company!.tables;
+      const { orders, orderItems, orderStatusLog, customers } = request.company!.tables;
       const publicToken = generateOrderToken();
       const pickupMode =
         body.kind === 'polsterreinigung' || body.kind === 'teppichbodenreinigung'
@@ -279,10 +280,17 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
       // by an admin once the work is done (cash / EC card / credit-card link).
 
       const orderRow = await db.transaction(async (tx) => {
+        const customerId = await linkCustomerByEmail(tx, customers, {
+          email: body.customer.email,
+          name: body.customer.name,
+          phone: body.customer.phone ?? null,
+          marketingOptIn: body.consentMarketing ?? false,
+        });
         const inserted = await tx
           .insert(orders)
           .values({
             publicToken,
+            customerId,
             kind: body.kind,
             status: isAfterService ? 'accepted' : 'pending',
             paymentMode,
@@ -1102,6 +1110,9 @@ async function aggregateCustomerOnPaid(
           totalSpentCents: sql`${customers.totalSpentCents} + ${paidTotal}`,
           name: sql`coalesce(${customers.name}, ${order.customerName})`,
           phone: sql`coalesce(${customers.phone}, ${order.customerPhone})`,
+          // Customer may already exist (linked at order creation) — keep the
+          // earliest firstOrderAt instead of leaving it null.
+          firstOrderAt: sql`coalesce(${customers.firstOrderAt}, ${now})`,
           lastOrderAt: now,
           updatedAt: now,
         },
