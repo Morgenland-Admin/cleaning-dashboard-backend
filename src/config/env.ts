@@ -39,8 +39,11 @@ const envSchema = z.object({
   STRIPE_SECRET_KEY: optionalString,
   STRIPE_WEBHOOK_SECRET: optionalString,
   STRIPE_PUBLISHABLE_KEY: optionalString,
+  PAYPAL_CLIENT_ID: optionalString,
+  PAYPAL_SECRET: optionalString,
+  PAYPAL_ENV: z.enum(['sandbox', 'live']).default('sandbox'),
+  PAYPAL_WEBHOOK_ID: optionalString,
   N8N_CANCEL_WEBHOOK_URL: optionalUrl,
-  /** HMAC secret for signing outgoing n8n webhooks (falls back to BETTER_AUTH_SECRET). */
   N8N_WEBHOOK_SECRET: optionalString,
   VAPID_PUBLIC_KEY: optionalString,
   VAPID_PRIVATE_KEY: optionalString,
@@ -68,6 +71,21 @@ if (parsed.data.NODE_ENV === 'production') {
   const errors: string[] = [];
   if (parsed.data.APP_BASE_URL === 'http://localhost:5173') {
     errors.push('APP_BASE_URL is required in production (currently using the local dev default).');
+  }
+  // Stripe webhooks fail silently without the signing secret — catch it at boot.
+  if (parsed.data.STRIPE_SECRET_KEY && !parsed.data.STRIPE_WEBHOOK_SECRET) {
+    errors.push('STRIPE_WEBHOOK_SECRET is required when STRIPE_SECRET_KEY is set.');
+  }
+  // PayPal must be configured as a coherent set, or not at all.
+  const paypalKeys = [
+    parsed.data.PAYPAL_CLIENT_ID,
+    parsed.data.PAYPAL_SECRET,
+    parsed.data.PAYPAL_WEBHOOK_ID,
+  ];
+  if (paypalKeys.some(Boolean) && !paypalKeys.every(Boolean)) {
+    errors.push(
+      'PayPal is half-configured: set PAYPAL_CLIENT_ID, PAYPAL_SECRET and PAYPAL_WEBHOOK_ID together, or none.',
+    );
   }
   if (errors.length > 0) {
     console.error('Production environment misconfigured:\n  ' + errors.join('\n  '));

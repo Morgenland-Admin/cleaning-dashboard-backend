@@ -128,6 +128,7 @@ export const checkoutSchema = quoteSchema.and(
     website: z.string().max(200).optional(),
     source: z.string().trim().max(64).optional(),
     paymentMode: z.enum(['upfront', 'after_service']).optional(),
+    provider: z.enum(['stripe', 'paypal']).optional(),
   }),
 );
 

@@ -263,6 +263,10 @@ function buildTenantTables(schemaName: string) {
       stripeSessionId: text('stripe_session_id'),
       stripePaymentIntentId: text('stripe_payment_intent_id'),
 
+      paymentProvider: varchar('payment_provider', { length: 16 }).notNull().default('stripe'),
+      paypalOrderId: text('paypal_order_id'),
+      paypalCaptureId: text('paypal_capture_id'),
+
       paymentMode: varchar('payment_mode', { length: 16 }).notNull().default('upfront'),
       paymentMethod: varchar('payment_method', { length: 24 }),
 
@@ -299,6 +303,7 @@ function buildTenantTables(schemaName: string) {
       stripePaymentIntentIdx: index('orders_stripe_payment_intent_idx').on(
         table.stripePaymentIntentId,
       ),
+      paypalOrderIdx: index('orders_paypal_order_id_idx').on(table.paypalOrderId),
       stripeTransferIdx: index('orders_stripe_transfer_idx').on(table.stripeTransferId),
       assignedPartnerIdx: index('orders_assigned_partner_idx').on(table.assignedPartnerId),
     }),
@@ -821,6 +826,9 @@ CREATE TABLE IF NOT EXISTS ${q}."orders" (
   "internal_notes" text,
   "stripe_session_id" text,
   "stripe_payment_intent_id" text,
+  "payment_provider" varchar(16) DEFAULT 'stripe' NOT NULL,
+  "paypal_order_id" text,
+  "paypal_capture_id" text,
   "payment_mode" varchar(16) DEFAULT 'upfront' NOT NULL,
   "payment_method" varchar(24),
   "paid_at" timestamp with time zone,
@@ -892,9 +900,14 @@ ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "stripe_transfer_id" text;
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payout_at" timestamp with time zone;
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payment_mode" varchar(16) DEFAULT 'upfront' NOT NULL;
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payment_method" varchar(24);
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "payment_provider" varchar(16) DEFAULT 'stripe' NOT NULL;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "paypal_order_id" text;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "paypal_capture_id" text;
 CREATE INDEX IF NOT EXISTS "orders_assigned_partner_idx" ON ${q}."orders" ("assigned_partner_id");
 -- Keep AFTER the stripe_transfer_id ALTER above or the batch aborts on legacy schemas.
 CREATE INDEX IF NOT EXISTS "orders_stripe_transfer_idx" ON ${q}."orders" ("stripe_transfer_id");
+-- Keep AFTER the paypal_order_id ALTER above (same legacy-schema ordering rule).
+CREATE INDEX IF NOT EXISTS "orders_paypal_order_id_idx" ON ${q}."orders" ("paypal_order_id");
 
 -- Backfill order numbers from the creation year; greatest() avoids lpad truncation.
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "order_number" varchar(20);

@@ -18,8 +18,8 @@ export const hamburgBook: PriceBook = {
       handgeknuepft: 2990,
       perser_premium: 3990,
       china: 3690,
-      seide: 4490,
-      antik: 4990,
+      seide: 5990,
+      antik: 6990,
     },
     labels: {
       maschinell: 'Maschinell',
@@ -37,11 +37,11 @@ export const hamburgBook: PriceBook = {
 
   carpetRepair: {
     prices: {
-      fransen_sichern: 2000,
-      kanten_sichern: 2200,
-      fransen_erneuern: 2800,
-      kanten_erneuern: 3000,
-      auf_mass_kuerzen: 3000,
+      fransen_sichern: 3500,
+      kanten_sichern: 3500,
+      fransen_erneuern: 12000,
+      kanten_erneuern: 5500,
+      auf_mass_kuerzen: 5500,
     },
     labels: {
       fransen_sichern: 'Fransen sichern / befestigen',

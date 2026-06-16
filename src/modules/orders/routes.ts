@@ -28,6 +28,12 @@ import { formatEurFromCents, priceOrder } from '../../lib/pricing.js';
 import { getPriceBook } from '../../lib/price-books/index.js';
 import { getStripe, stripeConfigured } from '../../lib/stripe.js';
 import {
+  paypalConfigured,
+  createPayPalOrder,
+  capturePayPalOrder,
+  verifyPayPalWebhook,
+} from '../../lib/paypal.js';
+import {
   allowedNextStatuses,
   canTransition,
   generateOrderToken,
@@ -161,12 +167,16 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
     '/checkout',
     { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } },
     async (request, reply) => {
-      if (!stripeConfigured) {
+      const body: CheckoutInput = checkoutSchema.parse(request.body);
+      const provider: 'stripe' | 'paypal' = body.provider === 'paypal' ? 'paypal' : 'stripe';
+
+      // After-service bookings are confirmed without an upfront charge; an admin
+      // sends a Stripe link later, so they still validate against the Stripe config.
+      const providerReady = provider === 'paypal' ? paypalConfigured : stripeConfigured;
+      if (!providerReady) {
         reply.code(503).send({ error: 'Payments are not configured on this server' });
         return;
       }
-
-      const body: CheckoutInput = checkoutSchema.parse(request.body);
 
       if (body.website && body.website.trim().length > 0) {
         reply.code(200).send({ ok: true, checkoutUrl: null });
@@ -223,6 +233,13 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           reply.code(503).send({
             error: 'Checkout temporarily unavailable. Please contact us if this persists.',
           });
+          return;
+        }
+        if (body.voucherCode && provider === 'paypal') {
+          // Vouchers are Stripe promotion codes; PayPal-direct can't redeem them yet.
+          reply
+            .code(400)
+            .send({ error: 'Gutscheine sind bei PayPal-Zahlung derzeit nicht verfügbar.' });
           return;
         }
         if (body.voucherCode) {
@@ -445,6 +462,65 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
 
+      // --- PayPal (native Orders v2): money settles directly in the PayPal account. ---
+      if (provider === 'paypal') {
+        let paypalOrder;
+        try {
+          paypalOrder = await createPayPalOrder({
+            amountCents: quote.totalCents,
+            referenceId: publicToken,
+            // invoiceId maps the capture/webhook back to this order AND makes PayPal
+            // itself reject an accidental double-pay for the same order.
+            invoiceId: `${request.company!.slug}_${orderRow.id}`,
+            description: `${companyRow.name} · ${KIND_LABEL[body.kind] ?? body.kind} · ${orderNumberOf(orderRow)}`,
+            brandName: companyRow.name,
+            idempotencyKey: `pp_create_${request.company!.slug}_${orderRow.id}`,
+          });
+        } catch (err) {
+          request.log.error({ err, orderId: orderRow.id }, 'PayPal order creation failed');
+          await markOrderCancelled(
+            app,
+            request.company!.slug,
+            orderRow.id,
+            'PayPal-Bestellung konnte nicht erstellt werden',
+          );
+          reply.code(502).send({
+            error:
+              'Die PayPal-Zahlung konnte nicht gestartet werden. Bitte versuchen Sie es erneut.',
+          });
+          return;
+        }
+
+        await db.transaction(async (tx) => {
+          await tx
+            .update(orders)
+            .set({
+              paymentProvider: 'paypal',
+              paypalOrderId: paypalOrder.id,
+              status: 'payment_pending',
+              updatedAt: now,
+            })
+            .where(eq(orders.id, orderRow.id));
+          await tx.insert(orderStatusLog).values({
+            orderId: orderRow.id,
+            fromStatus: 'pending',
+            toStatus: 'payment_pending',
+            reason: 'PayPal order created',
+          });
+        });
+
+        reply.code(201).send({
+          ok: true,
+          orderId: orderRow.id,
+          publicToken,
+          provider: 'paypal',
+          paypalOrderId: paypalOrder.id,
+          checkoutUrl: null,
+          sessionId: null,
+        });
+        return;
+      }
+
       const stripe = getStripe();
 
       const suffix = statementSuffix(companyRow.name);
@@ -453,7 +529,9 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         session = await stripe.checkout.sessions.create(
           {
             mode: 'payment',
-            payment_method_types: ['card', 'paypal', 'amazon_pay', 'link'],
+            // PayPal is handled by the native Orders v2 flow (lib/paypal.ts) so the
+            // money lands in the PayPal account — not routed through Stripe here.
+            payment_method_types: ['card', 'amazon_pay', 'link'],
             currency: 'eur',
             line_items: [
               {
@@ -558,6 +636,8 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         internalNotes: _n,
         stripeSessionId: _s,
         stripePaymentIntentId: _p,
+        paypalOrderId: _po,
+        paypalCaptureId: _pc,
         ...safe
       } = row;
       // Dispute details are internal — not for the public tracker.
@@ -567,6 +647,75 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         items,
         statusLog: log,
       });
+    },
+  );
+
+  // Capture a PayPal order after the buyer approves it in the PayPal popup.
+  // Called by the storefront's onApprove handler. Idempotent: finalizePaidOrder
+  // and the PAYMENT.CAPTURE.COMPLETED webhook both no-op once the order is paid.
+  app.post(
+    '/:token/paypal/capture',
+    { config: { rateLimit: { max: 12, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      if (!paypalConfigured) {
+        reply.code(503).send({ error: 'PayPal is not configured on this server' });
+        return;
+      }
+      const token = (request.params as { token: string }).token;
+      if (typeof token !== 'string' || token.length < 8 || token.length > 64) {
+        reply.code(400).send({ error: 'Invalid token' });
+        return;
+      }
+      const { orders } = request.company!.tables;
+      const [row] = await db.select().from(orders).where(eq(orders.publicToken, token)).limit(1);
+      if (!row) {
+        reply.code(404).send({ error: 'Order not found' });
+        return;
+      }
+      if (row.paymentProvider !== 'paypal' || !row.paypalOrderId) {
+        reply.code(400).send({ error: 'Order is not a PayPal order' });
+        return;
+      }
+      // Already finalized (capture retried, or the webhook beat us here) — succeed idempotently.
+      if (row.status !== 'pending' && row.status !== 'payment_pending') {
+        reply.code(200).send({ ok: true, status: row.status, publicToken: token });
+        return;
+      }
+
+      let capture;
+      try {
+        capture = await capturePayPalOrder(
+          row.paypalOrderId,
+          `pp_capture_${request.company!.slug}_${row.id}`,
+        );
+      } catch (err) {
+        request.log.error({ err, orderId: row.id }, 'PayPal capture failed');
+        reply.code(502).send({ error: 'Die PayPal-Zahlung konnte nicht abgeschlossen werden.' });
+        return;
+      }
+
+      // Only a COMPLETED capture means money was received. A PENDING or declined
+      // capture must NOT mark the order paid — the webhook finalizes it if it later clears.
+      if (capture.captureStatus !== 'COMPLETED') {
+        request.log.warn(
+          { orderId: row.id, orderStatus: capture.status, captureStatus: capture.captureStatus },
+          'PayPal capture not COMPLETED — order left payment_pending',
+        );
+        reply.code(402).send({
+          error: 'PayPal-Zahlung nicht abgeschlossen',
+          status: capture.captureStatus ?? capture.status,
+        });
+        return;
+      }
+
+      await markOrderPaidPayPal(app, request.company!.slug, row.id, {
+        amountCents: capture.amountCents,
+        status: capture.status,
+        orderId: row.paypalOrderId,
+        captureId: capture.captureId,
+      });
+
+      reply.code(200).send({ ok: true, status: 'paid', publicToken: token });
     },
   );
 };
@@ -617,7 +766,150 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
 
     reply.code(200).send({ received: true });
   });
+
+  // Native PayPal webhook (PAYMENT.CAPTURE.* etc). Backstop to the synchronous
+  // capture endpoint — reconciles the order if the buyer's browser dropped off.
+  app.post('/paypal', async (request, reply) => {
+    if (!paypalConfigured || !env.PAYPAL_WEBHOOK_ID) {
+      reply.code(503).send({ error: 'PayPal webhook not configured' });
+      return;
+    }
+    const raw = Buffer.isBuffer(request.body)
+      ? request.body.toString('utf8')
+      : typeof request.body === 'string'
+        ? request.body
+        : JSON.stringify(request.body ?? {});
+    const h = request.headers;
+    const verified = await verifyPayPalWebhook(
+      {
+        transmissionId: h['paypal-transmission-id'] as string | undefined,
+        transmissionTime: h['paypal-transmission-time'] as string | undefined,
+        transmissionSig: h['paypal-transmission-sig'] as string | undefined,
+        certUrl: h['paypal-cert-url'] as string | undefined,
+        authAlgo: h['paypal-auth-algo'] as string | undefined,
+      },
+      raw,
+    );
+    if (!verified) {
+      request.log.warn('PayPal webhook signature verification failed');
+      reply.code(400).send({ error: 'Invalid signature' });
+      return;
+    }
+
+    let event: PayPalWebhookEvent;
+    try {
+      event = JSON.parse(raw) as PayPalWebhookEvent;
+    } catch {
+      reply.code(400).send({ error: 'Invalid JSON' });
+      return;
+    }
+
+    try {
+      await handlePayPalEvent(app, event);
+    } catch (err) {
+      request.log.error({ err, eventType: event.event_type }, 'PayPal webhook handler failed');
+      captureException(err, { eventType: event.event_type, eventId: event.id });
+      reply.code(500).send({ error: 'Webhook handler failed' });
+      return;
+    }
+
+    reply.code(200).send({ received: true });
+  });
 };
+
+interface PayPalWebhookEvent {
+  id?: string;
+  event_type?: string;
+  resource?: {
+    id?: string;
+    invoice_id?: string;
+    status?: string;
+    amount?: { value?: string; currency_code?: string };
+    supplementary_data?: { related_ids?: { order_id?: string; capture_id?: string } };
+    links?: { href?: string; rel?: string }[];
+  };
+}
+
+/** invoice_id is `${companySlug}_${orderId}` — parse it back to route the event. */
+function parsePayPalInvoiceId(
+  invoiceId: string | undefined,
+): { companySlug: string; orderId: number } | null {
+  if (typeof invoiceId !== 'string') return null;
+  const idx = invoiceId.lastIndexOf('_');
+  if (idx <= 0) return null;
+  const companySlug = invoiceId.slice(0, idx);
+  const orderId = Number(invoiceId.slice(idx + 1));
+  if (!companySlug || !Number.isInteger(orderId)) return null;
+  return { companySlug, orderId };
+}
+
+/** Resolve the parent capture id of a refund resource from its `up` link. */
+function paypalCaptureIdFromRefund(resource: PayPalWebhookEvent['resource']): string | null {
+  const fromData = resource?.supplementary_data?.related_ids?.capture_id;
+  if (fromData) return fromData;
+  const up = resource?.links?.find((l) => l.rel === 'up')?.href;
+  const seg = up?.split('/').pop()?.split('?')[0];
+  return seg && seg.length > 0 ? seg : null;
+}
+
+async function handlePayPalEvent(app: FastifyInstance, event: PayPalWebhookEvent): Promise<void> {
+  const resource = event.resource ?? {};
+  switch (event.event_type) {
+    case 'PAYMENT.CAPTURE.COMPLETED': {
+      const ref = parsePayPalInvoiceId(resource.invoice_id);
+      if (!ref) {
+        app.log.warn(
+          { captureId: resource.id },
+          'PayPal capture completed but invoice_id did not map to an order',
+        );
+        return;
+      }
+      const amountCents =
+        resource.amount?.value != null ? Math.round(parseFloat(resource.amount.value) * 100) : null;
+      await markOrderPaidPayPal(app, ref.companySlug, ref.orderId, {
+        amountCents,
+        status: 'COMPLETED',
+        orderId: resource.supplementary_data?.related_ids?.order_id || null,
+        captureId: typeof resource.id === 'string' ? resource.id : null,
+      });
+      return;
+    }
+    case 'PAYMENT.CAPTURE.DENIED':
+    case 'PAYMENT.CAPTURE.DECLINED': {
+      const ref = parsePayPalInvoiceId(resource.invoice_id);
+      if (!ref) return;
+      await markOrderCancelled(app, ref.companySlug, ref.orderId, `PayPal ${event.event_type}`);
+      return;
+    }
+    case 'PAYMENT.CAPTURE.REFUNDED':
+    case 'PAYMENT.CAPTURE.REVERSED': {
+      const refundedCents =
+        resource.amount?.value != null ? Math.round(parseFloat(resource.amount.value) * 100) : null;
+      const captureId = paypalCaptureIdFromRefund(resource);
+      const ref = parsePayPalInvoiceId(resource.invoice_id);
+      const located = ref
+        ? await markOrderRefundedPayPal(
+            app,
+            ref.companySlug,
+            ref.orderId,
+            refundedCents,
+            event.event_type,
+          )
+        : captureId
+          ? await markOrderRefundedByPayPalCapture(app, captureId, refundedCents, event.event_type)
+          : false;
+      if (!located) {
+        app.log.error(
+          { refundId: resource.id, captureId, eventType: event.event_type },
+          'PayPal refund/reversal could not be mapped to an order — reconcile manually',
+        );
+      }
+      return;
+    }
+    default:
+      app.log.info({ eventType: event.event_type }, 'Unhandled PayPal webhook event');
+  }
+}
 
 async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Promise<void> {
   switch (event.type) {
@@ -876,11 +1168,63 @@ async function markOrderDisputedByPaymentIntent(
   app.log.warn({ paymentIntentId }, 'Dispute webhook for unknown payment intent');
 }
 
+/** Provider-agnostic snapshot of a completed payment, fed into finalizePaidOrder. */
+interface PaidInfo {
+  provider: 'stripe' | 'paypal';
+  /** Free-text shown in the order status log, e.g. 'paid' or 'PayPal capture COMPLETED'. */
+  statusLabel: string;
+  /** Amount actually charged, in cents (null if the provider didn't report it). */
+  amountTotalCents: number | null;
+  discountCents: number;
+  stripePaymentIntentId?: string | null;
+  paypalOrderId?: string | null;
+  paypalCaptureId?: string | null;
+}
+
+/** Thin Stripe adapter — keeps the webhook call site unchanged. */
 async function markOrderPaid(
   app: FastifyInstance,
   companySlug: string,
   orderId: number,
   session: Stripe.Checkout.Session,
+): Promise<void> {
+  await finalizePaidOrder(app, companySlug, orderId, {
+    provider: 'stripe',
+    statusLabel: session.payment_status,
+    amountTotalCents: typeof session.amount_total === 'number' ? session.amount_total : null,
+    discountCents: session.total_details?.amount_discount ?? 0,
+    stripePaymentIntentId:
+      typeof session.payment_intent === 'string' ? session.payment_intent : null,
+  });
+}
+
+/** PayPal adapter — runs the same onboarding as a Stripe payment. */
+async function markOrderPaidPayPal(
+  app: FastifyInstance,
+  companySlug: string,
+  orderId: number,
+  capture: {
+    amountCents: number | null;
+    status: string;
+    orderId: string | null;
+    captureId: string | null;
+  },
+): Promise<void> {
+  await finalizePaidOrder(app, companySlug, orderId, {
+    provider: 'paypal',
+    statusLabel: `PayPal capture ${capture.status}`,
+    amountTotalCents: capture.amountCents,
+    discountCents: 0,
+    paypalOrderId: capture.orderId,
+    paypalCaptureId: capture.captureId,
+  });
+}
+
+async function finalizePaidOrder(
+  app: FastifyInstance,
+  companySlug: string,
+  orderId: number,
+  paid: PaidInfo,
 ): Promise<void> {
   const { getTenantTables } = await import('../../db/schema/tenant.js');
   const { loadCompany } = await import('../../lib/company-loader.js');
@@ -894,7 +1238,7 @@ async function markOrderPaid(
     .where(eq(tables.orders.id, orderId))
     .limit(1);
   if (!order) {
-    app.log.warn({ orderId, companySlug }, 'Stripe webhook for unknown order');
+    app.log.warn({ orderId, companySlug, provider: paid.provider }, 'Payment for unknown order');
     return;
   }
 
@@ -908,19 +1252,30 @@ async function markOrderPaid(
     order.status === 'completed';
   if (isAlreadyAdvanced) return;
 
-  const paymentIntentId =
-    typeof session.payment_intent === 'string' ? session.payment_intent : null;
   const now = new Date();
+  // Payment-identifying columns, keyed by provider. paypalOrderId is set at order
+  // creation, so only overwrite it when this event actually carries a value.
+  const providerCols =
+    paid.provider === 'paypal'
+      ? {
+          paymentProvider: 'paypal' as const,
+          ...(paid.paypalOrderId ? { paypalOrderId: paid.paypalOrderId } : {}),
+          paypalCaptureId: paid.paypalCaptureId ?? null,
+        }
+      : {
+          paymentProvider: 'stripe' as const,
+          stripePaymentIntentId: paid.stripePaymentIntentId ?? null,
+        };
 
   if (order.status === 'cancelled' || order.status === 'refunded') {
     // Payment landed after cancellation — record loudly, never silent-drop money.
     app.log.error(
-      { orderId, companySlug, status: order.status },
+      { orderId, companySlug, status: order.status, provider: paid.provider },
       'Payment received on a cancelled order — refund required',
     );
     await db
       .update(tables.orders)
-      .set({ stripePaymentIntentId: paymentIntentId, updatedAt: now })
+      .set({ ...providerCols, updatedAt: now })
       .where(eq(tables.orders.id, orderId));
     await db.insert(tables.orderStatusLog).values({
       orderId,
@@ -931,8 +1286,8 @@ async function markOrderPaid(
     return;
   }
 
-  const amountTotal = typeof session.amount_total === 'number' ? session.amount_total : null;
-  const discountCents = session.total_details?.amount_discount ?? 0;
+  const amountTotal = paid.amountTotalCents;
+  const discountCents = paid.discountCents;
   if (amountTotal != null && amountTotal !== order.totalCents && discountCents === 0) {
     app.log.warn(
       { orderId, orderTotal: order.totalCents, amountTotal },
@@ -947,7 +1302,7 @@ async function markOrderPaid(
       .set({
         status: 'paid',
         paidAt: now,
-        stripePaymentIntentId: paymentIntentId,
+        ...providerCols,
         totalCents: paidTotal,
         discountCents,
         updatedAt: now,
@@ -966,8 +1321,8 @@ async function markOrderPaid(
       toStatus: 'paid',
       reason:
         discountCents > 0
-          ? `Stripe ${session.payment_status} · Rabatt ${formatEurFromCents(discountCents)}`
-          : `Stripe ${session.payment_status}`,
+          ? `${paid.statusLabel} · Rabatt ${formatEurFromCents(discountCents)}`
+          : paid.statusLabel,
     });
     return true;
   });
@@ -1340,6 +1695,101 @@ async function markOrderRefundedByPaymentIntent(
   app.log.warn({ paymentIntentId }, 'Refund webhook for unknown payment intent');
 }
 
+/** Apply a PayPal refund/reversal to an order by company + id. Returns false if not found. */
+async function markOrderRefundedPayPal(
+  app: FastifyInstance,
+  companySlug: string,
+  orderId: number,
+  refundedCents: number | null,
+  label: string | undefined,
+): Promise<boolean> {
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  const { loadCompany } = await import('../../lib/company-loader.js');
+  const companyRow = await loadCompany(companySlug);
+  if (!companyRow) return false;
+  const tables = getTenantTables(companyRow.schemaName);
+  const [order] = await db
+    .select()
+    .from(tables.orders)
+    .where(eq(tables.orders.id, orderId))
+    .limit(1);
+  if (!order) return false;
+
+  const now = new Date();
+  const fromStatus = order.status as OrderStatus;
+  const refundedTotal = refundedCents ?? order.totalCents;
+  if (refundedTotal <= order.refundedAmountCents) return true;
+
+  if (order.status === 'refunded' || order.status === 'cancelled') {
+    await db
+      .update(tables.orders)
+      .set({
+        refundedAmountCents: refundedTotal,
+        ...(order.refundedAt ? {} : { refundedAt: now }),
+        updatedAt: now,
+      })
+      .where(eq(tables.orders.id, order.id));
+    return true;
+  }
+
+  const isFull = refundedTotal >= order.totalCents;
+  const toStatus: OrderStatus = isFull ? 'refunded' : 'partially_refunded';
+  await db.transaction(async (tx) => {
+    await tx
+      .update(tables.orders)
+      .set({
+        status: toStatus,
+        refundedAmountCents: refundedTotal,
+        ...(isFull ? { refundedAt: now } : {}),
+        updatedAt: now,
+      })
+      .where(eq(tables.orders.id, order.id));
+    await tx.insert(tables.orderStatusLog).values({
+      orderId: order.id,
+      fromStatus: order.status,
+      toStatus,
+      reason: `PayPal ${label ?? 'Erstattung'} · ${formatEurFromCents(refundedTotal)}`,
+    });
+  });
+  void notifyCustomerStatusChange({
+    log: app.log,
+    companySlug,
+    order: {
+      id: order.id,
+      orderNumber: orderNumberOf(order),
+      customerName: order.customerName,
+      customerEmail: order.customerEmail,
+      publicToken: order.publicToken,
+    },
+    fromStatus,
+    toStatus,
+    refundCents: refundedTotal,
+  }).catch(() => null);
+  return true;
+}
+
+/** Locate an order by PayPal capture id across tenant schemas, then apply the refund. */
+async function markOrderRefundedByPayPalCapture(
+  app: FastifyInstance,
+  captureId: string,
+  refundedCents: number | null,
+  label: string | undefined,
+): Promise<boolean> {
+  const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  for (const c of await loadAllActiveCompanies()) {
+    const tables = getTenantTables(c.schemaName);
+    const [order] = await db
+      .select({ id: tables.orders.id })
+      .from(tables.orders)
+      .where(eq(tables.orders.paypalCaptureId, captureId))
+      .limit(1);
+    if (!order) continue;
+    return markOrderRefundedPayPal(app, c.slug, order.id, refundedCents, label);
+  }
+  return false;
+}
+
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).max(500).optional(),
@@ -1381,7 +1831,7 @@ const updateInternalNotesSchema = z.object({
 
 const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
 
-/** Viewers don't see IP/UA, internal notes, or Stripe IDs (same rule as contact/inquiries). */
+/** Viewers don't see IP/UA, internal notes, or payment-processor IDs. */
 function redactOrderPii<
   T extends {
     ipAddress?: unknown;
@@ -1389,6 +1839,8 @@ function redactOrderPii<
     internalNotes?: unknown;
     stripeSessionId?: unknown;
     stripePaymentIntentId?: unknown;
+    paypalOrderId?: unknown;
+    paypalCaptureId?: unknown;
   },
 >(row: T, accessLevel: string | undefined): T {
   if (accessLevel && PRIVILEGED_LEVELS.has(accessLevel)) return row;
@@ -1399,6 +1851,8 @@ function redactOrderPii<
     internalNotes: null,
     stripeSessionId: null,
     stripePaymentIntentId: null,
+    paypalOrderId: null,
+    paypalCaptureId: null,
   };
 }
 
@@ -1491,6 +1945,18 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     if (toStatus === 'refunded') {
+      const lvl = accessLevelOf(request);
+      if (!lvl || !PRIVILEGED_LEVELS.has(lvl)) {
+        reply.code(403).send({ error: 'Nur Manager/Admin dürfen Rückerstattungen ausführen.' });
+        return;
+      }
+      if (row.paymentProvider === 'paypal') {
+        reply.code(400).send({
+          error:
+            'PayPal-Zahlung — bitte direkt in PayPal erstatten. Eine Stripe-Rückerstattung ist nicht möglich.',
+        });
+        return;
+      }
       if (!row.stripePaymentIntentId) {
         reply.code(400).send({ error: 'Order has no payment intent — cannot refund via Stripe' });
         return;
@@ -1500,7 +1966,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
       try {
-        // Idempotency key dedupes double-submits at Stripe.
         await getStripe().refunds.create(
           { payment_intent: row.stripePaymentIntentId },
           { idempotencyKey: `refund_full_${request.company!.slug}_${id}` },
@@ -1805,6 +2270,18 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     );
 
     if (refundCents > 0) {
+      const lvl = accessLevelOf(request);
+      if (!lvl || !PRIVILEGED_LEVELS.has(lvl)) {
+        reply.code(403).send({ error: 'Nur Manager/Admin dürfen Rückerstattungen ausführen.' });
+        return;
+      }
+      if (row.paymentProvider === 'paypal') {
+        reply.code(400).send({
+          error:
+            'PayPal-Zahlung — bitte direkt in PayPal erstatten. Stornieren Sie hier ohne Rückerstattungsbetrag.',
+        });
+        return;
+      }
       if (!row.stripePaymentIntentId) {
         reply.code(400).send({
           error:
@@ -1817,8 +2294,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
       try {
-        // One key per order: same-amount retries dedupe at Stripe, different
-        // amounts are rejected — either way, never a second refund.
+        // One idempotency key per order: same-amount retries dedupe, different amounts reject.
         await getStripe().refunds.create(
           {
             payment_intent: row.stripePaymentIntentId,
@@ -2194,6 +2670,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
       const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
       if (!order) throw notFound('Order not found');
+      // PayPal-direct orders funded the PayPal account, not the Stripe balance — there
+      // is no charge to transfer from. Partner must be paid manually via PayPal.
+      if (order.paymentProvider === 'paypal') {
+        throw badRequest(
+          'Dieser Auftrag wurde über PayPal bezahlt — eine Stripe-Connect-Auszahlung ist nicht möglich. Bitte den Partner manuell über PayPal auszahlen.',
+        );
+      }
       if (order.stripeTransferId || order.payoutStatus === 'paid') {
         throw conflict('Partner has already been paid out for this order');
       }
