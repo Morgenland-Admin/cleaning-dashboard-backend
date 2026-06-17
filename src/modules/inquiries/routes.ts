@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, isNotNull, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { env } from '../../config/env.js';
@@ -378,5 +378,118 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
 
     reply.code(201);
     return { ok: true, inquiry: updated };
+  });
+
+  // Inquiries due a follow-up call: still untouched, reachable by phone, privacy
+  // consent given, past the wait window but not stale, under the attempt cap and
+  // not opted out. Brand-scoped via the X-Company-Slug from requireCompany.
+  const callbackQueueSchema = z.object({
+    minAgeHours: z.coerce.number().min(0).max(720).default(24),
+    maxAgeDays: z.coerce.number().min(1).max(90).default(14),
+    maxAttempts: z.coerce.number().int().min(1).max(10).default(3),
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+  });
+  app.get('/callback-queue', async (request) => {
+    const { minAgeHours, maxAgeDays, maxAttempts, limit } = callbackQueueSchema.parse(
+      request.query,
+    );
+    const { serviceInquiries: si } = request.company!.tables;
+
+    const now = Date.now();
+    const newestCreatedAt = new Date(now - minAgeHours * 3_600_000).toISOString();
+    const oldestCreatedAt = new Date(now - maxAgeDays * 86_400_000).toISOString();
+    const attempts = sql<number>`coalesce((${si.metadata}->'callback'->>'attempts')::int, 0)`;
+
+    const inquiries = await db
+      .select({
+        id: si.id,
+        name: si.name,
+        phone: si.phone,
+        email: si.email,
+        service: si.service,
+        message: si.message,
+        preferredDate: si.preferredDate,
+        locale: si.locale,
+        priority: si.priority,
+        createdAt: si.createdAt,
+        attempts,
+      })
+      .from(si)
+      .where(
+        and(
+          eq(si.status, 'new'),
+          eq(si.consentPrivacy, true),
+          isNotNull(si.phone),
+          sql`length(trim(${si.phone})) > 0`,
+          sql`${si.createdAt} <= ${newestCreatedAt}::timestamptz`,
+          sql`${si.createdAt} >= ${oldestCreatedAt}::timestamptz`,
+          sql`${attempts} < ${maxAttempts}`,
+          sql`coalesce(${si.metadata}->'callback'->>'lastOutcome', '') <> 'opted_out'`,
+        ),
+      )
+      .orderBy(asc(si.createdAt), asc(si.id))
+      .limit(limit);
+
+    return { inquiries };
+  });
+
+  // Records a call outcome: appends a timestamped note, bumps the attempt count,
+  // and advances a still-open inquiry (reached → in_review, opted_out → lost).
+  const callbackOutcomeSchema = z.object({
+    outcome: z.enum(['reached', 'no_answer', 'voicemail', 'opted_out']),
+    summary: z.string().min(1).max(4000),
+    nextStatus: z.enum(['new', 'in_review', 'quoted', 'won', 'lost']).optional(),
+  });
+  app.post('/:id/callback-outcome', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const body = callbackOutcomeSchema.parse(request.body);
+    const adminId = request.authUser!.id;
+    const { serviceInquiries: si } = request.company!.tables;
+
+    const [inquiry] = await db.select().from(si).where(eq(si.id, id)).limit(1);
+    if (!inquiry) throw notFound('Inquiry not found');
+
+    const now = new Date();
+    const stamp = now.toISOString();
+
+    const prevCb = (inquiry.metadata?.callback ?? {}) as Record<string, unknown>;
+    const callback = {
+      attempts: Number(prevCb.attempts ?? 0) + 1,
+      lastOutcome: body.outcome,
+      lastAttemptAt: stamp,
+      lastSummary: body.summary,
+    };
+
+    const note = `[Callback ${body.outcome} · ${stamp}] ${body.summary}`;
+    const internalNotes = inquiry.internalNotes ? `${inquiry.internalNotes}\n${note}` : note;
+
+    // Only ever advance a still-new inquiry; never downgrade one a human moved on.
+    let status = inquiry.status;
+    if (body.nextStatus) {
+      status = body.nextStatus;
+    } else if (inquiry.status === 'new') {
+      if (body.outcome === 'reached') status = 'in_review';
+      else if (body.outcome === 'opted_out') status = 'lost';
+    }
+
+    const patch: Record<string, unknown> = {
+      internalNotes,
+      metadata: { ...(inquiry.metadata ?? {}), callback },
+      status,
+      updatedAt: now,
+    };
+    if (status === 'in_review' && !inquiry.handledByUserId) {
+      patch.handledByUserId = adminId;
+      patch.handledAt = now;
+    }
+    if (status === 'lost' && !inquiry.closedAt) patch.closedAt = now;
+    // An explicit opt-out also withdraws marketing consent.
+    if (body.outcome === 'opted_out') patch.consentMarketing = false;
+
+    const [row] = await db.update(si).set(patch).where(eq(si.id, id)).returning();
+    if (!row) throw notFound('Inquiry not found');
+    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    reply.code(200);
+    return { ok: true, inquiry: redactPii(row, accessLevel) };
   });
 };
