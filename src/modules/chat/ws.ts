@@ -3,6 +3,7 @@ import fastifyWebsocket from '@fastify/websocket';
 import { eq } from 'drizzle-orm';
 
 import { auth } from '../../auth/index.js';
+import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
 import { loadCompany } from '../../lib/company-loader.js';
 import { getTenantTables } from '../../db/schema/tenant.js';
@@ -16,6 +17,16 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
   });
 
   app.get('/chat', { websocket: true }, async (connection, req) => {
+    // CSWSH guard: browsers always send Origin on the WS handshake, and SOP does
+    // not block cross-origin WS the way it does fetch — so reject any browser
+    // origin not in our CORS allowlist. A missing Origin (non-browser) is allowed,
+    // matching the HTTP CORS policy.
+    const origin = req.headers.origin;
+    if (origin && !env.CORS_ORIGINS.includes(origin)) {
+      connection.close(4403, 'Origin not allowed');
+      return;
+    }
+
     const headers = new Headers();
     for (const [k, v] of Object.entries(req.headers)) {
       if (Array.isArray(v)) for (const item of v) headers.append(k, item);

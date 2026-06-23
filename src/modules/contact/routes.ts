@@ -55,6 +55,7 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
   app.post(
     '/',
     {
+      bodyLimit: 64 * 1024,
       config: {
         rateLimit: { max: 5, timeWindow: '1 minute' },
       },

@@ -8,6 +8,7 @@ import authPlugin from './auth/plugin.js';
 import companyContext from './plugins/company-context.js';
 import errorHandler from './plugins/error-handler.js';
 import adminRoutes from './routes/admin.js';
+import internalRoutes from './routes/internal.js';
 import partnerRoutes from './routes/partner.js';
 import storefrontRoutes from './routes/storefront.js';
 import { loadAllActiveCompanies } from './lib/company-loader.js';
@@ -118,6 +119,7 @@ export async function buildApp(opts: FastifyServerOptions = {}) {
   await app.register(adminRoutes, { prefix: '/admin' });
   await app.register(partnerRoutes, { prefix: '/partner' });
   await app.register(storefrontRoutes, { prefix: '/storefront' });
+  await app.register(internalRoutes, { prefix: '/internal' });
 
   const chatWsPlugin = (await import('./modules/chat/ws.js')).default;
   await app.register(chatWsPlugin, { prefix: '/ws' });

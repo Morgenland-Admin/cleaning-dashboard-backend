@@ -49,6 +49,23 @@ const envSchema = z.object({
   VAPID_PRIVATE_KEY: optionalString,
   VAPID_SUBJECT: z.string().default('mailto:admin@reinigungs-portal.com'),
   SENTRY_DSN: optionalString,
+
+  // ── Voice-AI / callback geo-routing ──
+  // Reference point and radius for splitting inquiries between a human callback
+  // (within radius) and the automated AI warm-callback queue (outside). Both are
+  // expected to change as we grow, so they live in config, not code. Default ref
+  // is PLZ 20457 taken from the centroid table itself, keeping the haversine
+  // self-consistent with the lookup data.
+  CALLBACK_GEO_REF_LAT: z.coerce.number().default(53.53165),
+  CALLBACK_GEO_REF_LNG: z.coerce.number().default(9.98526),
+  CALLBACK_GEO_RADIUS_KM: z.coerce.number().positive().default(100),
+  // User id that human (Hamburg-area) callbacks are assigned to by default.
+  // A plain user pointer — hand off or distribute across reps later by changing
+  // this value (or the assignment logic), no schema change. Set to Kabir's id.
+  CALLBACK_DEFAULT_HUMAN_ASSIGNEE_ID: optionalString,
+  // Shared secret the voice-AI / n8n intake endpoint must present in the
+  // X-Intake-Token header. When unset, the intake endpoint is disabled (503).
+  INQUIRY_INTAKE_TOKEN: optionalString,
 });
 
 const parsed = envSchema.safeParse(process.env);

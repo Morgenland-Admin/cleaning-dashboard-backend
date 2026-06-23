@@ -35,7 +35,7 @@ export const reviewsPublicRoutes: FastifyPluginAsync = async (app) => {
 
   app.post(
     '/',
-    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    { bodyLimit: 64 * 1024, config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
     async (request, reply) => {
       const body = createReviewSchema.parse(request.body);
       const { orders, reviews } = request.company!.tables;

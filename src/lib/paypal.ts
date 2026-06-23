@@ -31,6 +31,7 @@ async function getAccessToken(): Promise<string> {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: 'grant_type=client_credentials',
+    signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -56,7 +57,11 @@ async function paypalFetch<T>(
   };
   if (init.idempotencyKey) headers['PayPal-Request-Id'] = init.idempotencyKey;
 
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers,
+    signal: init.signal ?? AbortSignal.timeout(10_000),
+  });
   const text = await res.text();
   const body = text ? (JSON.parse(text) as unknown) : {};
   if (!res.ok) {

@@ -27,36 +27,39 @@ const createCompanySchema = z.object({
   logoUrl: z.string().url().optional(),
 });
 
+// Column allowlist for any company row returned over the API. Deliberately
+// EXCLUDES secrets (resendApiKey) — never `.returning()` the raw row.
+const companyPublicColumns = {
+  slug: company.slug,
+  name: company.name,
+  legalName: company.legalName,
+  schemaName: company.schemaName,
+  email: company.email,
+  phone: company.phone,
+  websiteUrl: company.websiteUrl,
+  addressLine1: company.addressLine1,
+  addressLine2: company.addressLine2,
+  city: company.city,
+  region: company.region,
+  postalCode: company.postalCode,
+  country: company.country,
+  vatId: company.vatId,
+  registrationNumber: company.registrationNumber,
+  logoUrl: company.logoUrl,
+  primaryColor: company.primaryColor,
+  senderEmail: company.senderEmail,
+  senderName: company.senderName,
+  storefrontOrigin: company.storefrontOrigin,
+  isActive: company.isActive,
+} as const;
+
 const companiesRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAuth);
 
   app.get('/', async (request) => {
     const userId = request.authUser!.id;
     const rows = await db
-      .select({
-        slug: company.slug,
-        name: company.name,
-        legalName: company.legalName,
-        schemaName: company.schemaName,
-        email: company.email,
-        phone: company.phone,
-        websiteUrl: company.websiteUrl,
-        addressLine1: company.addressLine1,
-        addressLine2: company.addressLine2,
-        city: company.city,
-        region: company.region,
-        postalCode: company.postalCode,
-        country: company.country,
-        vatId: company.vatId,
-        registrationNumber: company.registrationNumber,
-        logoUrl: company.logoUrl,
-        primaryColor: company.primaryColor,
-        senderEmail: company.senderEmail,
-        senderName: company.senderName,
-        storefrontOrigin: company.storefrontOrigin,
-        isActive: company.isActive,
-        role: membership.role,
-      })
+      .select({ ...companyPublicColumns, role: membership.role })
       .from(membership)
       .innerJoin(company, eq(membership.companySlug, company.slug))
       .where(eq(membership.userId, userId));
@@ -106,7 +109,7 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
           primaryColor: body.primaryColor,
           logoUrl: body.logoUrl,
         })
-        .returning();
+        .returning(companyPublicColumns);
       await tx
         .insert(membership)
         .values({ userId, companySlug: body.slug, role: 'owner', acceptedAt: new Date() })
@@ -162,11 +165,17 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
     }
+    // storefrontOrigin is folded into the process-wide credentialed CORS allowlist,
+    // so a tenant admin must not be able to set it — super_admin only.
+    if (body.storefrontOrigin !== undefined && inviterMeta.accessLevel !== 'super_admin') {
+      reply.code(403).send({ error: 'Nur ein super_admin darf die storefrontOrigin ändern.' });
+      return;
+    }
     const [updated] = await db
       .update(company)
       .set({ ...body, updatedAt: new Date() })
       .where(eq(company.slug, slug))
-      .returning();
+      .returning(companyPublicColumns);
     if (!updated) {
       reply.code(404).send({ error: 'Company not found' });
       return;

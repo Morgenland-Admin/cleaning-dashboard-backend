@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 
@@ -17,6 +17,14 @@ const createSchema = z.object({
 
 export const priceAdjustmentsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
+  // Reads stay open to any member; pricing mutations need manager+.
+  const requireManager = app.requireAccess('super_admin', 'admin', 'manager') as (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ) => Promise<void>;
+  app.addHook('preHandler', async (request, reply) => {
+    if (request.method !== 'GET') await requireManager(request, reply);
+  });
 
   app.get('/', async (request) => {
     const { priceAdjustments } = request.company!.tables;

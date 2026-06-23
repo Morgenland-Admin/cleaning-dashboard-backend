@@ -67,8 +67,9 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
     }
     const inviter = request.authUser!;
     const inviterMeta = inviter as unknown as { accessLevel?: string };
+    const isSuperAdmin = inviterMeta.accessLevel === 'super_admin';
 
-    if (inviterMeta.accessLevel !== 'super_admin') {
+    if (!isSuperAdmin) {
       const [m] = await db
         .select()
         .from(membership)
@@ -76,6 +77,15 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
         .limit(1);
       if (!m || (m.role !== 'owner' && m.role !== 'admin')) {
         reply.code(403).send({ error: 'Forbidden — must be owner/admin on this company' });
+        return;
+      }
+      // Privilege ceiling: only a super_admin may mint a global super_admin.
+      // accessLevel is a platform-wide field, so a tenant owner/admin must not
+      // be able to grant it (would bypass every membership check).
+      if (body.accessLevel === 'super_admin') {
+        reply
+          .code(403)
+          .send({ error: 'Forbidden — only a super_admin may grant super_admin access' });
         return;
       }
     }

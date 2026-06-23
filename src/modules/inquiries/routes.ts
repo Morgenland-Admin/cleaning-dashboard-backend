@@ -12,7 +12,9 @@ import {
   contactAckEmail,
   inquiryQuoteEmail,
 } from '../../email/templates.js';
-import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
+import { routeCallback } from '../../lib/geo.js';
+import type { FastifyBaseLogger } from 'fastify';
 
 const submitSchema = z.object({
   name: z.string().min(1).max(120),
@@ -28,6 +30,13 @@ const submitSchema = z.object({
   message: z.string().min(1).max(5000),
   locale: z.string().min(2).max(16).optional(),
   source: z.string().max(64).optional(),
+  /** Service PLZ (where the cleaning happens) — drives geo callback routing. */
+  plz: z
+    .string()
+    .regex(/^\d{5}$/, 'plz must be exactly 5 digits')
+    .optional(),
+  /** Free-text "Grund des Anrufs". */
+  callReason: z.string().max(2000).optional(),
   /**
    * Brand-specific form fields. Each storefront defines its own keys
    * (e.g. carpet material, square meters, pickup vs on-site).
@@ -69,12 +78,171 @@ const updateSchema = z.object({
   metadata: z.record(z.unknown()).optional(),
 });
 
+/** Inquiry fields the post-create side-effects read. */
+export interface CreatedInquiry {
+  id: number;
+  name: string;
+  email: string | null;
+  phone: string | null;
+  service: string | null;
+  message: string;
+  preferredDate: string | null;
+  budget: string | null;
+  plz: string | null;
+  callReason: string | null;
+  callbackOwner: string | null;
+  assignedTo: string | null;
+}
+
+/**
+ * Geo-route a new inquiry by its service PLZ and return the columns to persist.
+ * `human` leads are pinned to the configured default assignee (a plain user
+ * pointer — reps can be added/distributed later without a schema change).
+ * Geo provenance (distance, geocoded?) is stashed under metadata.geo.
+ */
+export function buildCallbackFields(
+  plz: string | null | undefined,
+  callReason: string | null | undefined,
+) {
+  const routing = routeCallback(plz);
+  return {
+    plz: plz ?? null,
+    callReason: callReason ?? null,
+    callbackOwner: routing.callbackOwner,
+    assignedTo:
+      routing.callbackOwner === 'human' ? (env.CALLBACK_DEFAULT_HUMAN_ASSIGNEE_ID ?? null) : null,
+    geoMeta: {
+      distanceKm: routing.distanceKm,
+      geoStatus: routing.geoStatus,
+      routedAt: new Date().toISOString(),
+    },
+  };
+}
+
+/**
+ * Fire-and-forget side-effects after an inquiry is created: customer ack email,
+ * admin inbox email, push, and a dashboard task. Human (Hamburg-area) leads get
+ * a flagged `human_callback` task assigned to their owner; everything else keeps
+ * the standard `inquiry_review` task. Failures are logged, never thrown.
+ */
+export async function notifyInquiryCreated(
+  companySlug: string,
+  row: CreatedInquiry,
+  log: FastifyBaseLogger,
+): Promise<void> {
+  const isHuman = row.callbackOwner === 'human';
+  try {
+    const [companyRow] = await db
+      .select()
+      .from(company)
+      .where(eq(company.slug, companySlug))
+      .limit(1);
+    if (companyRow) {
+      const brand = brandInfoFromCompany(companyRow);
+      // No email (e.g. a voice-AI phone lead) → no customer acknowledgement to send.
+      if (row.email) {
+        await sendEmail({
+          to: row.email,
+          from: brandSender(companyRow),
+          apiKey: companyRow.resendApiKey ?? undefined,
+          replyTo: companyRow.email ?? undefined,
+          email: contactAckEmail({
+            name: row.name,
+            subject: row.service ?? null,
+            message: row.message,
+            brand,
+          }),
+        });
+      }
+      if (companyRow.email) {
+        const details: Array<{ label: string; value: string }> = [];
+        if (row.service) details.push({ label: 'Service', value: row.service });
+        if (row.preferredDate) details.push({ label: 'Wunschtermin', value: row.preferredDate });
+        if (row.budget) details.push({ label: 'Budget', value: row.budget });
+        if (row.phone) details.push({ label: 'Telefon', value: row.phone });
+        if (row.plz) details.push({ label: 'PLZ', value: row.plz });
+        if (row.callReason) details.push({ label: 'Grund des Anrufs', value: row.callReason });
+        const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/inquiries?id=${row.id}`;
+        await sendEmail({
+          to: companyRow.email,
+          from: brandSender(companyRow),
+          apiKey: companyRow.resendApiKey ?? undefined,
+          replyTo: row.email ?? undefined,
+          email: adminInboxNotificationEmail({
+            brand,
+            kind: 'inquiry',
+            fromName: row.name,
+            fromEmail: row.email ?? '—',
+            subject: row.service ?? null,
+            message: row.callReason ?? row.message,
+            adminUrl,
+            details,
+          }),
+        });
+      }
+    }
+  } catch (err) {
+    log.error(
+      { err, inquiryId: row.id, recipientEmail: row.email },
+      'Failed to send inquiry emails',
+    );
+  }
+
+  try {
+    const { sendPushToBrandAdmins } = await import('../../lib/push.js');
+    await sendPushToBrandAdmins(companySlug, {
+      title: isHuman ? `${companySlug} · Rückruf (Hamburg)` : `${companySlug} · Service-Anfrage`,
+      body: `${row.name}${row.service ? ` · ${row.service}` : ''}: ${(row.callReason || row.message || '').slice(0, 120)}`,
+      url: `/inquiries?id=${row.id}`,
+      tag: `inquiry:${row.id}`,
+      brandSlug: companySlug,
+    });
+  } catch (err) {
+    log.warn({ err, inquiryId: row.id }, 'push dispatch failed');
+  }
+
+  try {
+    const { spawnTask } = await import('../../lib/tasks.js');
+    if (isHuman) {
+      const lines = [
+        row.callReason ? `Grund: ${row.callReason}` : null,
+        row.phone ? `Tel: ${row.phone}` : null,
+        row.plz ? `PLZ: ${row.plz}` : null,
+        row.message,
+      ].filter(Boolean);
+      await spawnTask({
+        companySlug,
+        kind: 'human_callback',
+        refKind: 'service_inquiry',
+        refId: row.id,
+        title: `Rückruf (Hamburg-Umkreis) – ${row.name}`,
+        body: lines.join('\n'),
+        priority: 'high',
+        assigneeUserId: row.assignedTo ?? undefined,
+      });
+    } else {
+      await spawnTask({
+        companySlug,
+        kind: 'inquiry_review',
+        refKind: 'service_inquiry',
+        refId: row.id,
+        title: `Anfrage von ${row.name}${row.service ? ` — ${row.service}` : ''}`,
+        body: row.message,
+        priority: 'high',
+      });
+    }
+  } catch (err) {
+    log.warn({ err, inquiryId: row.id }, 'task spawn failed');
+  }
+}
+
 export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
 
   app.post(
     '/',
     {
+      bodyLimit: 64 * 1024,
       config: {
         rateLimit: { max: 5, timeWindow: '1 minute' },
       },
@@ -100,6 +268,10 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
         phone: body.phone,
         marketingOptIn: body.consentMarketing ?? false,
       });
+      const { plz, callReason, callbackOwner, assignedTo, geoMeta } = buildCallbackFields(
+        body.plz,
+        body.callReason,
+      );
       const [row] = await db
         .insert(serviceInquiries)
         .values({
@@ -114,7 +286,11 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
           message: body.message,
           locale: body.locale ?? 'de',
           source: body.source,
-          metadata: body.metadata ?? {},
+          plz,
+          callReason,
+          callbackOwner,
+          assignedTo,
+          metadata: { ...(body.metadata ?? {}), geo: geoMeta },
           attachments: body.attachments ?? [],
           consentPrivacy: body.consentPrivacy,
           consentMarketing: body.consentMarketing ?? false,
@@ -124,86 +300,7 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
         .returning();
 
       if (row) {
-        try {
-          const [companyRow] = await db
-            .select()
-            .from(company)
-            .where(eq(company.slug, request.company!.slug))
-            .limit(1);
-          if (companyRow) {
-            const brand = brandInfoFromCompany(companyRow);
-            await sendEmail({
-              to: row.email,
-              from: brandSender(companyRow),
-              apiKey: companyRow.resendApiKey ?? undefined,
-              replyTo: companyRow.email ?? undefined,
-              email: contactAckEmail({
-                name: row.name,
-                subject: row.service ?? null,
-                message: row.message,
-                brand,
-              }),
-            });
-            if (companyRow.email) {
-              const details: Array<{ label: string; value: string }> = [];
-              if (row.service) details.push({ label: 'Service', value: row.service });
-              if (row.preferredDate)
-                details.push({ label: 'Wunschtermin', value: row.preferredDate });
-              if (row.budget) details.push({ label: 'Budget', value: row.budget });
-              if (row.phone) details.push({ label: 'Telefon', value: row.phone });
-              const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/inquiries?id=${row.id}`;
-              await sendEmail({
-                to: companyRow.email,
-                from: brandSender(companyRow),
-                apiKey: companyRow.resendApiKey ?? undefined,
-                replyTo: row.email,
-                email: adminInboxNotificationEmail({
-                  brand,
-                  kind: 'inquiry',
-                  fromName: row.name,
-                  fromEmail: row.email,
-                  subject: row.service ?? null,
-                  message: row.message,
-                  adminUrl,
-                  details,
-                }),
-              });
-            }
-          }
-        } catch (err) {
-          request.log.error(
-            { err, inquiryId: row.id, recipientEmail: row.email },
-            'Failed to send inquiry emails',
-          );
-        }
-
-        try {
-          const { sendPushToBrandAdmins } = await import('../../lib/push.js');
-          await sendPushToBrandAdmins(request.company!.slug, {
-            title: `${request.company!.slug} · Service-Anfrage`,
-            body: `${row.name}${row.service ? ` · ${row.service}` : ''}: ${(row.message || '').slice(0, 120)}`,
-            url: `/inquiries?id=${row.id}`,
-            tag: `inquiry:${row.id}`,
-            brandSlug: request.company!.slug,
-          });
-        } catch (err) {
-          request.log.warn({ err, inquiryId: row.id }, 'push dispatch failed');
-        }
-
-        try {
-          const { spawnTask } = await import('../../lib/tasks.js');
-          await spawnTask({
-            companySlug: request.company!.slug,
-            kind: 'inquiry_review',
-            refKind: 'service_inquiry',
-            refId: row.id,
-            title: `Anfrage von ${row.name}${row.service ? ` — ${row.service}` : ''}`,
-            body: row.message,
-            priority: 'high',
-          });
-        } catch (err) {
-          request.log.warn({ err, inquiryId: row.id }, 'task spawn failed');
-        }
+        await notifyInquiryCreated(request.company!.slug, row, request.log);
       }
 
       reply.code(201);
@@ -327,6 +424,8 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(serviceInquiries.id, id))
       .limit(1);
     if (!inquiry) throw notFound('Inquiry not found');
+    // A quote is delivered by email; phone-only leads have nothing to send to.
+    if (!inquiry.email) throw badRequest('Inquiry has no email address to send a quote to');
 
     const [adminRow] = await db
       .select({ name: user.name })
@@ -383,22 +482,33 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
   // Inquiries due a follow-up call: still untouched, reachable by phone, privacy
   // consent given, past the wait window but not stale, under the attempt cap and
   // not opted out. Brand-scoped via the X-Company-Slug from requireCompany.
+  //
+  // The AI must never call a lead a human should handle, so this defaults to
+  // EXCLUDING human-owned leads (callback_owner ai, plus legacy NULLs that
+  // predate routing). Pass ?callbackOwner=ai|human to filter explicitly.
   const callbackQueueSchema = z.object({
     minAgeHours: z.coerce.number().min(0).max(720).default(24),
     maxAgeDays: z.coerce.number().min(1).max(90).default(14),
     maxAttempts: z.coerce.number().int().min(1).max(10).default(3),
     limit: z.coerce.number().int().min(1).max(200).default(50),
+    callbackOwner: z.enum(['ai', 'human']).optional(),
   });
   app.get('/callback-queue', async (request) => {
-    const { minAgeHours, maxAgeDays, maxAttempts, limit } = callbackQueueSchema.parse(
-      request.query,
-    );
+    const { minAgeHours, maxAgeDays, maxAttempts, limit, callbackOwner } =
+      callbackQueueSchema.parse(request.query);
     const { serviceInquiries: si } = request.company!.tables;
 
     const now = Date.now();
     const newestCreatedAt = new Date(now - minAgeHours * 3_600_000).toISOString();
     const oldestCreatedAt = new Date(now - maxAgeDays * 86_400_000).toISOString();
     const attempts = sql<number>`coalesce((${si.metadata}->'callback'->>'attempts')::int, 0)`;
+
+    const ownerFilter =
+      callbackOwner === 'ai'
+        ? sql`${si.callbackOwner} = 'ai'`
+        : callbackOwner === 'human'
+          ? sql`${si.callbackOwner} = 'human'`
+          : sql`${si.callbackOwner} is distinct from 'human'`;
 
     const inquiries = await db
       .select({
@@ -408,6 +518,9 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
         email: si.email,
         service: si.service,
         message: si.message,
+        plz: si.plz,
+        callReason: si.callReason,
+        callbackOwner: si.callbackOwner,
         preferredDate: si.preferredDate,
         locale: si.locale,
         priority: si.priority,
@@ -425,12 +538,60 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
           sql`${si.createdAt} >= ${oldestCreatedAt}::timestamptz`,
           sql`${attempts} < ${maxAttempts}`,
           sql`coalesce(${si.metadata}->'callback'->>'lastOutcome', '') <> 'opted_out'`,
+          ownerFilter,
         ),
       )
       .orderBy(asc(si.createdAt), asc(si.id))
       .limit(limit);
 
     return { inquiries };
+  });
+
+  // Human (Hamburg-area) callbacks for the dashboard. Unlike the AI queue this
+  // has no wait window / attempt cap — a person works the list directly. Each
+  // entry carries everything the assignee needs and is flagged for the UI.
+  // The assignee marks it done via the existing PATCH /:id status change.
+  const humanCallbackSchema = z.object({
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+    assignedTo: z.string().min(1).max(64).optional(),
+    // Not z.coerce.boolean() — "false" would coerce to true.
+    includeClosed: z
+      .enum(['true', 'false'])
+      .transform((v) => v === 'true')
+      .default('false'),
+  });
+  app.get('/human-callback-queue', async (request) => {
+    const { limit, assignedTo, includeClosed } = humanCallbackSchema.parse(request.query);
+    const { serviceInquiries: si } = request.company!.tables;
+    const brand = request.company!.slug;
+
+    const filters = [eq(si.callbackOwner, 'human')];
+    if (!includeClosed) filters.push(eq(si.status, 'new'));
+    if (assignedTo) filters.push(eq(si.assignedTo, assignedTo));
+
+    const rows = await db
+      .select({
+        id: si.id,
+        name: si.name,
+        phone: si.phone,
+        email: si.email,
+        callReason: si.callReason,
+        plz: si.plz,
+        service: si.service,
+        message: si.message,
+        status: si.status,
+        assignedTo: si.assignedTo,
+        priority: si.priority,
+        createdAt: si.createdAt,
+      })
+      .from(si)
+      .where(and(...filters))
+      .orderBy(asc(si.createdAt), asc(si.id))
+      .limit(limit);
+
+    return {
+      inquiries: rows.map((r) => ({ ...r, brand, flag: 'Human callback – Hamburg area' })),
+    };
   });
 
   // Records a call outcome: appends a timestamped note, bumps the attempt count,

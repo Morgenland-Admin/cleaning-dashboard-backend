@@ -6,10 +6,9 @@ import { db } from '../../db/index.js';
 import { company } from '../../db/schema/shared.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { notFound, parseIntId } from '../../lib/http-errors.js';
-import { formatEurFromCents } from '../../lib/pricing.js';
-import { renderInvoicePdf } from '../../lib/invoice-pdf.js';
-import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
-import { invoiceEmail } from '../../email/templates.js';
+import { sendDunningEmail } from '../../lib/dunning.js';
+import { sendInvoiceEmail } from './send-invoice.js';
+import { nextInvoiceNumber } from './number.js';
 
 const lineItemSchema = z.object({
   label: z.string().min(1).max(200),
@@ -83,11 +82,6 @@ const listQuerySchema = z.object({
     .optional(),
 });
 
-function invoiceNumber(id: number): string {
-  const year = new Date().getUTCFullYear();
-  return `INV-${year}-${String(id).padStart(6, '0')}`;
-}
-
 function computeTaxCents(subtotalCents: number, taxRatePercent: number): number {
   return Math.round((subtotalCents * taxRatePercent) / 100);
 }
@@ -152,6 +146,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const taxCents = computeTaxCents(subtotalCents, body.taxRatePercent);
     const totalCents = subtotalCents + taxCents;
     const invoice = await db.transaction(async (tx) => {
+      // Drafts carry no number — it's assigned from the gapless sequence at issue.
       const [row] = await tx
         .insert(invoices)
         .values({
@@ -177,11 +172,6 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           status: 'draft',
         })
         .returning();
-      const [withNumber] = await tx
-        .update(invoices)
-        .set({ number: invoiceNumber(row!.id) })
-        .where(eq(invoices.id, row!.id))
-        .returning();
       await tx.insert(invoiceStatusLog).values({
         invoiceId: row!.id,
         fromStatus: null,
@@ -189,7 +179,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         changedByUserId: adminId,
         reason: 'Rechnung erstellt',
       });
-      return withNumber!;
+      return row!;
     });
     reply.code(201).send({ invoice });
   });
@@ -278,24 +268,31 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         });
         return;
       }
-      // dueAt is set once at first issue; re-sends never move it.
+      // dueAt is set once at first issue; re-sends never move it. The gapless
+      // invoice number is assigned here (issue time), in the same transaction.
       const dueAt = new Date(now.getTime() + current.paymentTermsDays * 24 * 60 * 60 * 1000);
-      const [issued] = await db
-        .update(invoices)
-        .set({ status: 'sent', sentAt: now, dueAt, updatedAt: now })
-        .where(and(eq(invoices.id, id), eq(invoices.status, 'draft')))
-        .returning();
+      const issued = await db.transaction(async (tx) => {
+        const number =
+          current.number ?? (await nextInvoiceNumber(tx, request.company!.tables, now));
+        const [r] = await tx
+          .update(invoices)
+          .set({ status: 'sent', number, sentAt: now, dueAt, updatedAt: now })
+          .where(and(eq(invoices.id, id), eq(invoices.status, 'draft')))
+          .returning();
+        if (!r) return null;
+        await tx.insert(invoiceStatusLog).values({
+          invoiceId: id,
+          fromStatus: 'draft',
+          toStatus: 'sent',
+          changedByUserId: adminId,
+          reason: 'Rechnung ausgestellt & versendet',
+        });
+        return r;
+      });
       if (!issued) {
         reply.code(409).send({ error: 'Rechnung wurde zwischenzeitlich geändert.' });
         return;
       }
-      await db.insert(invoiceStatusLog).values({
-        invoiceId: id,
-        fromStatus: 'draft',
-        toStatus: 'sent',
-        changedByUserId: adminId,
-        reason: 'Rechnung ausgestellt & versendet',
-      });
       row = issued;
     } else {
       // sent/overdue: re-send the unchanged document.
@@ -307,8 +304,6 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         reason: 'Rechnung erneut versendet',
       });
     }
-    const dueAt = row.dueAt ?? now;
-
     // Email the invoice to the recipient via the brand's Resend account.
     // Best-effort: a mail failure must not undo the "sent" transition.
     let emailSent = false;
@@ -321,108 +316,9 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           .where(eq(company.slug, request.company!.slug))
           .limit(1);
         if (companyRow) {
-          const fmtDate = (d: Date) =>
-            d.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
-          const fmtDateStr = (s: string) => {
-            const [y, m, d] = s.split('-');
-            return y && m && d ? `${d}.${m}.${y}` : s;
-          };
-          const taxRate = row.taxCents > 0 ? row.taxRatePercent : 0;
-          const addressLines = [
-            companyRow.addressLine1,
-            companyRow.addressLine2,
-            [companyRow.postalCode, companyRow.city].filter(Boolean).join(' ') || null,
-          ].filter((x): x is string => Boolean(x));
-
-          // Shared, pre-formatted values — used by both the HTML email and the PDF.
-          const invoiceNumber = row.number ?? `#${row.id}`;
-          const invoiceDate = fmtDate(row.sentAt ?? now);
-          const dueDate = fmtDate(dueAt);
-          const serviceDateLabel = row.serviceDate
-            ? row.serviceDateEnd
-              ? `${fmtDateStr(row.serviceDate)} – ${fmtDateStr(row.serviceDateEnd)}`
-              : fmtDateStr(row.serviceDate)
-            : null;
-          const recipientAddressLines = [
-            row.recipientAddressLine1,
-            row.recipientAddressLine2,
-            [row.recipientPostalCode, row.recipientCity].filter(Boolean).join(' ') || null,
-          ].filter((x): x is string => Boolean(x));
-          const taxFormatted = row.taxCents > 0 ? formatEurFromCents(row.taxCents) : null;
-          const taxRateLabel = taxRate > 0 ? `${taxRate} %` : null;
-          const subtotalFormatted = formatEurFromCents(row.subtotalCents);
-          const totalFormatted = formatEurFromCents(row.totalCents);
-          const lineItems = row.lineItems.map((li) => ({
-            label: li.label,
-            quantity: li.quantity.toLocaleString('de-DE'),
-            unitPrice: formatEurFromCents(li.unitPriceCents),
-            lineTotal: formatEurFromCents(Math.round(li.quantity * li.unitPriceCents)),
-          }));
-          const seller = {
-            name: companyRow.legalName ?? companyRow.name,
-            addressLines,
-            vatId: companyRow.vatId,
-            registrationNumber: companyRow.registrationNumber,
-            email: companyRow.email,
-            phone: companyRow.phone,
-          };
-
-          // Render the PDF attachment (best-effort — fall back to HTML-only).
-          let attachments: Array<{ filename: string; content: Buffer }> | undefined;
-          try {
-            const pdf = await renderInvoicePdf({
-              brandName: companyRow.name,
-              invoiceNumber,
-              invoiceDate,
-              dueDate,
-              paymentTermsDays: row.paymentTermsDays,
-              recipientName: row.recipientName,
-              recipientEmail: row.recipientEmail,
-              recipientAddressLines,
-              serviceDateLabel,
-              lineItems,
-              subtotal: subtotalFormatted,
-              tax: taxFormatted,
-              taxRateLabel,
-              total: totalFormatted,
-              notes: row.notes,
-              accentColor: companyRow.primaryColor ?? '#bd5b3e',
-              seller,
-            });
-            attachments = [{ filename: `Rechnung-${invoiceNumber}.pdf`, content: pdf }];
-          } catch (err) {
-            request.log.error({ err, invoiceId: id }, 'Failed to render invoice PDF');
-          }
-
-          const result = await sendEmail({
-            to: row.recipientEmail,
-            from: brandSender(companyRow),
-            apiKey: companyRow.resendApiKey ?? undefined,
-            replyTo: companyRow.email ?? undefined,
-            attachments,
-            email: invoiceEmail({
-              brand: brandInfoFromCompany(companyRow),
-              recipientName: row.recipientName,
-              invoiceNumber,
-              invoiceDateFormatted: invoiceDate,
-              dueDateFormatted: dueDate,
-              paymentTermsDays: row.paymentTermsDays,
-              lineItems: lineItems.map((li) => ({
-                label: li.label,
-                quantityLabel: li.quantity,
-                unitPriceFormatted: li.unitPrice,
-                lineTotalFormatted: li.lineTotal,
-              })),
-              subtotalFormatted,
-              taxFormatted,
-              taxRateLabel,
-              totalFormatted,
-              notes: row.notes,
-              seller,
-            }),
-          });
-          emailSent = result.ok && !result.skipped;
-          emailSkipped = result.skipped ?? false;
+          const res = await sendInvoiceEmail(companyRow, row, request.log);
+          emailSent = res.ok;
+          emailSkipped = res.skipped;
         }
       } catch (err) {
         request.log.error({ err, invoiceId: id }, 'Failed to send invoice email');
@@ -498,7 +394,24 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       changedByUserId: request.authUser!.id,
       reason: `Mahnstufe ${row.dunningLevel}`,
     });
-    return { invoice: row };
+
+    let emailSent = false;
+    let emailSkipped = false;
+    try {
+      const [companyRow] = await db
+        .select()
+        .from(company)
+        .where(eq(company.slug, request.company!.slug))
+        .limit(1);
+      if (companyRow) {
+        const res = await sendDunningEmail(companyRow, row);
+        emailSent = res.ok;
+        emailSkipped = res.skipped;
+      }
+    } catch (err) {
+      request.log.error({ err, invoiceId: id }, 'Failed to send dunning email');
+    }
+    return { invoice: row, emailSent, emailSkipped };
   });
 
   /** GoBD audit trail for one invoice. */

@@ -8,3 +8,6 @@ package-lock.json
 pnpm-lock.yaml
 .env
 .env.*
+# Generated PLZ centroid table + its source data (see scripts/gen-plz-centroids.mjs)
+src/lib/plz-centroids.generated.ts
+src/lib/data

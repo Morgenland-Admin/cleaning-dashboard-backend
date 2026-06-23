@@ -1331,6 +1331,27 @@ async function finalizePaidOrder(
 
   await aggregateCustomerOnPaid(app, tables, order, paidTotal, now);
 
+  // Auto-create the draft invoice for this paid order (idempotent, best-effort).
+  // Replaces the n8n ALL_12 creator; a mail/render failure never blocks it.
+  try {
+    const { autoCreateInvoiceForPaidOrder } = await import('../invoices/auto-invoice.js');
+    const res = await autoCreateInvoiceForPaidOrder(tables, order, companySlug, app.log);
+    if (res.created) {
+      app.log.info(
+        {
+          orderId,
+          invoiceId: res.invoiceId,
+          number: res.number,
+          issued: res.issued,
+          emailed: res.emailed,
+        },
+        'Auto-created invoice for paid order',
+      );
+    }
+  } catch (err) {
+    app.log.error({ err, orderId, companySlug }, 'Failed to auto-create invoice for paid order');
+  }
+
   try {
     const items = await db
       .select()
@@ -1522,26 +1543,31 @@ async function markAfterServicePaid(
       'Payment received on a cancelled order — refund required',
     );
     const now = new Date();
-    const claimedRows = await db
-      .update(tables.orders)
-      .set({
-        paidAt: now,
-        paymentMethod: 'credit_card',
-        stripePaymentIntentId:
-          typeof session.payment_intent === 'string' ? session.payment_intent : null,
-        updatedAt: now,
-      })
-      .where(and(eq(tables.orders.id, orderId), isNull(tables.orders.paidAt)))
-      .returning({ id: tables.orders.id });
-    // Log only on a successful claim so webhook retries don't duplicate it.
-    if (claimedRows.length > 0) {
-      await db.insert(tables.orderStatusLog).values({
-        orderId,
-        fromStatus: order.status,
-        toStatus: order.status,
-        reason: '⚠ Zahlung auf stornierten Auftrag eingegangen — Rückerstattung erforderlich',
-      });
-    }
+    // Single transaction so the money-claim and its audit note can't diverge
+    // if the process dies between them — this is exactly the case where the
+    // "refund required" note must not be lost.
+    await db.transaction(async (tx) => {
+      const claimedRows = await tx
+        .update(tables.orders)
+        .set({
+          paidAt: now,
+          paymentMethod: 'credit_card',
+          stripePaymentIntentId:
+            typeof session.payment_intent === 'string' ? session.payment_intent : null,
+          updatedAt: now,
+        })
+        .where(and(eq(tables.orders.id, orderId), isNull(tables.orders.paidAt)))
+        .returning({ id: tables.orders.id });
+      // Log only on a successful claim so webhook retries don't duplicate it.
+      if (claimedRows.length > 0) {
+        await tx.insert(tables.orderStatusLog).values({
+          orderId,
+          fromStatus: order.status,
+          toStatus: order.status,
+          reason: '⚠ Zahlung auf stornierten Auftrag eingegangen — Rückerstattung erforderlich',
+        });
+      }
+    });
     return;
   }
 
@@ -1930,6 +1956,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     const { orders, orderStatusLog } = request.company!.tables;
     const adminId = request.authUser!.id;
     const now = new Date();
+
+    // Advancing an order's status is an operational write — viewers are read-only.
+    const callerLevel = accessLevelOf(request);
+    if (!callerLevel || !PRIVILEGED_LEVELS.has(callerLevel)) {
+      reply.code(403).send({ error: 'Nur Manager/Admin dürfen den Auftragsstatus ändern.' });
+      return;
+    }
 
     const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
     if (!row) {

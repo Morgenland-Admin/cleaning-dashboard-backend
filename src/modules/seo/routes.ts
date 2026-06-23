@@ -3,8 +3,11 @@ import { and, asc, desc, eq, inArray, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
+import { env } from '../../config/env.js';
+import { loadCompany } from '../../lib/company-loader.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
+import { sanitizeHtml } from '../../lib/sanitize-html.js';
 
 const PATH_RE = /^[a-z0-9][a-z0-9/_-]{0,299}$/;
 
@@ -125,7 +128,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
         metaTitle: body.metaTitle,
         metaDescription: body.metaDescription,
         h1: body.h1,
-        bodyHtml: body.bodyHtml,
+        bodyHtml: body.bodyHtml != null ? sanitizeHtml(body.bodyHtml) : body.bodyHtml,
         schemaJsonld: body.schemaJsonld ?? null,
         faq: body.faq ?? [],
         status: body.status,
@@ -150,7 +153,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
       metaTitle: p.metaTitle,
       metaDescription: p.metaDescription,
       h1: p.h1,
-      bodyHtml: p.bodyHtml,
+      bodyHtml: p.bodyHtml != null ? sanitizeHtml(p.bodyHtml) : p.bodyHtml,
       schemaJsonld: p.schemaJsonld ?? null,
       faq: p.faq ?? [],
       status: p.status, // defaults to 'draft'
@@ -224,6 +227,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     ] as const) {
       if (body[k] !== undefined) patch[k] = body[k];
     }
+    if (typeof patch.bodyHtml === 'string') patch.bodyHtml = sanitizeHtml(patch.bodyHtml);
     if (body.schemaJsonld !== undefined) patch.schemaJsonld = body.schemaJsonld;
     if (body.faq !== undefined) patch.faq = body.faq;
     if (body.gscPosition !== undefined) patch.gscPosition = body.gscPosition.toFixed(2);
@@ -243,6 +247,15 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
 
 const PUBLIC_STATUSES = ['live', 'protected'] as const;
 
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
 
@@ -254,6 +267,46 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
       .where(inArray(seoPages.status, [...PUBLIC_STATUSES]))
       .orderBy(asc(seoPages.path));
     return { pages: rows };
+  });
+
+  /**
+   * Brand-aware XML sitemap of every published page, ready for the storefront to
+   * serve at /sitemap.xml (proxy or rewrite). Absolute URLs are built from the
+   * brand's storefrontOrigin so each tenant gets its own canonical host. The
+   * storefront renders these at /seo/<path>, so that's the URL shape emitted.
+   */
+  app.get('/sitemap.xml', async (request, reply) => {
+    const { seoPages } = request.company!.tables;
+    const companyRow = await loadCompany(request.company!.slug);
+    const origin = (companyRow?.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '');
+    // Sitemaps cap at 50k URLs per the spec. Cap the query and log if we hit it
+    // (a future split into a sitemap index would be the next step).
+    const SITEMAP_MAX = 50_000;
+    const rows = await db
+      .select({ path: seoPages.path, updatedAt: seoPages.updatedAt })
+      .from(seoPages)
+      .where(inArray(seoPages.status, [...PUBLIC_STATUSES]))
+      .orderBy(asc(seoPages.path))
+      .limit(SITEMAP_MAX + 1);
+    if (rows.length > SITEMAP_MAX) {
+      request.log.warn(
+        { company: request.company!.slug },
+        `SEO sitemap exceeds ${SITEMAP_MAX} URLs — truncated; split into a sitemap index.`,
+      );
+      rows.length = SITEMAP_MAX;
+    }
+    const urls = rows
+      .map((r) => {
+        const loc = escapeXml(`${origin}/seo/${r.path}`);
+        const lastmod = r.updatedAt.toISOString().slice(0, 10);
+        return `  <url>\n    <loc>${loc}</loc>\n    <lastmod>${lastmod}</lastmod>\n  </url>`;
+      })
+      .join('\n');
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`;
+    reply
+      .header('content-type', 'application/xml; charset=utf-8')
+      .header('cache-control', 'public, max-age=3600')
+      .send(xml);
   });
 
   app.get('/*', async (request, reply) => {

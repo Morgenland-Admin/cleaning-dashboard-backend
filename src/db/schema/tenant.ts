@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import {
   boolean,
   date,
@@ -98,7 +99,8 @@ function buildTenantTables(schemaName: string) {
       id: serial('id').primaryKey(),
       customerId: integer('customer_id'),
       name: text('name').notNull(),
-      email: text('email').notNull(),
+      // Nullable: voice-AI phone leads often have no email (phone is the contact).
+      email: text('email'),
       phone: varchar('phone', { length: 32 }),
       service: text('service'),
       propertyDetails: text('property_details'),
@@ -109,6 +111,16 @@ function buildTenantTables(schemaName: string) {
       source: varchar('source', { length: 64 }),
       status: varchar('status', { length: 16 }).notNull().default('new'),
       priority: varchar('priority', { length: 16 }).notNull().default('normal'),
+      // Service PLZ (where the cleaning happens) — drives geo callback routing.
+      plz: varchar('plz', { length: 5 }),
+      // Free-text "Grund des Anrufs" captured by the inbound voice-AI.
+      callReason: text('call_reason'),
+      // Geo routing: 'human' (within radius of Hamburg) | 'ai' (warm-callback
+      // queue). Null on legacy rows created before routing existed.
+      callbackOwner: varchar('callback_owner', { length: 8 }),
+      // User who owns a human callback. A plain user pointer (not a "Kabir"
+      // flag) so leads can be distributed across reps without a schema change.
+      assignedTo: text('assigned_to'),
       consentPrivacy: boolean('consent_privacy').notNull().default(false),
       consentMarketing: boolean('consent_marketing').notNull().default(false),
       handledByUserId: text('handled_by_user_id'),
@@ -129,6 +141,7 @@ function buildTenantTables(schemaName: string) {
     },
     (table) => ({
       createdAtIdx: index('service_inquiries_created_at_idx').on(table.createdAt),
+      callbackOwnerIdx: index('service_inquiries_callback_owner_idx').on(table.callbackOwner),
     }),
   );
 
@@ -470,6 +483,13 @@ function buildTenantTables(schemaName: string) {
     (table) => ({
       statusIdx: index('invoices_status_idx').on(table.status),
       dueIdx: index('invoices_due_idx').on(table.dueAt),
+      statusDueIdx: index('invoices_status_due_idx').on(table.status, table.dueAt),
+      orderIdUnique: uniqueIndex('invoices_order_id_unique')
+        .on(table.orderId)
+        .where(sql`${table.orderId} IS NOT NULL`),
+      numberUnique: uniqueIndex('invoices_number_unique')
+        .on(table.number)
+        .where(sql`${table.number} IS NOT NULL`),
     }),
   );
 
@@ -491,6 +511,13 @@ function buildTenantTables(schemaName: string) {
       invoiceIdx: index('invoice_status_log_invoice_id_idx').on(table.invoiceId),
     }),
   );
+
+  // Gapless per-year invoice number sequence (one counter row per year, per
+  // tenant). Incremented at ISSUE time so abandoned drafts never burn a number.
+  const invoiceCounters = s.table('invoice_counters', {
+    year: integer('year').primaryKey(),
+    nextValue: integer('next_value').notNull().default(0),
+  });
 
   const cityStatus = s.table(
     'city_status',
@@ -579,6 +606,7 @@ function buildTenantTables(schemaName: string) {
     subscriptions,
     invoices,
     invoiceStatusLog,
+    invoiceCounters,
     cityStatus,
     priceAdjustments,
     seoPages,
@@ -693,7 +721,7 @@ CREATE TABLE IF NOT EXISTS ${q}."service_inquiries" (
   "id" serial PRIMARY KEY NOT NULL,
   "customer_id" integer,
   "name" text NOT NULL,
-  "email" text NOT NULL,
+  "email" text,
   "phone" varchar(32),
   "service" text,
   "property_details" text,
@@ -704,6 +732,10 @@ CREATE TABLE IF NOT EXISTS ${q}."service_inquiries" (
   "source" varchar(64),
   "status" varchar(16) DEFAULT 'new' NOT NULL,
   "priority" varchar(16) DEFAULT 'normal' NOT NULL,
+  "plz" varchar(5),
+  "call_reason" text,
+  "callback_owner" varchar(8),
+  "assigned_to" text,
   "consent_privacy" boolean DEFAULT false NOT NULL,
   "consent_marketing" boolean DEFAULT false NOT NULL,
   "handled_by_user_id" text,
@@ -1020,6 +1052,18 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
 );
 CREATE INDEX IF NOT EXISTS "invoices_status_idx" ON ${q}."invoices" ("status");
 CREATE INDEX IF NOT EXISTS "invoices_due_idx" ON ${q}."invoices" ("due_at");
+-- One invoice per order (manual invoices may have a null order_id → partial).
+CREATE UNIQUE INDEX IF NOT EXISTS "invoices_order_id_unique" ON ${q}."invoices" ("order_id") WHERE "order_id" IS NOT NULL;
+-- Invoice numbers must be unique once assigned (drafts stay null until issued).
+CREATE UNIQUE INDEX IF NOT EXISTS "invoices_number_unique" ON ${q}."invoices" ("number") WHERE "number" IS NOT NULL;
+-- Dunning sweep filters status + due_at together.
+CREATE INDEX IF NOT EXISTS "invoices_status_due_idx" ON ${q}."invoices" ("status", "due_at");
+
+-- Gapless per-year invoice number sequence.
+CREATE TABLE IF NOT EXISTS ${q}."invoice_counters" (
+  "year" integer PRIMARY KEY NOT NULL,
+  "next_value" integer DEFAULT 0 NOT NULL
+);
 
 -- §14 UStG fields for schemas predating these columns.
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_address_line1" text;
@@ -1118,6 +1162,17 @@ CREATE INDEX IF NOT EXISTS "orders_customer_id_idx" ON ${q}."orders" ("customer_
 CREATE INDEX IF NOT EXISTS "service_inquiries_customer_id_idx" ON ${q}."service_inquiries" ("customer_id");
 CREATE INDEX IF NOT EXISTS "contact_messages_customer_id_idx" ON ${q}."contact_messages" ("customer_id");
 CREATE INDEX IF NOT EXISTS "newsletter_subscribers_customer_id_idx" ON ${q}."newsletter_subscribers" ("customer_id");
+
+-- ── Voice-AI / callback geo-routing: service PLZ, call reason, human|ai split ──
+-- Self-healing for schemas predating these columns (idempotent).
+ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "plz" varchar(5);
+ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "call_reason" text;
+ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "callback_owner" varchar(8);
+ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "assigned_to" text;
+-- Phone leads (voice-AI) have no email; relax the legacy NOT NULL constraint.
+ALTER TABLE ${q}."service_inquiries" ALTER COLUMN "email" DROP NOT NULL;
+-- Index AFTER the ALTER above or the batch aborts on legacy schemas.
+CREATE INDEX IF NOT EXISTS "service_inquiries_callback_owner_idx" ON ${q}."service_inquiries" ("callback_owner");
 
 -- Backfill: every email across the source tables becomes a customer (lower-cased,
 -- de-duplicated). ON CONFLICT keeps the existing row — never overwrites manual edits.

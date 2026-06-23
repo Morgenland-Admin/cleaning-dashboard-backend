@@ -10,6 +10,7 @@ import { sendPushToUser } from './push.js';
 export type TaskKind =
   | 'contact_review'
   | 'inquiry_review'
+  | 'human_callback'
   | 'order_dispute'
   | 'order_cancellation'
   | 'bad_review_followup'

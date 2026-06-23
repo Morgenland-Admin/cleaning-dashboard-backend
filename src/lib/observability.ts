@@ -23,7 +23,14 @@ export async function initObservability(): Promise<boolean> {
     });
     sentry = mod;
     return true;
-  } catch {
+  } catch (err) {
+    // A DSN is configured but the SDK couldn't load — surface it loudly instead
+    // of silently running with no error tracking on a payments backend.
+    console.error(
+      '[observability] SENTRY_DSN is set but @sentry/node failed to load — ' +
+        'error tracking is DISABLED. Run `pnpm add @sentry/node` or unset SENTRY_DSN.',
+      err,
+    );
     return false;
   }
 }

@@ -13,6 +13,9 @@ export function getStripe(): Stripe {
   cached = new Stripe(env.STRIPE_SECRET_KEY, {
     apiVersion: '2026-04-22.dahlia',
     typescript: true,
+    // Don't let a hung Stripe call tie up a request + pool connection.
+    timeout: 10_000,
+    maxNetworkRetries: 2,
   });
   return cached;
 }

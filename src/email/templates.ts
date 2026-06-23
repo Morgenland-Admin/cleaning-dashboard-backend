@@ -604,6 +604,112 @@ export function invoiceEmail(opts: {
 }
 
 /**
+ * Payment reminder / dunning notice. The tone escalates with `dunningLevel`:
+ *   1 → freundliche Zahlungserinnerung
+ *   2 → 1. Mahnung
+ *   3+ → 2. Mahnung (letzte außergerichtliche Aufforderung)
+ * Sent from the brand's own sender; references the already-issued invoice.
+ */
+export function dunningEmail(opts: {
+  brand: BrandInfo;
+  recipientName: string;
+  invoiceNumber: string;
+  invoiceDateFormatted: string | null;
+  dueDateFormatted: string | null;
+  totalFormatted: string;
+  dunningLevel: number;
+  daysOverdue: number;
+  seller: {
+    name: string;
+    addressLines: string[];
+    vatId?: string | null;
+    email?: string | null;
+    phone?: string | null;
+  };
+}): RenderedEmail {
+  const level = Math.max(1, opts.dunningLevel);
+  const heading = level === 1 ? 'Zahlungserinnerung' : level === 2 ? '1. Mahnung' : '2. Mahnung';
+  const intro =
+    level === 1
+      ? `unsere Rechnung <strong>${escapeHtml(opts.invoiceNumber)}</strong> ist noch offen. Vermutlich ist sie im Alltag untergegangen – das passiert. Wir möchten Sie daher freundlich an die Zahlung erinnern.`
+      : level === 2
+        ? `trotz unserer Erinnerung konnten wir zur Rechnung <strong>${escapeHtml(opts.invoiceNumber)}</strong> noch keinen Zahlungseingang feststellen. Wir bitten Sie, den offenen Betrag nun zeitnah zu begleichen.`
+        : `zur Rechnung <strong>${escapeHtml(opts.invoiceNumber)}</strong> ist trotz Mahnung weiterhin kein Zahlungseingang verzeichnet. Wir fordern Sie hiermit letztmalig zur Zahlung auf, bevor wir weitere Schritte einleiten.`;
+
+  const overdueLine =
+    opts.daysOverdue > 0
+      ? `Die Rechnung ist seit <strong>${opts.daysOverdue} Tagen</strong> überfällig${
+          opts.dueDateFormatted ? ` (fällig war der ${escapeHtml(opts.dueDateFormatted)})` : ''
+        }.`
+      : opts.dueDateFormatted
+        ? `Fällig war der <strong>${escapeHtml(opts.dueDateFormatted)}</strong>.`
+        : '';
+
+  const sellerLines = [
+    `<strong>${escapeHtml(opts.seller.name)}</strong>`,
+    ...opts.seller.addressLines.map(escapeHtml),
+    opts.seller.vatId ? `USt-IdNr.: ${escapeHtml(opts.seller.vatId)}` : '',
+    opts.seller.email ? `E-Mail: ${escapeHtml(opts.seller.email)}` : '',
+    opts.seller.phone ? `Tel.: ${escapeHtml(opts.seller.phone)}` : '',
+  ]
+    .filter(Boolean)
+    .join('<br />');
+
+  return {
+    subject: `${heading} zu Rechnung ${opts.invoiceNumber} · ${opts.brand.name}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `${heading}: Rechnung ${opts.invoiceNumber} über ${opts.totalFormatted} ist offen.`,
+      contentHtml: `
+        <p style="margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">${escapeHtml(heading)}</p>
+        <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.recipientName)},</p>
+        <p style="margin:0 0 16px;">${intro}</p>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 16px;">
+          <tr>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsnummer</td>
+            <td style="font-size:13px;font-family:monospace;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceNumber)}</td>
+          </tr>
+          ${
+            opts.invoiceDateFormatted
+              ? `<tr>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsdatum</td>
+            <td style="font-size:13px;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceDateFormatted)}</td>
+          </tr>`
+              : ''
+          }
+          <tr>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:6px 0 2px;">Offener Betrag</td>
+            <td style="font-size:16px;font-weight:700;text-align:right;padding:6px 0 2px;white-space:nowrap;">${escapeHtml(opts.totalFormatted)}</td>
+          </tr>
+        </table>
+
+        ${overdueLine ? `<p style="margin:0 0 16px;font-size:14px;">${overdueLine}</p>` : ''}
+
+        <p style="margin:0 0 16px;font-size:14px;">
+          Bitte überweisen Sie den offenen Betrag unter Angabe der Rechnungsnummer.
+          Sollten Sie die Zahlung bereits veranlasst haben, betrachten Sie dieses Schreiben als gegenstandslos.
+        </p>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e2d3b6;">
+          <tr>
+            <td style="padding:16px 0 0;font-size:12px;color:#6b5b48;line-height:1.6;">
+              <span style="text-transform:uppercase;letter-spacing:1px;font-size:11px;">Rechnungssteller</span><br />
+              ${sellerLines}
+            </td>
+          </tr>
+        </table>
+
+        <p style="margin:20px 0 0;font-size:12px;color:#6b5b48;">
+          Bei Fragen oder wenn Sie eine Ratenzahlung wünschen, antworten Sie einfach auf diese E-Mail.
+        </p>
+      `,
+      footerNote: `${heading} von ${opts.brand.name} · ${opts.brand.domain}.`,
+    }),
+  };
+}
+
+/**
  * Internal admin notification — fires alongside the customer confirmation so
  * the operations inbox sees a new paid order without having to refresh the
  * dashboard. Mirrors adminInboxNotificationEmail for contact / inquiry.
