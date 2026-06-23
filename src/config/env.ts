@@ -50,6 +50,11 @@ const envSchema = z.object({
   VAPID_SUBJECT: z.string().default('mailto:admin@reinigungs-portal.com'),
   SENTRY_DSN: optionalString,
 
+  // Claude text assistant. Key unset ⇒ /admin/ai/* returns 503 (UI shows a hint).
+  ANTHROPIC_API_KEY: optionalString,
+  ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-6'),
+  ANTHROPIC_MAX_TOKENS: z.coerce.number().int().positive().max(8192).default(1024),
+
   // ── Voice-AI / callback geo-routing ──
   // Reference point and radius for splitting inquiries between a human callback
   // (within radius) and the automated AI warm-callback queue (outside). Both are
