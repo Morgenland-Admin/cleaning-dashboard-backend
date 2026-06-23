@@ -13,6 +13,11 @@ const ADMIN_LAST = process.env.ADMIN_LAST_NAME ?? '';
 const N8N_EMAIL = process.env.N8N_ROBOT_EMAIL ?? 'n8n@morgenland-teppiche.de';
 const N8N_PASSWORD = process.env.N8N_ROBOT_PASSWORD ?? '';
 
+const CALLBACK_EMAIL = process.env.CALLBACK_USER_EMAIL ?? 'callbacks@reinigungs-portal.com';
+const CALLBACK_PASSWORD = process.env.CALLBACK_USER_PASSWORD ?? '';
+const CALLBACK_FIRST = process.env.CALLBACK_USER_FIRST_NAME ?? 'Callback';
+const CALLBACK_LAST = process.env.CALLBACK_USER_LAST_NAME ?? 'Team';
+
 interface SeedUser {
   email: string;
   password: string;
@@ -164,6 +169,25 @@ async function main() {
   });
   await ensureMembershipsAllBrands(n8nId, 'admin');
 
+  // Dedicated human-callback owner — only when a password is provided.
+  let callbackId: string | null = null;
+  if (CALLBACK_PASSWORD) {
+    if (CALLBACK_PASSWORD.length < 8) {
+      throw new Error('CALLBACK_USER_PASSWORD must be at least 8 chars.');
+    }
+    callbackId = await ensureUser({
+      email: CALLBACK_EMAIL,
+      password: CALLBACK_PASSWORD,
+      firstName: CALLBACK_FIRST,
+      lastName: CALLBACK_LAST,
+      accessLevel: 'admin',
+      role: 'admin',
+    });
+    await ensureMembershipsAllBrands(callbackId, 'admin');
+  } else {
+    console.info('   ⤵ callback owner skipped (set CALLBACK_USER_PASSWORD to create it)');
+  }
+
   console.info('→ Per-brand sample rows…');
   const companies = await db
     .select({ slug: company.slug, schemaName: company.schemaName, name: company.name })
@@ -174,6 +198,10 @@ async function main() {
 
   console.info('\nDone. Admin + n8n robot + 1 newsletter/contact/inquiry per brand.');
   console.info(`   admin: ${ADMIN_EMAIL}  ·  n8n: ${N8N_EMAIL}`);
+  if (callbackId) {
+    console.info(`   callback owner: ${CALLBACK_EMAIL}`);
+    console.info(`   → set CALLBACK_DEFAULT_HUMAN_ASSIGNEE_ID=${callbackId}`);
+  }
 }
 
 main()
