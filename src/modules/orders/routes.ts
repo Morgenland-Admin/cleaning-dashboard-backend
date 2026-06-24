@@ -23,6 +23,7 @@ import { computeCommission, parseCommissionRate } from '../../lib/commission.js'
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
 import { captureException } from '../../lib/observability.js';
 import { fireN8nWebhook } from '../../lib/n8n.js';
+import { sendMetaServerEvent, type MetaEventContext } from '../../lib/meta-capi.js';
 import { spawnTask } from '../../lib/tasks.js';
 import { formatEurFromCents, priceOrder } from '../../lib/pricing.js';
 import { getPriceBook } from '../../lib/price-books/index.js';
@@ -322,10 +323,13 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
             pickupPlz: pickupPlz ?? null,
             pickupLabel: quote.pickupLabel,
             preferredDate: body.preferredSlots?.[0]?.slice(0, 10) ?? body.preferredDate ?? null,
-            metadata:
-              body.preferredSlots && body.preferredSlots.length > 0
+            metadata: {
+              ...(body.preferredSlots && body.preferredSlots.length > 0
                 ? { preferredSlots: body.preferredSlots }
-                : {},
+                : {}),
+              // Read by finalizePaidOrder for the Purchase event; kept private.
+              ...(body.meta ? { meta: body.meta } : {}),
+            },
             customerName: body.customer.name,
             customerEmail: body.customer.email.trim().toLowerCase(),
             customerPhone: body.customer.phone ?? null,
@@ -640,10 +644,18 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         paypalCaptureId: _pc,
         ...safe
       } = row;
-      // Dispute details are internal — not for the public tracker.
-      const { dispute: _dispute, ...publicMeta } = safe.metadata ?? {};
+      // Dispute + Meta fbp/fbc are internal; expose only the Purchase eventId
+      // so the success page can fire a deduped browser Purchase.
+      const { dispute: _dispute, meta: _meta, ...publicMeta } = safe.metadata ?? {};
+      const metaPurchaseEventId =
+        (safe.metadata as { meta?: { eventId?: string } } | null)?.meta?.eventId ?? null;
       reply.send({
-        order: { ...safe, metadata: publicMeta, orderNumber: orderNumberOf(row) },
+        order: {
+          ...safe,
+          metadata: publicMeta,
+          metaPurchaseEventId,
+          orderNumber: orderNumberOf(row),
+        },
         items,
         statusLog: log,
       });
@@ -1330,6 +1342,32 @@ async function finalizePaidOrder(
   order.totalCents = paidTotal;
 
   await aggregateCustomerOnPaid(app, tables, order, paidTotal, now);
+
+  // Server-side Meta Purchase, deduped via the eventId stored at checkout. The
+  // claimed status-claim above guarantees this runs once per order.
+  try {
+    const metaCtx = (order.metadata as { meta?: MetaEventContext } | null)?.meta;
+    if (metaCtx?.eventId) {
+      await sendMetaServerEvent(
+        companySlug,
+        {
+          eventName: 'Purchase',
+          eventId: metaCtx.eventId,
+          eventSourceUrl: metaCtx.eventSourceUrl,
+          fbp: metaCtx.fbp,
+          fbc: metaCtx.fbc,
+          email: order.customerEmail,
+          phone: order.customerPhone,
+          clientIpAddress: order.ipAddress,
+          clientUserAgent: order.userAgent,
+          customData: { currency: order.currency || 'EUR', value: order.totalCents / 100 },
+        },
+        app.log,
+      );
+    }
+  } catch (err) {
+    app.log.warn({ err, orderId }, 'Meta Purchase CAPI dispatch failed');
+  }
 
   // Auto-create the draft invoice for this paid order (idempotent, best-effort).
   // Replaces the n8n ALL_12 creator; a mail/render failure never blocks it.

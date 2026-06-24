@@ -14,6 +14,7 @@ import {
 } from '../../email/templates.js';
 import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
 import { routeCallback } from '../../lib/geo.js';
+import { metaEventContextSchema, sendMetaServerEvent } from '../../lib/meta-capi.js';
 import type { FastifyBaseLogger } from 'fastify';
 
 const submitSchema = z.object({
@@ -64,6 +65,8 @@ const submitSchema = z.object({
   consentMarketing: z.boolean().optional(),
   /** Honeypot — must stay empty. */
   website: z.string().max(200).optional(),
+  // Present only with marketing consent; triggers the server-side Lead.
+  meta: metaEventContextSchema.optional(),
 });
 
 const updateSchema = z.object({
@@ -301,6 +304,26 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
 
       if (row) {
         await notifyInquiryCreated(request.company!.slug, row, request.log);
+
+        // Server-side Meta Lead, deduped against the browser Pixel via eventId.
+        if (body.meta) {
+          await sendMetaServerEvent(
+            request.company!.slug,
+            {
+              eventName: 'Lead',
+              eventId: body.meta.eventId,
+              eventSourceUrl: body.meta.eventSourceUrl,
+              fbp: body.meta.fbp,
+              fbc: body.meta.fbc,
+              email: row.email,
+              phone: row.phone,
+              clientIpAddress: request.ip,
+              clientUserAgent: request.headers['user-agent'] ?? null,
+              customData: { content_name: body.service || 'Anfrage' },
+            },
+            request.log,
+          );
+        }
       }
 
       reply.code(201);

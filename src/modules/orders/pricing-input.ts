@@ -8,6 +8,7 @@ import {
   ZUSATZ_KINDS,
   type OrderServiceInput,
 } from '../../lib/pricing.js';
+import { metaEventContextSchema } from '../../lib/meta-capi.js';
 
 export const customerSchema = z.object({
   name: z.string().trim().min(1).max(120),
@@ -129,6 +130,8 @@ export const checkoutSchema = quoteSchema.and(
     source: z.string().trim().max(64).optional(),
     paymentMode: z.enum(['upfront', 'after_service']).optional(),
     provider: z.enum(['stripe', 'paypal']).optional(),
+    // Persisted on the order for the server-side Purchase (deduped via eventId).
+    meta: metaEventContextSchema.optional(),
   }),
 );
 

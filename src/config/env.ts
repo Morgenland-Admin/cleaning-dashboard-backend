@@ -50,6 +50,12 @@ const envSchema = z.object({
   VAPID_SUBJECT: z.string().default('mailto:admin@reinigungs-portal.com'),
   SENTRY_DSN: optionalString,
 
+  // Meta Conversions API (per-brand). Needs both pixel id + token, else no-op.
+  // TEST_EVENT_CODE is optional (Events Manager → Test Events).
+  META_PIXEL_ID_HAMBURG: optionalString,
+  META_CAPI_TOKEN_HAMBURG: optionalString,
+  META_TEST_EVENT_CODE_HAMBURG: optionalString,
+
   // Claude text assistant. Key unset ⇒ /admin/ai/* returns 503 (UI shows a hint).
   ANTHROPIC_API_KEY: optionalString,
   ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-6'),

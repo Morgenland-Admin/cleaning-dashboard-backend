@@ -13,6 +13,7 @@ import {
   contactReplyEmail,
 } from '../../email/templates.js';
 import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { metaEventContextSchema, sendMetaServerEvent } from '../../lib/meta-capi.js';
 
 const submitSchema = z.object({
   name: z.string().min(1).max(120),
@@ -39,6 +40,8 @@ const submitSchema = z.object({
   }),
   consentMarketing: z.boolean().optional(),
   website: z.string().max(200).optional(),
+  // Present only with marketing consent; triggers the server-side Lead.
+  meta: metaEventContextSchema.optional(),
 });
 
 const updateStatusSchema = z.object({
@@ -176,6 +179,26 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
           });
         } catch (err) {
           request.log.warn({ err, contactMessageId: row.id }, 'task spawn failed');
+        }
+
+        // Server-side Meta Lead, deduped against the browser Pixel via eventId.
+        if (body.meta) {
+          await sendMetaServerEvent(
+            request.company!.slug,
+            {
+              eventName: 'Lead',
+              eventId: body.meta.eventId,
+              eventSourceUrl: body.meta.eventSourceUrl,
+              fbp: body.meta.fbp,
+              fbc: body.meta.fbc,
+              email: row.email,
+              phone: row.phone,
+              clientIpAddress: request.ip,
+              clientUserAgent: request.headers['user-agent'] ?? null,
+              customData: { content_name: 'Kontaktformular' },
+            },
+            request.log,
+          );
         }
       }
 
