@@ -18,7 +18,7 @@ const faqSchema = z
   .optional();
 
 const createSchema = z.object({
-  type: z.enum(['service', 'city']).default('service'),
+  type: z.enum(['service', 'city', 'blog']).default('service'),
   path: z.string().trim().regex(PATH_RE, 'path must be a lowercase slug, optionally with "/"'),
   category: z.string().max(64).optional(),
   city: z.string().max(120).optional(),
@@ -54,7 +54,7 @@ const CONTENT_FIELDS = [
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).max(500).optional(),
-  type: z.enum(['service', 'city']).optional(),
+  type: z.enum(['service', 'city', 'blog']).optional(),
   status: z.enum(['draft', 'live', 'protected']).optional(),
   category: z.string().max(64).optional(),
 });
@@ -256,15 +256,41 @@ function escapeXml(s: string): string {
     .replace(/'/g, '&apos;');
 }
 
+const publicListQuerySchema = z.object({
+  type: z.enum(['service', 'city', 'blog']).optional(),
+});
+
 export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
 
   app.get('/', async (request) => {
+    const { type } = publicListQuerySchema.parse(request.query);
     const { seoPages } = request.company!.tables;
+    const conds = [inArray(seoPages.status, [...PUBLIC_STATUSES])];
+    if (type) conds.push(eq(seoPages.type, type));
+
+    if (type) {
+      const rows = await db
+        .select({
+          path: seoPages.path,
+          type: seoPages.type,
+          title: seoPages.title,
+          metaTitle: seoPages.metaTitle,
+          metaDescription: seoPages.metaDescription,
+          h1: seoPages.h1,
+          schemaJsonld: seoPages.schemaJsonld,
+          createdAt: seoPages.createdAt,
+          updatedAt: seoPages.updatedAt,
+        })
+        .from(seoPages)
+        .where(and(...conds))
+        .orderBy(desc(seoPages.createdAt), desc(seoPages.id));
+      return { pages: rows };
+    }
     const rows = await db
       .select({ path: seoPages.path, type: seoPages.type, updatedAt: seoPages.updatedAt })
       .from(seoPages)
-      .where(inArray(seoPages.status, [...PUBLIC_STATUSES]))
+      .where(and(...conds))
       .orderBy(asc(seoPages.path));
     return { pages: rows };
   });
@@ -283,7 +309,7 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
     // (a future split into a sitemap index would be the next step).
     const SITEMAP_MAX = 50_000;
     const rows = await db
-      .select({ path: seoPages.path, updatedAt: seoPages.updatedAt })
+      .select({ path: seoPages.path, type: seoPages.type, updatedAt: seoPages.updatedAt })
       .from(seoPages)
       .where(inArray(seoPages.status, [...PUBLIC_STATUSES]))
       .orderBy(asc(seoPages.path))
@@ -297,7 +323,9 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
     }
     const urls = rows
       .map((r) => {
-        const loc = escapeXml(`${origin}/seo/${r.path}`);
+        // Blog paths already carry the "blog/" prefix; service/city render under /seo/.
+        const publicPath = r.type === 'blog' ? r.path : `seo/${r.path}`;
+        const loc = escapeXml(`${origin}/${publicPath}`);
         const lastmod = r.updatedAt.toISOString().slice(0, 10);
         return `  <url>\n    <loc>${loc}</loc>\n    <lastmod>${lastmod}</lastmod>\n  </url>`;
       })
