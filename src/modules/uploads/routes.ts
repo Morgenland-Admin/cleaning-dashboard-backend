@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { s3Configured, signDownload, signUpload } from '../../lib/s3.js';
+import { s3Configured, signDownload, signPublicUpload, signUpload } from '../../lib/s3.js';
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
 const ALLOWED_TYPES = new Set([
@@ -96,6 +96,36 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
         sizeBytes: body.size,
       });
       reply.code(201).send({ uploadUrl, key, expiresIn });
+    },
+  );
+
+  // Presign a publicly-readable image upload (e.g. a blog featured image). Returns
+  // a stable public URL the caller stores in the article's schemaJsonld.image.
+  app.post(
+    '/sign-public-image',
+    {
+      config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+      preHandler: app.requireAccess('super_admin', 'admin', 'manager'),
+    },
+    async (request, reply) => {
+      if (!s3Configured) {
+        reply.code(503).send({ error: 'Uploads are not configured on this server' });
+        return;
+      }
+      const body = signSchema.parse(request.body);
+      if (!ALLOWED_TYPES.has(body.contentType)) {
+        reply.code(415).send({
+          error: `Unsupported image type "${body.contentType}". Allowed: ${[...ALLOWED_TYPES].join(', ')}`,
+        });
+        return;
+      }
+      const { uploadUrl, key, publicUrl, expiresIn } = await signPublicUpload({
+        keyPrefix: request.company!.keyPrefix,
+        filename: body.filename,
+        contentType: body.contentType,
+        sizeBytes: body.size,
+      });
+      reply.code(201).send({ uploadUrl, key, publicUrl, expiresIn });
     },
   );
 

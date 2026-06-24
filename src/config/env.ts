@@ -36,6 +36,9 @@ const envSchema = z.object({
   AWS_SECRET_ACCESS_KEY: optionalString,
   S3_ENDPOINT: optionalUrl,
   S3_BUCKET: optionalString,
+  // Public base URL (CDN or bucket host) for the public/ asset prefix; e.g.
+  // blog featured images. Falls back to a URL built from endpoint/bucket/region.
+  S3_PUBLIC_BASE_URL: optionalUrl,
   STRIPE_SECRET_KEY: optionalString,
   STRIPE_WEBHOOK_SECRET: optionalString,
   STRIPE_PUBLISHABLE_KEY: optionalString,

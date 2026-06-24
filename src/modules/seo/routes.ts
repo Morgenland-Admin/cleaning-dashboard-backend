@@ -236,6 +236,25 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { page: row };
   });
 
+  // Set the featured image: merge a public image URL into the page's JSON-LD so
+  // the storefront renders it as the article hero. Additive (no content overwrite),
+  // so it's allowed even on protected pages.
+  const featuredImageSchema = z.object({ imageUrl: z.string().url().max(2000) });
+  app.patch('/:id/featured-image', canEdit, async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { imageUrl } = featuredImageSchema.parse(request.body);
+    const { seoPages } = request.company!.tables;
+    const [current] = await db.select().from(seoPages).where(eq(seoPages.id, id)).limit(1);
+    if (!current) throw notFound('SEO page not found');
+    const schemaJsonld = setJsonLdImage(current.schemaJsonld ?? null, imageUrl);
+    const [row] = await db
+      .update(seoPages)
+      .set({ schemaJsonld, updatedAt: new Date() })
+      .where(eq(seoPages.id, id))
+      .returning();
+    return { page: row };
+  });
+
   app.delete('/:id', canEdit, async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { seoPages } = request.company!.tables;
@@ -244,6 +263,35 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204).send();
   });
 };
+
+type JsonLd = Record<string, unknown> | unknown[];
+
+function isObjectNode(node: unknown): node is Record<string, unknown> {
+  return !!node && typeof node === 'object' && !Array.isArray(node);
+}
+
+function isArticleNode(node: unknown): node is Record<string, unknown> {
+  if (!isObjectNode(node)) return false;
+  const type = node['@type'];
+  return typeof type === 'string' && /article|blogposting/i.test(type);
+}
+
+/** Write `image` onto the Article node of a JSON-LD value (object or @graph array). */
+function setJsonLdImage(schema: JsonLd | null, imageUrl: string): JsonLd {
+  if (Array.isArray(schema)) {
+    const target = schema.find(isArticleNode) ?? schema.find(isObjectNode);
+    if (target) {
+      target.image = imageUrl;
+      return schema;
+    }
+    return [...schema, { '@type': 'Article', image: imageUrl }];
+  }
+  if (isObjectNode(schema)) {
+    schema.image = imageUrl;
+    return schema;
+  }
+  return { '@type': 'Article', image: imageUrl };
+}
 
 const PUBLIC_STATUSES = ['live', 'protected'] as const;
 

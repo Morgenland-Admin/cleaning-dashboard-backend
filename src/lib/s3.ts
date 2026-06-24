@@ -49,6 +49,59 @@ function buildKey(keyPrefix: string, originalName: string): string {
 const UPLOAD_EXPIRY_SECONDS = 60 * 5;
 const DOWNLOAD_EXPIRY_SECONDS = 60 * 10;
 
+// Objects under this prefix are served publicly (bucket policy / CDN), so their
+// URLs are stable and non-expiring — suitable for blog featured images.
+const PUBLIC_PREFIX = 'public';
+
+function buildPublicKey(keyPrefix: string, originalName: string): string {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const safeName =
+    originalName
+      .toLowerCase()
+      .replace(/[^a-z0-9.\-_]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 80) || 'image';
+  return `${PUBLIC_PREFIX}/${keyPrefix}/blog/${year}/${month}/${nanoid(12)}-${safeName}`;
+}
+
+/** Stable public URL for an object under the public prefix. */
+export function publicAssetUrl(key: string): string {
+  if (env.S3_PUBLIC_BASE_URL) {
+    return `${env.S3_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}`;
+  }
+  if (env.S3_ENDPOINT) {
+    return `${env.S3_ENDPOINT.replace(/\/$/, '')}/${getBucket()}/${key}`;
+  }
+  return `https://${getBucket()}.s3.${env.AWS_REGION}.amazonaws.com/${key}`;
+}
+
+/**
+ * Presign a PUT for a publicly-readable image. The browser streams the file to
+ * S3, then the caller stores publicAssetUrl(key) (e.g. in schemaJsonld.image).
+ */
+export async function signPublicUpload(opts: {
+  keyPrefix: string;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+}): Promise<{ uploadUrl: string; key: string; publicUrl: string; expiresIn: number }> {
+  const bucket = getBucket();
+  const key = buildPublicKey(opts.keyPrefix, opts.filename);
+  const cmd = new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    ContentType: opts.contentType,
+    ContentLength: opts.sizeBytes,
+  });
+  const uploadUrl = await getSignedUrl(client, cmd, {
+    expiresIn: UPLOAD_EXPIRY_SECONDS,
+    signableHeaders: new Set(['content-length', 'content-type']),
+  });
+  return { uploadUrl, key, publicUrl: publicAssetUrl(key), expiresIn: UPLOAD_EXPIRY_SECONDS };
+}
+
 export async function signUpload(opts: {
   keyPrefix: string;
   filename: string;
