@@ -1,10 +1,10 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, lt, ne, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
-import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { conflict, notFound, parseIntId } from '../../lib/http-errors.js';
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
 
 const listQuerySchema = z.object({
@@ -17,6 +17,7 @@ const listQuerySchema = z.object({
 const tagsSchema = z.array(z.string().trim().min(1).max(64)).max(50);
 
 const updateSchema = z.object({
+  email: z.string().email().max(254).optional(),
   name: z.string().max(200).nullable().optional(),
   phone: z.string().max(32).nullable().optional(),
   addressLine1: z.string().max(200).nullable().optional(),
@@ -276,11 +277,18 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     const id = parseIntId((request.params as { id: string }).id);
     const body = updateSchema.parse(request.body);
     const { customers } = request.company!.tables;
-    const [row] = await db
-      .update(customers)
-      .set({ ...body, updatedAt: new Date() })
-      .where(eq(customers.id, id))
-      .returning();
+    const patch: Record<string, unknown> = { ...body, updatedAt: new Date() };
+    if (body.email !== undefined) {
+      const email = body.email.trim().toLowerCase();
+      const [clash] = await db
+        .select({ id: customers.id })
+        .from(customers)
+        .where(and(sql`lower(${customers.email}) = ${email}`, ne(customers.id, id)))
+        .limit(1);
+      if (clash) throw conflict('A customer with this email already exists');
+      patch.email = email;
+    }
+    const [row] = await db.update(customers).set(patch).where(eq(customers.id, id)).returning();
     if (!row) throw notFound('Customer not found');
     return { customer: row };
   });
