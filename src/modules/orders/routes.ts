@@ -1966,6 +1966,146 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
+  // Admin-created order (phone booking, walk-in). No payment is taken here: it's
+  // created as an offline `after_service`/`accepted` order, then settled later via
+  // the existing payment-link / record-payment / transition actions.
+  const createOrderSchema = z.object({
+    kind: z.enum([
+      'teppichreinigung',
+      'teppichreparatur',
+      'polsterreinigung',
+      'teppichbodenreinigung',
+    ]),
+    customer: z.object({
+      name: z.string().min(1).max(120),
+      email: z.string().email().max(254),
+      phone: z.string().max(32).optional(),
+    }),
+    items: z
+      .array(
+        z.object({
+          code: z.string().max(64).optional(),
+          label: z.string().min(1).max(200),
+          quantityLabel: z.string().min(1).max(80),
+          quantity: z.number().positive().max(100_000),
+          unitPriceCents: z.number().int().min(0).max(100_000_000),
+        }),
+      )
+      .min(1)
+      .max(50),
+    pickupMode: z.enum(['pickup', 'drop_off', 'onsite']).default('drop_off'),
+    address: z
+      .object({
+        line1: z.string().min(1).max(200),
+        line2: z.string().max(200).optional(),
+        city: z.string().min(1).max(120),
+        postalCode: z.string().regex(/^\d{5}$/, 'postalCode must be 5 digits'),
+        country: z.string().length(2).optional(),
+      })
+      .optional(),
+    preferredDate: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'preferredDate must be YYYY-MM-DD')
+      .optional(),
+    customerNotes: z.string().max(2000).optional(),
+    internalNotes: z.string().max(4000).optional(),
+  });
+
+  app.post('/', async (request, reply) => {
+    const callerLevel = accessLevelOf(request);
+    if (!callerLevel || !PRIVILEGED_LEVELS.has(callerLevel)) {
+      reply.code(403).send({ error: 'Nur Manager/Admin dürfen Aufträge anlegen.' });
+      return;
+    }
+    const body = createOrderSchema.parse(request.body);
+    const adminId = request.authUser!.id;
+    const { orders, orderItems, orderStatusLog, customers } = request.company!.tables;
+
+    // Total is recomputed from the line items server-side — never trusted from the client.
+    const lines = body.items.map((it) => ({
+      code: it.code ?? 'manual',
+      label: it.label,
+      quantityLabel: it.quantityLabel,
+      quantity: it.quantity,
+      unitPriceCents: it.unitPriceCents,
+      subtotalCents: Math.round(it.quantity * it.unitPriceCents),
+    }));
+    const totalCents = lines.reduce((sum, l) => sum + l.subtotalCents, 0);
+    const publicToken = generateOrderToken();
+    const now = new Date();
+
+    const orderRow = await db.transaction(async (tx) => {
+      const customerId = await linkCustomerByEmail(tx, customers, {
+        email: body.customer.email,
+        name: body.customer.name,
+        phone: body.customer.phone ?? null,
+        marketingOptIn: false,
+      });
+      const inserted = await tx
+        .insert(orders)
+        .values({
+          publicToken,
+          customerId,
+          kind: body.kind,
+          status: 'accepted',
+          paymentMode: 'after_service',
+          acceptedAt: now,
+          currency: 'EUR',
+          subtotalCents: totalCents,
+          pickupFeeCents: 0,
+          totalCents,
+          pickupMode: body.pickupMode,
+          preferredDate: body.preferredDate ?? null,
+          customerName: body.customer.name,
+          customerEmail: body.customer.email.trim().toLowerCase(),
+          customerPhone: body.customer.phone ?? null,
+          addressLine1: body.address?.line1 ?? null,
+          addressLine2: body.address?.line2 ?? null,
+          addressCity: body.address?.city ?? null,
+          addressPostalCode: body.address?.postalCode ?? null,
+          addressCountry: body.address?.country ?? 'DE',
+          customerNotes: body.customerNotes ?? null,
+          internalNotes: body.internalNotes ?? null,
+          consentPrivacy: true,
+          consentMarketing: false,
+          locale: 'de',
+          source: 'manual_admin',
+          handledByUserId: adminId,
+        })
+        .returning();
+      const order = inserted[0];
+      if (!order) throw new Error('Failed to insert order row');
+
+      const stampedNumber = formatOrderNumber(order.id, order.createdAt);
+      await tx.update(orders).set({ orderNumber: stampedNumber }).where(eq(orders.id, order.id));
+      order.orderNumber = stampedNumber;
+
+      await tx.insert(orderItems).values(
+        lines.map((l) => ({
+          orderId: order.id,
+          code: l.code,
+          label: l.label,
+          quantityLabel: l.quantityLabel,
+          quantity: l.quantity.toFixed(2),
+          unitPriceCents: l.unitPriceCents,
+          subtotalCents: l.subtotalCents,
+        })),
+      );
+
+      await tx.insert(orderStatusLog).values({
+        orderId: order.id,
+        fromStatus: null,
+        toStatus: 'accepted',
+        changedByUserId: adminId,
+        reason: 'Manuell erstellt',
+      });
+      return order;
+    });
+
+    reply.code(201);
+    return { order: { ...orderRow, orderNumber: orderNumberOf(orderRow) } };
+  });
+
   app.get('/:id', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { orders, orderItems, orderStatusLog } = request.company!.tables;
