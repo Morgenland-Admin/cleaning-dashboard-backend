@@ -439,7 +439,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
     const id = parseIntId((request.params as { id: string }).id);
     const parsed = quoteSchema.parse(request.body);
     const adminId = request.authUser!.id;
-    const { serviceInquiries } = request.company!.tables;
+    const { serviceInquiries, inquiryEmails } = request.company!.tables;
 
     const [inquiry] = await db
       .select()
@@ -469,18 +469,35 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       : null;
 
     if (companyRow) {
-      await sendEmail({
+      // Render once so we can both send the mail and persist exactly what the
+      // customer received (the dashboard is the only record — Resend mail never
+      // lands a copy in the brand mailbox).
+      const rendered = inquiryQuoteEmail({
+        recipientName: inquiry.name,
+        brand: brandInfoFromCompany(companyRow),
+        quoteBody: parsed.body,
+        quotedAmount: amountFormatted,
+        signedBy,
+      });
+      const result = await sendEmail({
         to: inquiry.email,
         from: brandSender(companyRow),
         apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
-        email: inquiryQuoteEmail({
-          recipientName: inquiry.name,
-          brand: brandInfoFromCompany(companyRow),
-          quoteBody: parsed.body,
-          quotedAmount: amountFormatted,
-          signedBy,
-        }),
+        email: rendered,
+      });
+      const emailStatus = result.skipped ? 'skipped' : result.ok ? 'sent' : 'failed';
+      await db.insert(inquiryEmails).values({
+        inquiryId: id,
+        kind: 'quote',
+        toAddress: inquiry.email,
+        subject: rendered.subject,
+        html: rendered.html,
+        quotedAmount: amountFinal,
+        status: emailStatus,
+        emailMessageId: result.id ?? null,
+        sentByUserId: adminId,
+        sentByName: signedBy,
       });
     }
 
@@ -500,6 +517,19 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
 
     reply.code(201);
     return { ok: true, inquiry: updated };
+  });
+
+  // Email history for a lead (sent offers/quotes), newest first. Includes the
+  // rendered HTML so the dashboard can preview exactly what was delivered.
+  app.get('/:id/emails', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { inquiryEmails } = request.company!.tables;
+    const emails = await db
+      .select()
+      .from(inquiryEmails)
+      .where(eq(inquiryEmails.inquiryId, id))
+      .orderBy(desc(inquiryEmails.createdAt), desc(inquiryEmails.id));
+    return { emails };
   });
 
   // Inquiries due a follow-up call: still untouched, reachable by phone, privacy

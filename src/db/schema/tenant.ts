@@ -145,6 +145,34 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
+  // Log of emails sent to a lead from the dashboard (currently quotes/offers).
+  // Mail goes out via Resend, which never lands a copy in the brand mailbox, so
+  // this table is the in-app system of record. We persist the rendered HTML so
+  // the operator can preview exactly what the customer received.
+  const inquiryEmails = s.table(
+    'inquiry_emails',
+    {
+      id: serial('id').primaryKey(),
+      inquiryId: integer('inquiry_id')
+        .notNull()
+        .references(() => serviceInquiries.id, { onDelete: 'cascade' }),
+      kind: varchar('kind', { length: 24 }).notNull().default('quote'),
+      toAddress: text('to_address').notNull(),
+      subject: text('subject').notNull(),
+      html: text('html').notNull(),
+      quotedAmount: numeric('quoted_amount', { precision: 12, scale: 2 }),
+      // 'sent' | 'skipped' (no Resend key) | 'failed'
+      status: varchar('status', { length: 16 }).notNull().default('sent'),
+      emailMessageId: text('email_message_id'),
+      sentByUserId: text('sent_by_user_id'),
+      sentByName: text('sent_by_name'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      inquiryIdIdx: index('inquiry_emails_inquiry_id_idx').on(table.inquiryId),
+    }),
+  );
+
   const partners = s.table('partners', {
     id: serial('id').primaryKey(),
     userId: text('user_id').notNull(),
@@ -595,6 +623,7 @@ function buildTenantTables(schemaName: string) {
     contactMessages,
     contactReplies,
     serviceInquiries,
+    inquiryEmails,
     partners,
     chatConversations,
     chatMessages,
@@ -635,6 +664,7 @@ export const cleaniloNewsletterSubscribers = _cleanilo.newsletterSubscribers;
 export const cleaniloContactMessages = _cleanilo.contactMessages;
 export const cleaniloContactReplies = _cleanilo.contactReplies;
 export const cleaniloServiceInquiries = _cleanilo.serviceInquiries;
+export const cleaniloInquiryEmails = _cleanilo.inquiryEmails;
 export const cleaniloPartners = _cleanilo.partners;
 
 export const hamburgSchema = _hamburg.schema;
@@ -642,6 +672,7 @@ export const hamburgNewsletterSubscribers = _hamburg.newsletterSubscribers;
 export const hamburgContactMessages = _hamburg.contactMessages;
 export const hamburgContactReplies = _hamburg.contactReplies;
 export const hamburgServiceInquiries = _hamburg.serviceInquiries;
+export const hamburgInquiryEmails = _hamburg.inquiryEmails;
 export const hamburgPartners = _hamburg.partners;
 
 export const teppichreinigenLassenSchema = _teppichreinigenLassen.schema;
@@ -650,6 +681,7 @@ export const teppichreinigenLassenNewsletterSubscribers =
 export const teppichreinigenLassenContactMessages = _teppichreinigenLassen.contactMessages;
 export const teppichreinigenLassenContactReplies = _teppichreinigenLassen.contactReplies;
 export const teppichreinigenLassenServiceInquiries = _teppichreinigenLassen.serviceInquiries;
+export const teppichreinigenLassenInquiryEmails = _teppichreinigenLassen.inquiryEmails;
 export const teppichreinigenLassenPartners = _teppichreinigenLassen.partners;
 
 export function createTenantSchemaSql(schemaName: string): string {
@@ -752,6 +784,22 @@ CREATE TABLE IF NOT EXISTS ${q}."service_inquiries" (
   "updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 CREATE INDEX IF NOT EXISTS "service_inquiries_created_at_idx" ON ${q}."service_inquiries" ("created_at");
+
+CREATE TABLE IF NOT EXISTS ${q}."inquiry_emails" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "inquiry_id" integer NOT NULL REFERENCES ${q}."service_inquiries"("id") ON DELETE CASCADE,
+  "kind" varchar(24) DEFAULT 'quote' NOT NULL,
+  "to_address" text NOT NULL,
+  "subject" text NOT NULL,
+  "html" text NOT NULL,
+  "quoted_amount" numeric(12, 2),
+  "status" varchar(16) DEFAULT 'sent' NOT NULL,
+  "email_message_id" text,
+  "sent_by_user_id" text,
+  "sent_by_name" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "inquiry_emails_inquiry_id_idx" ON ${q}."inquiry_emails" ("inquiry_id");
 
 CREATE TABLE IF NOT EXISTS ${q}."partners" (
   "id" serial PRIMARY KEY NOT NULL,

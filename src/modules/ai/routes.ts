@@ -10,7 +10,7 @@ import { notFound } from '../../lib/http-errors.js';
 // The source record is loaded server-side by refId (never trust the client);
 // output is returned, never persisted.
 
-const KINDS = ['contact_reply', 'review_response', 'inquiry_note'] as const;
+const KINDS = ['contact_reply', 'review_response', 'inquiry_note', 'inquiry_quote'] as const;
 type AssistKind = (typeof KINDS)[number];
 
 const assistSchema = z.object({
@@ -30,11 +30,12 @@ interface PromptParts {
 const line = (label: string, value: string | number | null | undefined): string | null =>
   value === null || value === undefined || value === '' ? null : `${label}: ${value}`;
 
-const SHARED_RULES = [
-  'Schreibe auf Deutsch, per Sie, höflich und professionell.',
-  'Gib ausschließlich den fertigen Text zurück — keine Einleitung, keine Erklärung, keine Anführungszeichen, kein Markdown.',
-  'Erfinde keine Preise, Termine oder Zusagen, die nicht vorgegeben sind.',
-].join(' ');
+// Output-format + honesty rules every kind shares, independent of address form.
+const OUTPUT_RULES =
+  'Gib ausschließlich den fertigen Text zurück — keine Einleitung, keine Erklärung, keine Anführungszeichen, kein Markdown. ' +
+  'Erfinde keine Preise, Termine oder Zusagen, die nicht vorgegeben sind.';
+// Default: formal address. inquiry_quote overrides the address form (du) below.
+const SHARED_RULES = `Schreibe auf Deutsch, per Sie, höflich und professionell. ${OUTPUT_RULES}`;
 
 // System prompt + grounding context for a kind, from its loaded row.
 async function buildPrompt(
@@ -115,6 +116,40 @@ async function buildPrompt(
           `Schreibe eine kompakte interne Notiz zu dieser Anfrage: kurze Einschätzung, offene Punkte ` +
           `und ein konkreter nächster Schritt (z. B. Rückruf, Angebot, fehlende Infos). ` +
           `Stichpunkte sind erlaubt. Dies ist eine interne Notiz, kein Kundentext. ${SHARED_RULES}`,
+        context,
+      };
+    }
+    case 'inquiry_quote': {
+      const [inq] = await db
+        .select()
+        .from(tables.serviceInquiries)
+        .where(eq(tables.serviceInquiries.id, refId))
+        .limit(1);
+      if (!inq) throw notFound('Inquiry not found');
+      // The AI vision pipeline drops carpet/dirt details into metadata.carpet;
+      // surface it so the offer can reference what was actually requested.
+      const carpet = (inq.metadata as { carpet?: unknown } | null)?.carpet;
+      const context = [
+        line('Name', inq.name),
+        line('Service', inq.service),
+        line('Objekt/Details', inq.propertyDetails),
+        line('Wunschtermin', inq.preferredDate),
+        line('Budget', inq.budget),
+        line('Bereits genannter Angebotsbetrag', inq.quotedAmount),
+        line('PLZ', inq.plz),
+        line('Nachricht des Kunden', inq.message),
+        carpet ? line('Erkannte Teppich-Details', JSON.stringify(carpet)) : null,
+      ]
+        .filter(Boolean)
+        .join('\n');
+      return {
+        system:
+          `Du bist im Vertriebsteam von ${brand}, einem deutschen Reinigungsunternehmen. ` +
+          `Verfasse den Fließtext für eine Angebots-E-Mail an den Kunden — den Teil, der zwischen ` +
+          `Anrede und Signatur steht. Gehe konkret auf die Anfrage ein, beschreibe die vorgeschlagene ` +
+          `Leistung und nenne, falls vorgegeben, den Preis; lade zur Beauftragung ein. ` +
+          `Keine Betreffzeile, keine Anrede ("Hallo …"), keine Signatur — diese ergänzt die Vorlage. ` +
+          `Schreibe auf Deutsch, freundlich und per "du" (so wie die Marke ihre Kunden anspricht). ${OUTPUT_RULES}`,
         context,
       };
     }
