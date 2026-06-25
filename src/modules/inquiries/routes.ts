@@ -72,6 +72,8 @@ const submitSchema = z.object({
 const updateSchema = z.object({
   status: z.enum(['new', 'in_review', 'quoted', 'won', 'lost']).optional(),
   priority: z.enum(['normal', 'high']).optional(),
+  email: z.string().email().max(254).nullable().optional(),
+  phone: z.string().max(32).nullable().optional(),
   internalNotes: z.string().max(2000).nullable().optional(),
   quotedAmount: z
     .string()
