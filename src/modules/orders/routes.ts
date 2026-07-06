@@ -5,7 +5,7 @@ import type Stripe from 'stripe';
 
 import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
-import { company } from '../../db/schema/shared.js';
+import { company, user } from '../../db/schema/shared.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
 import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
 import {
@@ -13,6 +13,7 @@ import {
   newOrderAdminEmail,
   appointmentConfirmedEmail,
   orderConfirmationEmail,
+  orderMessageEmail,
   orderStatusUpdateEmail,
   paymentRequestEmail,
 } from '../../email/templates.js';
@@ -2703,6 +2704,121 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
+
+  // Operator proposes up to 3 pickup/appointment times directly from the panel
+  // (independent of whatever the booking carried). These become the
+  // `preferredSlots` the operator then confirms one of via /confirm-appointment.
+  app.post('/:id/propose-slots', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { slots } = z
+      .object({
+        slots: z
+          .array(z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/))
+          .min(1)
+          .max(3),
+      })
+      .parse(request.body);
+    const { orders } = request.company!.tables;
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+
+    const meta = row.metadata ?? {};
+    const [updated] = await db
+      .update(orders)
+      .set({
+        // Mirror the booking path: earliest proposed slot seeds the Wunschtermin.
+        preferredDate: row.preferredDate ?? slots[0]!.slice(0, 10),
+        metadata: { ...meta, preferredSlots: slots },
+        updatedAt: new Date(),
+      })
+      .where(eq(orders.id, id))
+      .returning();
+    if (!updated) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+    return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
+  });
+
+  // Free-form operator message to the customer about an order — the
+  // "✦ Claude compose + send" box on the panel. Sent under the order's OWN
+  // brand (brand separation holds here); logged to metadata.messages (no DDL).
+  app.post('/:id/message', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { body } = z.object({ body: z.string().trim().min(1).max(8000) }).parse(request.body);
+    const { orders } = request.company!.tables;
+    const adminId = request.authUser!.id;
+    const companySlug = request.company!.slug;
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+
+    const [adminRow] = await db
+      .select({ name: user.name })
+      .from(user)
+      .where(eq(user.id, adminId))
+      .limit(1);
+    const sentByName = adminRow?.name ?? null;
+
+    const [companyRow] = await db
+      .select()
+      .from(company)
+      .where(eq(company.slug, companySlug))
+      .limit(1);
+    if (!companyRow) {
+      reply.code(500).send({ error: 'Company not found' });
+      return;
+    }
+
+    const trackerUrl = `${(companyRow.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '')}/bestellung?token=${encodeURIComponent(row.publicToken)}`;
+    const result = await sendEmail({
+      to: row.customerEmail,
+      from: brandSender(companyRow),
+      apiKey: companyRow.resendApiKey ?? undefined,
+      replyTo: companyRow.email ?? undefined,
+      email: orderMessageEmail({
+        brand: brandInfoFromCompany(companyRow),
+        customerName: row.customerName,
+        orderNumber: orderNumberOf(row),
+        messageBody: body,
+        signedBy: sentByName,
+        trackerUrl,
+      }),
+    });
+    if (!result.ok) {
+      request.log.error({ orderId: id, error: result.error }, 'order message email failed');
+      reply
+        .code(502)
+        .send({ error: 'E-Mail konnte nicht gesendet werden. Bitte erneut versuchen.' });
+      return;
+    }
+
+    const meta = (row.metadata ?? {}) as { messages?: unknown[] };
+    const messages = Array.isArray(meta.messages) ? meta.messages : [];
+    messages.push({
+      body,
+      sentByUserId: adminId,
+      sentByName,
+      sentAt: new Date().toISOString(),
+      emailMessageId: result.id ?? (result.skipped ? 'skipped' : null),
+    });
+    const [updated] = await db
+      .update(orders)
+      .set({ metadata: { ...meta, messages }, updatedAt: new Date() })
+      .where(eq(orders.id, id))
+      .returning();
+
+    reply.code(201);
+    return { order: { ...(updated ?? row), orderNumber: orderNumberOf(updated ?? row) } };
+  });
+
   app.post('/:id/sync-stripe', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { orders } = request.company!.tables;

@@ -10,7 +10,13 @@ import { notFound } from '../../lib/http-errors.js';
 // The source record is loaded server-side by refId (never trust the client);
 // output is returned, never persisted.
 
-const KINDS = ['contact_reply', 'review_response', 'inquiry_note', 'inquiry_quote'] as const;
+const KINDS = [
+  'contact_reply',
+  'review_response',
+  'inquiry_note',
+  'inquiry_quote',
+  'order_message',
+] as const;
 type AssistKind = (typeof KINDS)[number];
 
 const assistSchema = z.object({
@@ -150,6 +156,41 @@ async function buildPrompt(
           `Leistung und nenne, falls vorgegeben, den Preis; lade zur Beauftragung ein. ` +
           `Keine Betreffzeile, keine Anrede ("Hallo …"), keine Signatur — diese ergänzt die Vorlage. ` +
           `Schreibe auf Deutsch, freundlich und per "du" (so wie die Marke ihre Kunden anspricht). ${OUTPUT_RULES}`,
+        context,
+      };
+    }
+    case 'order_message': {
+      const [order] = await db
+        .select()
+        .from(tables.orders)
+        .where(eq(tables.orders.id, refId))
+        .limit(1);
+      if (!order) throw notFound('Order not found');
+      const items = await db
+        .select()
+        .from(tables.orderItems)
+        .where(eq(tables.orderItems.orderId, refId));
+      const meta = (order.metadata ?? {}) as { confirmedSlot?: string };
+      const context = [
+        line('Auftragsnummer', order.orderNumber ?? `#${order.id}`),
+        line('Kunde', order.customerName),
+        line('Leistung', order.kind),
+        line('Status', order.status),
+        line('Abholung/Adresse', order.pickupLabel),
+        line('Wunschtermin', order.preferredDate),
+        line('Bestätigter Termin', meta.confirmedSlot),
+        items.length ? line('Positionen', items.map((it) => it.label).join(', ')) : null,
+        line('Kundenmitteilung', order.customerNotes),
+      ]
+        .filter(Boolean)
+        .join('\n');
+      return {
+        system:
+          `Du bist im Kundenservice-Team von ${brand}, einem deutschen Reinigungsunternehmen. ` +
+          `Verfasse eine kurze, freundliche E-Mail an den Kunden zu seinem laufenden Auftrag ` +
+          `(z. B. Rückfrage, Statusinfo, Terminabstimmung). Gehe konkret auf den Auftrag ein und ` +
+          `nenne den nächsten Schritt. Keine Betreffzeile, keine Signatur — diese ergänzt die Vorlage. ` +
+          `${SHARED_RULES}`,
         context,
       };
     }

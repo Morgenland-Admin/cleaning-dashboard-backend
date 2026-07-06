@@ -945,6 +945,49 @@ export function appointmentConfirmedEmail(opts: {
   };
 }
 
+/**
+ * Free-form operator message about an order — the "✦ Claude compose + send" box
+ * on the Aufträge panel. Body is whatever the operator typed (Claude-drafted or
+ * not); goes out under the order's own brand, per Sie like the other order mail.
+ */
+export function orderMessageEmail(opts: {
+  brand: BrandInfo;
+  customerName: string;
+  orderNumber: string;
+  /** Body the operator typed — plain text; newlines preserved as <br>. */
+  messageBody: string;
+  /** Operator name appended as a signature line. */
+  signedBy?: string | null;
+  /** Optional order-tracker link surfaced as a button. */
+  trackerUrl?: string | null;
+}): RenderedEmail {
+  const signature = opts.signedBy
+    ? `<p style="margin:20px 0 0;font-size:13px;color:#2d2419;">${escapeHtml(
+        opts.signedBy,
+      )}<br /><span style="color:#6b5b48;">${escapeHtml(opts.brand.name)}</span></p>`
+    : `<p style="margin:20px 0 0;font-size:13px;color:#6b5b48;">— ${escapeHtml(
+        opts.brand.name,
+      )}</p>`;
+  const trackerButton = opts.trackerUrl
+    ? button(opts.trackerUrl, 'Auftrag ansehen', opts.brand.primaryColor)
+    : '';
+
+  return {
+    subject: `${opts.brand.name} · Ihr Auftrag ${opts.orderNumber}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `Nachricht zu Ihrem Auftrag ${opts.orderNumber}.`,
+      contentHtml: `
+        <p style="margin:0 0 12px;">Hallo ${escapeHtml(opts.customerName)},</p>
+        <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.messageBody)}</div>
+        ${signature}
+        ${trackerButton}
+      `,
+      footerNote: `Nachricht zu Ihrem Auftrag ${opts.orderNumber} bei ${opts.brand.domain}. Sie können direkt auf diese Mail antworten.`,
+    }),
+  };
+}
+
 export function paymentRequestEmail(opts: {
   brand: BrandInfo;
   customerName: string;
