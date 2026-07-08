@@ -14,6 +14,12 @@ export interface BrandInfo {
   primaryColor?: string;
   /** Optional absolute logo URL shown in the header. */
   logoUrl?: string | null;
+  /** Public contact email for the signature block (company.email). */
+  email?: string | null;
+  /** Public phone for the signature block (company.phone). */
+  phone?: string | null;
+  /** Public website for the signature block (company.websiteUrl). */
+  websiteUrl?: string | null;
 }
 
 /** Email clients (Gmail, Outlook) don't render SVG — only allow raster logos. */
@@ -103,6 +109,46 @@ function button(href: string, label: string, accent = '#bd5b3e'): string {
       </td>
     </tr>
   </table>`;
+}
+
+/** Strip scheme + trailing slash for a clean, clickable website label. */
+function displayHost(url: string): string {
+  return url.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+}
+
+/**
+ * Shared branded sign-off for operator-sent mail (contact reply, quote, order
+ * message). Renders "<person> · <brand>" (or just the brand) followed by the
+ * brand's real contact details from the company record — never the bare
+ * operator username on its own. Missing fields are simply omitted.
+ */
+function signatureBlock(brand: BrandInfo, signedBy?: string | null): string {
+  const accent = brand.primaryColor ?? '#bd5b3e';
+  const nameLine = signedBy
+    ? `${escapeHtml(signedBy)} · <span style="color:#6b5b48;">${escapeHtml(brand.name)}</span>`
+    : escapeHtml(brand.name);
+
+  const contactBits: string[] = [];
+  if (brand.phone) contactBits.push(`Tel. ${escapeHtml(brand.phone)}`);
+  if (brand.email) {
+    contactBits.push(
+      `<a href="mailto:${escapeHtml(brand.email)}" style="color:#6b5b48;text-decoration:none;">${escapeHtml(brand.email)}</a>`,
+    );
+  }
+  const contactLine = contactBits.length
+    ? `<div style="margin-top:3px;font-size:12px;color:#6b5b48;">${contactBits.join(' · ')}</div>`
+    : '';
+
+  const site = brand.websiteUrl || (brand.domain ? `https://${brand.domain}` : null);
+  const websiteLine = site
+    ? `<div style="margin-top:2px;font-size:12px;"><a href="${escapeHtml(site)}" style="color:${accent};text-decoration:none;">${escapeHtml(displayHost(site))}</a></div>`
+    : '';
+
+  return `<div style="margin:24px 0 0;padding-top:14px;border-top:1px solid #e2d3b6;">
+    <div style="font-size:13px;font-weight:600;color:#2d2419;">${nameLine}</div>
+    ${contactLine}
+    ${websiteLine}
+  </div>`;
 }
 
 export interface RenderedEmail {
@@ -312,9 +358,7 @@ export function inquiryQuoteEmail(opts: {
   const amountLine = opts.quotedAmount
     ? `<p style="margin:8px 0 0;font-size:18px;font-weight:700;color:${accent};">${escapeHtml(opts.quotedAmount)}</p>`
     : '';
-  const signature = opts.signedBy
-    ? `<p style="margin:20px 0 0;font-size:13px;color:#2d2419;">${escapeHtml(opts.signedBy)}<br /><span style="color:#6b5b48;">${escapeHtml(opts.brand.name)}</span></p>`
-    : `<p style="margin:20px 0 0;font-size:13px;color:#6b5b48;">— ${escapeHtml(opts.brand.name)}</p>`;
+  const signature = signatureBlock(opts.brand, opts.signedBy);
   return {
     subject: `Dein Angebot von ${opts.brand.name}`,
     html: layout({
@@ -346,13 +390,7 @@ export function contactReplyEmail(opts: {
   const subjectLine = opts.originalSubject
     ? `Re: ${opts.originalSubject}`
     : `Antwort von ${opts.brand.name}`;
-  const signature = opts.signedBy
-    ? `<p style="margin:20px 0 0;font-size:13px;color:#2d2419;">${escapeHtml(
-        opts.signedBy,
-      )}<br /><span style="color:#6b5b48;">${escapeHtml(opts.brand.name)}</span></p>`
-    : `<p style="margin:20px 0 0;font-size:13px;color:#6b5b48;">— ${escapeHtml(
-        opts.brand.name,
-      )}</p>`;
+  const signature = signatureBlock(opts.brand, opts.signedBy);
 
   const quoted = opts.originalMessage
     ? `<div style="margin-top:28px;padding-top:16px;border-top:1px solid #e2d3b6;">
@@ -961,13 +999,7 @@ export function orderMessageEmail(opts: {
   /** Optional order-tracker link surfaced as a button. */
   trackerUrl?: string | null;
 }): RenderedEmail {
-  const signature = opts.signedBy
-    ? `<p style="margin:20px 0 0;font-size:13px;color:#2d2419;">${escapeHtml(
-        opts.signedBy,
-      )}<br /><span style="color:#6b5b48;">${escapeHtml(opts.brand.name)}</span></p>`
-    : `<p style="margin:20px 0 0;font-size:13px;color:#6b5b48;">— ${escapeHtml(
-        opts.brand.name,
-      )}</p>`;
+  const signature = signatureBlock(opts.brand, opts.signedBy);
   const trackerButton = opts.trackerUrl
     ? button(opts.trackerUrl, 'Auftrag ansehen', opts.brand.primaryColor)
     : '';

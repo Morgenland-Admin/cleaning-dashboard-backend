@@ -12,6 +12,9 @@ export default tseslint.config(
       'coverage/**',
       '*.tsbuildinfo',
       'drizzle.config.ts',
+      // One-off ops scripts: outside the src tsconfig project, so typed
+      // linting can't resolve them. Typechecked separately via a scoped config.
+      'scripts/**',
     ],
   },
   js.configs.recommended,

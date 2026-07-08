@@ -106,12 +106,21 @@ export async function sendEmail(opts: SendOptions): Promise<{
 
 /** Convenience: a BrandInfo shape used by the templates, from a Company row. */
 export function brandInfoFromCompany(
-  c: CompanyLike & { primaryColor?: string | null; logoUrl?: string | null },
+  c: CompanyLike & {
+    primaryColor?: string | null;
+    logoUrl?: string | null;
+    email?: string | null;
+    phone?: string | null;
+    websiteUrl?: string | null;
+  },
 ): BrandInfo {
   return {
     name: c.name,
     domain: c.senderEmail?.split('@')[1] ?? '',
     primaryColor: c.primaryColor ?? undefined,
     logoUrl: c.logoUrl ?? null,
+    email: c.email ?? null,
+    phone: c.phone ?? null,
+    websiteUrl: c.websiteUrl ?? null,
   };
 }
