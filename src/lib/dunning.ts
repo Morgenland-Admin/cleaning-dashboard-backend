@@ -59,7 +59,10 @@ export async function sendDunningEmail(
     apiKey: companyRow.resendApiKey ?? undefined,
     replyTo: companyRow.email ?? undefined,
     email: dunningEmail({
-      brand: brandInfoFromCompany(companyRow),
+      brand: {
+        ...brandInfoFromCompany(companyRow),
+        logoUrl: companyRow.invoiceLogoUrl ?? companyRow.logoUrl,
+      },
       recipientName: invoice.recipientName,
       invoiceNumber: invoice.number ?? `#${invoice.id}`,
       invoiceDateFormatted: invoice.sentAt ? fmtDate(invoice.sentAt) : null,

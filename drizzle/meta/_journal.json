@@ -43,6 +43,13 @@
       "when": 1789000000000,
       "tag": "0005_add_company_invoice_numbering",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789000100000,
+      "tag": "0006_add_company_invoice_logo",
+      "breakpoints": true
     }
   ]
 }

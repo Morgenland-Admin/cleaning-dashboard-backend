@@ -137,6 +137,9 @@ export const company = pgTable('company', {
   // Rich per-brand email sign-off (support hours, HQ, tagline, review CTA, …).
   emailSignature: jsonb('email_signature').$type<EmailSignature>(),
   logoUrl: text('logo_url'),
+  // Wide wordmark for invoices/dunning (PDF + email header). Falls back to
+  // logoUrl (the square dashboard avatar) when unset.
+  invoiceLogoUrl: text('invoice_logo_url'),
   primaryColor: varchar('primary_color', { length: 9 }),
   senderEmail: text('sender_email'),
   senderName: text('sender_name'),

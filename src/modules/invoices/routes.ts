@@ -158,7 +158,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!companyRow) throw notFound('Company not found');
 
     const pdfData = buildInvoicePdfData(companyRow, row);
-    pdfData.logo = await fetchInvoiceLogo(companyRow.logoUrl);
+    pdfData.logo = await fetchInvoiceLogo(companyRow.invoiceLogoUrl ?? companyRow.logoUrl);
     const pdf = await renderInvoicePdf(pdfData);
     const filename = invoicePdfFilename(row.number ?? `Entwurf-${row.id}`, row.recipientName);
     const download = (request.query as { download?: string }).download === '1';

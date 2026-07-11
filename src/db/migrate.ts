@@ -41,6 +41,8 @@ interface LegacyConfig {
   websiteUrl: string;
   resendApiKey: string | null;
   logoUrl: string | null;
+  /** Wide wordmark for invoice PDF + email (coalesced; falls back to logoUrl). */
+  invoiceLogoUrl?: string;
   /** Public phone (coalesced — an admin edit is never clobbered). */
   phone?: string;
   /** Public mobile shown in the invoice header (coalesced). */
@@ -108,6 +110,7 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     websiteUrl: 'https://cleanilo.de',
     resendApiKey: env.RESEND_API_KEY_CLEANILO ?? null,
     logoUrl: 'https://reinigungs-portal.com/cleanilo.png',
+    invoiceLogoUrl: 'https://reinigungs-portal.com/cleanilo-invoice-logo.png',
     phone: '+49 40 432 189 15',
     mobile: '+49 177 6909604',
     primaryColor: '#1f8a4c', // eco green — "ökologisch sauber"
@@ -155,6 +158,7 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     websiteUrl: 'https://hamburg-teppichreinigung.de',
     resendApiKey: env.RESEND_API_KEY_HAMBURG ?? null,
     logoUrl: 'https://reinigungs-portal.com/hamburg-teppichreinigung.png',
+    invoiceLogoUrl: 'https://reinigungs-portal.com/hamburg-teppichreinigung-invoice-logo.png',
     phone: '+49 40 432 189 19',
     primaryColor: '#bd5b3e', // warm rust/brown
     invoiceNumberPrefix: 'HT',
@@ -258,6 +262,8 @@ async function main(): Promise<void> {
     if (cfg.resendApiKey) updateSet.resendApiKey = cfg.resendApiKey;
     // Only set a default logo when none exists — never clobber an admin upload.
     if (cfg.logoUrl) updateSet.logoUrl = sql`coalesce(${company.logoUrl}, ${cfg.logoUrl})`;
+    if (cfg.invoiceLogoUrl)
+      updateSet.invoiceLogoUrl = sql`coalesce(${company.invoiceLogoUrl}, ${cfg.invoiceLogoUrl})`;
     // Phone / mobile / accent: seed only where blank so an admin edit wins.
     if (cfg.phone) updateSet.phone = sql`coalesce(${company.phone}, ${cfg.phone})`;
     if (cfg.mobile) updateSet.mobile = sql`coalesce(${company.mobile}, ${cfg.mobile})`;
@@ -304,6 +310,7 @@ async function main(): Promise<void> {
         senderName: cfg.senderName,
         resendApiKey: cfg.resendApiKey,
         logoUrl: cfg.logoUrl,
+        invoiceLogoUrl: cfg.invoiceLogoUrl,
         websiteUrl: cfg.websiteUrl,
         email: cfg.senderEmail,
         phone: cfg.phone,

@@ -150,8 +150,10 @@ export async function sendInvoiceEmail(
 ): Promise<{ ok: boolean; skipped: boolean }> {
   if (!invoice.recipientEmail) return { ok: false, skipped: true };
 
+  // Invoices use the wide wordmark (invoiceLogoUrl), not the square avatar.
+  const logoSrc = companyRow.invoiceLogoUrl ?? companyRow.logoUrl;
   const pdfData = buildInvoicePdfData(companyRow, invoice);
-  pdfData.logo = await fetchInvoiceLogo(companyRow.logoUrl);
+  pdfData.logo = await fetchInvoiceLogo(logoSrc);
 
   // Render the PDF attachment (best-effort — fall back to HTML-only).
   let attachments: Array<{ filename: string; content: Buffer }> | undefined;
@@ -174,7 +176,7 @@ export async function sendInvoiceEmail(
     replyTo: companyRow.email ?? undefined,
     attachments,
     email: invoiceEmail({
-      brand: brandInfoFromCompany(companyRow),
+      brand: { ...brandInfoFromCompany(companyRow), logoUrl: logoSrc },
       recipientName: pdfData.recipientName,
       invoiceNumber: pdfData.invoiceNumber,
       invoiceDateFormatted: pdfData.invoiceDate,
