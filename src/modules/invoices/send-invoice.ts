@@ -85,6 +85,13 @@ export async function sendInvoiceEmail(
     email: companyRow.email,
     phone: companyRow.phone,
   };
+  const bank = {
+    accountHolder: companyRow.accountHolder ?? companyRow.legalName ?? companyRow.name,
+    iban: companyRow.iban,
+    bic: companyRow.bic,
+    bankName: companyRow.bankName,
+    bankAddress: companyRow.bankAddress,
+  };
 
   // Render the PDF attachment (best-effort — fall back to HTML-only).
   let attachments: Array<{ filename: string; content: Buffer }> | undefined;
@@ -107,6 +114,7 @@ export async function sendInvoiceEmail(
       notes: invoice.notes,
       accentColor: companyRow.primaryColor ?? '#bd5b3e',
       seller,
+      bank,
     });
     attachments = [{ filename: `Rechnung-${invoiceNumber}.pdf`, content: pdf }];
   } catch (err) {
@@ -138,6 +146,7 @@ export async function sendInvoiceEmail(
       totalFormatted,
       notes: invoice.notes,
       seller,
+      bank,
     }),
   });
   return { ok: result.ok && !result.skipped, skipped: result.skipped ?? false };

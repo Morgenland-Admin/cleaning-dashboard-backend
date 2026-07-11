@@ -20,6 +20,23 @@ export interface BrandInfo {
   phone?: string | null;
   /** Public website for the signature block (company.websiteUrl). */
   websiteUrl?: string | null;
+  /** Registered legal entity for the formal footer (company.legalName). */
+  legalName?: string | null;
+  /** Postal address lines for the formal footer (street, "PLZ Ort"). */
+  addressLines?: string[];
+  /** USt-IdNr. shown in the formal footer. */
+  vatId?: string | null;
+  /** Handelsregister / registration number shown in the formal footer. */
+  registrationNumber?: string | null;
+}
+
+/** Seller bank details rendered as the "Bankverbindung" block on payment mail. */
+export interface BankInfo {
+  accountHolder?: string | null;
+  iban?: string | null;
+  bic?: string | null;
+  bankName?: string | null;
+  bankAddress?: string | null;
 }
 
 /** Email clients (Gmail, Outlook) don't render SVG — only allow raster logos. */
@@ -86,9 +103,9 @@ function layout(opts: {
           </table>
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="max-width:560px;width:100%;margin-top:16px;">
             <tr>
-              <td style="padding:0 32px;font-size:11px;color:#6b5b48;text-align:center;line-height:1.5;">
-                ${opts.footerNote ? escapeHtml(opts.footerNote) + '<br />' : ''}
-                ${escapeHtml(opts.brand.name)} · ${escapeHtml(opts.brand.domain)}
+              <td style="padding:0 32px;font-size:11px;color:#6b5b48;text-align:center;line-height:1.6;">
+                ${opts.footerNote ? '<div style="margin-bottom:10px;">' + escapeHtml(opts.footerNote) + '</div>' : ''}
+                ${legalFooter(opts.brand, accent)}
               </td>
             </tr>
           </table>
@@ -114,6 +131,97 @@ function button(href: string, label: string, accent = '#bd5b3e'): string {
 /** Strip scheme + trailing slash for a clean, clickable website label. */
 function displayHost(url: string): string {
   return url.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+}
+
+/** Group an IBAN into readable blocks of four ("DE91 2022 0800 0043 …"). */
+function formatIban(iban: string): string {
+  return iban
+    .replace(/\s+/g, '')
+    .toUpperCase()
+    .replace(/(.{4})/g, '$1 ')
+    .trim();
+}
+
+/**
+ * Formal company footer shown on every branded email. Renders the registered
+ * legal entity, postal address, VAT / registration number and public contact —
+ * the identity a business email is expected to carry. Falls back gracefully to
+ * just "Name · domain" when the extended fields aren't set (e.g. system mail or
+ * a brand an admin hasn't fully filled in yet).
+ */
+function legalFooter(brand: BrandInfo, accent: string): string {
+  const identity = brand.legalName && brand.legalName !== brand.name ? brand.legalName : brand.name;
+  const addr = (brand.addressLines ?? []).filter(Boolean).join(' · ');
+  const line1 = [escapeHtml(identity), addr ? escapeHtml(addr) : ''].filter(Boolean).join(' · ');
+
+  const idBits: string[] = [];
+  if (brand.vatId) idBits.push(`USt-IdNr. ${escapeHtml(brand.vatId)}`);
+  if (brand.registrationNumber) idBits.push(`Reg-Nr. ${escapeHtml(brand.registrationNumber)}`);
+  if (brand.phone) idBits.push(`Tel. ${escapeHtml(brand.phone)}`);
+  if (brand.email) {
+    idBits.push(
+      `<a href="mailto:${escapeHtml(brand.email)}" style="color:#6b5b48;text-decoration:none;">${escapeHtml(brand.email)}</a>`,
+    );
+  }
+
+  const site = brand.websiteUrl || (brand.domain ? `https://${brand.domain}` : null);
+  const brandLine = site
+    ? `<a href="${escapeHtml(site)}" style="color:${accent};text-decoration:none;font-weight:600;">${escapeHtml(displayHost(site))}</a>`
+    : `<span style="font-weight:600;">${escapeHtml(brand.domain || brand.name)}</span>`;
+
+  return `
+    ${line1 ? `<div style="color:#5b4b38;">${line1}</div>` : ''}
+    ${idBits.length ? `<div style="margin-top:2px;">${idBits.join(' · ')}</div>` : ''}
+    <div style="margin-top:8px;">${brandLine}</div>`;
+}
+
+/**
+ * "Bankverbindung" payment card for invoice + dunning mail — the seller's bank
+ * account with a monospace IBAN, plus the invoice number as Verwendungszweck so
+ * the customer can pay by transfer without hunting for the details. Renders
+ * nothing when no account is configured.
+ */
+function bankTransferBlock(opts: {
+  accent: string;
+  bank: BankInfo;
+  reference?: string | null;
+  amount?: string | null;
+}): string {
+  // No IBAN → nothing to pay into; skip the block entirely.
+  if (!opts.bank.iban) return '';
+  const rows: Array<[string, string, boolean]> = [];
+  if (opts.bank.accountHolder)
+    rows.push(['Kontoinhaber', escapeHtml(opts.bank.accountHolder), false]);
+  if (opts.bank.iban) rows.push(['IBAN', escapeHtml(formatIban(opts.bank.iban)), true]);
+  if (opts.bank.bic) rows.push(['BIC', escapeHtml(opts.bank.bic), true]);
+  if (opts.bank.bankName) {
+    const bank = opts.bank.bankAddress
+      ? `${opts.bank.bankName}, ${opts.bank.bankAddress}`
+      : opts.bank.bankName;
+    rows.push(['Bank', escapeHtml(bank), false]);
+  }
+  if (opts.reference) rows.push(['Verwendungszweck', escapeHtml(opts.reference), true]);
+  if (opts.amount) rows.push(['Betrag', escapeHtml(opts.amount), true]);
+  if (!rows.length) return '';
+
+  const rowsHtml = rows
+    .map(
+      ([label, value, mono]) => `<tr>
+        <td style="padding:5px 14px 5px 0;font-size:11px;text-transform:uppercase;letter-spacing:0.6px;color:#6b5b48;white-space:nowrap;vertical-align:top;">${label}</td>
+        <td style="padding:5px 0;font-size:14px;color:#2d2419;${mono ? "font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;letter-spacing:0.3px;" : ''}">${value}</td>
+      </tr>`,
+    )
+    .join('');
+
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:20px 0 0;background:#f4ebdc;border:1px solid #e2d3b6;border-left:3px solid ${opts.accent};border-radius:10px;">
+      <tr>
+        <td style="padding:16px 18px;">
+          <div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:${opts.accent};margin-bottom:10px;">Bankverbindung</div>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0">${rowsHtml}</table>
+        </td>
+      </tr>
+    </table>`;
 }
 
 /**
@@ -525,7 +633,10 @@ export function invoiceEmail(opts: {
     email?: string | null;
     phone?: string | null;
   };
+  /** Seller bank details for the Bankverbindung / payment-by-transfer block. */
+  bank?: BankInfo;
 }): RenderedEmail {
+  const accent = opts.brand.primaryColor ?? '#bd5b3e';
   const itemRowsHtml = opts.lineItems
     .map(
       (l) => `<tr>
@@ -556,9 +667,18 @@ export function invoiceEmail(opts: {
             <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>`;
 
+  const bankHtml = opts.bank
+    ? bankTransferBlock({
+        accent,
+        bank: opts.bank,
+        reference: opts.invoiceNumber,
+        amount: opts.totalFormatted,
+      })
+    : '';
+  const toAccount = bankHtml ? ' auf das unten genannte Konto' : '';
   const paymentLine = opts.dueDateFormatted
-    ? `Bitte überweisen Sie den Gesamtbetrag bis zum <strong>${escapeHtml(opts.dueDateFormatted)}</strong> (Zahlungsziel ${opts.paymentTermsDays} Tage).`
-    : `Bitte überweisen Sie den Gesamtbetrag innerhalb von <strong>${opts.paymentTermsDays} Tagen</strong>.`;
+    ? `Bitte überweisen Sie den Gesamtbetrag bis zum <strong>${escapeHtml(opts.dueDateFormatted)}</strong> (Zahlungsziel ${opts.paymentTermsDays} Tage)${toAccount}.`
+    : `Bitte überweisen Sie den Gesamtbetrag innerhalb von <strong>${opts.paymentTermsDays} Tagen</strong>${toAccount}.`;
 
   const notesHtml = opts.notes
     ? `<p style="margin:16px 0 0;font-size:13px;color:#6b5b48;">${nl2br(opts.notes)}</p>`
@@ -621,6 +741,7 @@ export function invoiceEmail(opts: {
         </table>
 
         <p style="margin:16px 0 0;font-size:14px;">${paymentLine}</p>
+        ${bankHtml}
         ${notesHtml}
 
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e2d3b6;">
@@ -664,7 +785,10 @@ export function dunningEmail(opts: {
     email?: string | null;
     phone?: string | null;
   };
+  /** Seller bank details for the Bankverbindung block. */
+  bank?: BankInfo;
 }): RenderedEmail {
+  const accent = opts.brand.primaryColor ?? '#bd5b3e';
   const level = Math.max(1, opts.dunningLevel);
   const heading = level === 1 ? 'Zahlungserinnerung' : level === 2 ? '1. Mahnung' : '2. Mahnung';
   const intro =
@@ -692,6 +816,16 @@ export function dunningEmail(opts: {
   ]
     .filter(Boolean)
     .join('<br />');
+
+  const bankHtml = opts.bank
+    ? bankTransferBlock({
+        accent,
+        bank: opts.bank,
+        reference: opts.invoiceNumber,
+        amount: opts.totalFormatted,
+      })
+    : '';
+  const toAccount = bankHtml ? ' auf das unten genannte Konto' : '';
 
   return {
     subject: `${heading} zu Rechnung ${opts.invoiceNumber} · ${opts.brand.name}`,
@@ -725,9 +859,11 @@ export function dunningEmail(opts: {
         ${overdueLine ? `<p style="margin:0 0 16px;font-size:14px;">${overdueLine}</p>` : ''}
 
         <p style="margin:0 0 16px;font-size:14px;">
-          Bitte überweisen Sie den offenen Betrag unter Angabe der Rechnungsnummer.
+          Bitte überweisen Sie den offenen Betrag unter Angabe der Rechnungsnummer${toAccount}.
           Sollten Sie die Zahlung bereits veranlasst haben, betrachten Sie dieses Schreiben als gegenstandslos.
         </p>
+
+        ${bankHtml}
 
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e2d3b6;">
           <tr>

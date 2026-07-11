@@ -39,6 +39,23 @@ export interface InvoicePdfData {
     email?: string | null;
     phone?: string | null;
   };
+  /** Seller bank details rendered as the Bankverbindung block. */
+  bank?: {
+    accountHolder?: string | null;
+    iban?: string | null;
+    bic?: string | null;
+    bankName?: string | null;
+    bankAddress?: string | null;
+  };
+}
+
+/** Group an IBAN into blocks of four for readability. */
+function formatIbanPdf(iban: string): string {
+  return iban
+    .replace(/\s+/g, '')
+    .toUpperCase()
+    .replace(/(.{4})/g, '$1 ')
+    .trim();
 }
 
 const PAGE_LEFT = 50;
@@ -225,6 +242,56 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
         .text(data.notes, PAGE_LEFT, y, {
           width: PAGE_RIGHT - PAGE_LEFT,
         });
+      y = doc.y;
+    }
+
+    // Bankverbindung — payment card so the customer can pay by transfer.
+    const bankRows: Array<[string, string]> = [];
+    if (data.bank?.accountHolder) bankRows.push(['Kontoinhaber', data.bank.accountHolder]);
+    if (data.bank?.iban) bankRows.push(['IBAN', formatIbanPdf(data.bank.iban)]);
+    if (data.bank?.bic) bankRows.push(['BIC', data.bank.bic]);
+    if (data.bank?.bankName) {
+      bankRows.push([
+        'Bank',
+        data.bank.bankAddress
+          ? `${data.bank.bankName}, ${data.bank.bankAddress}`
+          : data.bank.bankName,
+      ]);
+    }
+    bankRows.push(['Verwendungszweck', data.invoiceNumber]);
+    if (data.bank?.iban) {
+      y += 16;
+      const boxTop = y;
+      const bankLabelX = PAGE_LEFT + 12;
+      const bankValX = PAGE_LEFT + 120;
+      let by = boxTop + 12;
+      doc
+        .fillColor(accent)
+        .font('Helvetica-Bold')
+        .fontSize(9)
+        .text('BANKVERBINDUNG', bankLabelX, by);
+      by += 16;
+      const bankValW = PAGE_RIGHT - bankValX - 12;
+      doc.fontSize(9);
+      for (const [label, value] of bankRows) {
+        // Values can wrap (e.g. the bank name + address) — advance by the real
+        // rendered height so the next row never overlaps the wrapped line.
+        const valH = doc.font('Helvetica-Bold').heightOfString(value, { width: bankValW });
+        doc.fillColor(MUTED).font('Helvetica').text(label, bankLabelX, by, { width: 100 });
+        doc.fillColor(INK).font('Helvetica-Bold').text(value, bankValX, by, { width: bankValW });
+        by += Math.max(15, valH + 4);
+      }
+      const boxBottom = by + 4;
+      // Draw the framing box behind the text we just laid out.
+      doc
+        .save()
+        .rect(PAGE_LEFT, boxTop, PAGE_RIGHT - PAGE_LEFT, boxBottom - boxTop)
+        .fillOpacity(1)
+        .lineWidth(0.75)
+        .strokeColor(accent)
+        .stroke()
+        .restore();
+      y = boxBottom;
     }
 
     // Footer: seller legal block (Pflichtangaben)

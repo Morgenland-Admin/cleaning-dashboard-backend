@@ -112,8 +112,20 @@ export function brandInfoFromCompany(
     email?: string | null;
     phone?: string | null;
     websiteUrl?: string | null;
+    legalName?: string | null;
+    addressLine1?: string | null;
+    addressLine2?: string | null;
+    postalCode?: string | null;
+    city?: string | null;
+    vatId?: string | null;
+    registrationNumber?: string | null;
   },
 ): BrandInfo {
+  const addressLines = [
+    c.addressLine1,
+    c.addressLine2,
+    [c.postalCode, c.city].filter(Boolean).join(' ') || null,
+  ].filter((x): x is string => Boolean(x));
   return {
     name: c.name,
     domain: c.senderEmail?.split('@')[1] ?? '',
@@ -122,5 +134,9 @@ export function brandInfoFromCompany(
     email: c.email ?? null,
     phone: c.phone ?? null,
     websiteUrl: c.websiteUrl ?? null,
+    legalName: c.legalName ?? null,
+    addressLines,
+    vatId: c.vatId ?? null,
+    registrationNumber: c.registrationNumber ?? null,
   };
 }

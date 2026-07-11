@@ -15,6 +15,13 @@
       "when": 1780663205637,
       "tag": "0001_rare_ultragirl",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783762278337,
+      "tag": "0002_add_company_bank_details",
+      "breakpoints": true
     }
   ]
 }

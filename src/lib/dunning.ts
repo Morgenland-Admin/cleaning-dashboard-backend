@@ -74,6 +74,13 @@ export async function sendDunningEmail(
         email: companyRow.email,
         phone: companyRow.phone,
       },
+      bank: {
+        accountHolder: companyRow.accountHolder ?? companyRow.legalName ?? companyRow.name,
+        iban: companyRow.iban,
+        bic: companyRow.bic,
+        bankName: companyRow.bankName,
+        bankAddress: companyRow.bankAddress,
+      },
     }),
   });
   return { ok: result.ok && !result.skipped, skipped: result.skipped ?? false };

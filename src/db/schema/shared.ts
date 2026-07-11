@@ -113,6 +113,13 @@ export const company = pgTable('company', {
   country: varchar('country', { length: 2 }).default('DE'),
   vatId: varchar('vat_id', { length: 32 }),
   registrationNumber: varchar('registration_number', { length: 64 }),
+  // Bank details for the seller's own invoicing (Bankverbindung on Rechnungen +
+  // Mahnungen). Per-brand so each legal entity can carry its own account.
+  accountHolder: text('account_holder'),
+  iban: varchar('iban', { length: 34 }),
+  bic: varchar('bic', { length: 11 }),
+  bankName: text('bank_name'),
+  bankAddress: text('bank_address'),
   logoUrl: text('logo_url'),
   primaryColor: varchar('primary_color', { length: 9 }),
   senderEmail: text('sender_email'),

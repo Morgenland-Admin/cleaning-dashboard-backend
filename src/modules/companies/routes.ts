@@ -45,6 +45,11 @@ const companyPublicColumns = {
   country: company.country,
   vatId: company.vatId,
   registrationNumber: company.registrationNumber,
+  accountHolder: company.accountHolder,
+  iban: company.iban,
+  bic: company.bic,
+  bankName: company.bankName,
+  bankAddress: company.bankAddress,
   logoUrl: company.logoUrl,
   primaryColor: company.primaryColor,
   senderEmail: company.senderEmail,
@@ -137,6 +142,21 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     country: z.string().length(2).nullable().optional(),
     vatId: z.string().max(32).nullable().optional(),
     registrationNumber: z.string().max(64).nullable().optional(),
+    accountHolder: z.string().max(200).nullable().optional(),
+    iban: z
+      .string()
+      .transform((s) => s.replace(/\s+/g, '').toUpperCase())
+      .pipe(z.string().regex(/^[A-Z]{2}[0-9A-Z]{13,32}$/, 'IBAN must be 15–34 chars'))
+      .nullable()
+      .optional(),
+    bic: z
+      .string()
+      .transform((s) => s.replace(/\s+/g, '').toUpperCase())
+      .pipe(z.string().regex(/^[A-Z0-9]{8}([A-Z0-9]{3})?$/, 'BIC must be 8 or 11 chars'))
+      .nullable()
+      .optional(),
+    bankName: z.string().max(200).nullable().optional(),
+    bankAddress: z.string().max(200).nullable().optional(),
     primaryColor: z
       .string()
       .regex(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/)
