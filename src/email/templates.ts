@@ -249,12 +249,7 @@ function bankTransferBlock(opts: {
     ),
   );
   if (opts.bank.bic) account.push(line('BIC', escapeHtml(opts.bank.bic), MONO));
-  if (opts.bank.bankName) {
-    const bank = opts.bank.bankAddress
-      ? `${opts.bank.bankName}, ${opts.bank.bankAddress}`
-      : opts.bank.bankName;
-    account.push(line('Bank', escapeHtml(bank)));
-  }
+  if (opts.bank.bankName) account.push(line('Bank', escapeHtml(opts.bank.bankName)));
 
   const payment: string[] = [];
   if (opts.reference)
@@ -779,8 +774,11 @@ export function invoiceEmail(opts: {
   };
   /** Seller bank details for the Bankverbindung / payment-by-transfer block. */
   bank?: BankInfo;
+  /** 'transfer' (default) shows bank + due date; 'card'/'cash' show "paid". */
+  paymentMethod?: string | null;
 }): RenderedEmail {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
+  const paid = opts.paymentMethod === 'card' || opts.paymentMethod === 'cash';
   const itemRowsHtml = opts.lineItems
     .map(
       (l) => `<tr>
@@ -811,18 +809,24 @@ export function invoiceEmail(opts: {
             <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>`;
 
-  const bankHtml = opts.bank
-    ? bankTransferBlock({
-        accent,
-        bank: opts.bank,
-        reference: opts.invoiceNumber,
-        amount: opts.totalFormatted,
-      })
-    : '';
+  // Paid by card/cash → no bank block, a "paid" acknowledgement instead.
+  const bankHtml =
+    !paid && opts.bank
+      ? bankTransferBlock({
+          accent,
+          bank: opts.bank,
+          reference: opts.invoiceNumber,
+          amount: opts.totalFormatted,
+        })
+      : '';
   const toAccount = bankHtml ? ' auf das unten genannte Konto' : '';
-  const paymentLine = opts.dueDateFormatted
-    ? `Bitte überweisen Sie den Gesamtbetrag bis zum <strong>${escapeHtml(opts.dueDateFormatted)}</strong> (Zahlungsziel ${opts.paymentTermsDays} Tage)${toAccount}.`
-    : `Bitte überweisen Sie den Gesamtbetrag innerhalb von <strong>${opts.paymentTermsDays} Tagen</strong>${toAccount}.`;
+  const paymentLine = paid
+    ? opts.paymentMethod === 'card'
+      ? `Der Rechnungsbetrag wurde bereits per Kartenzahlung beglichen. Vielen Dank!`
+      : `Der Rechnungsbetrag wurde bereits in bar beglichen. Vielen Dank!`
+    : opts.dueDateFormatted
+      ? `Bitte überweisen Sie den Gesamtbetrag bis zum <strong>${escapeHtml(opts.dueDateFormatted)}</strong> (Zahlungsziel ${opts.paymentTermsDays} Tage)${toAccount}.`
+      : `Bitte überweisen Sie den Gesamtbetrag innerhalb von <strong>${opts.paymentTermsDays} Tagen</strong>${toAccount}.`;
 
   const notesHtml = opts.notes
     ? `<p style="margin:16px 0 0;font-size:13px;color:#6b5b48;">${nl2br(opts.notes)}</p>`

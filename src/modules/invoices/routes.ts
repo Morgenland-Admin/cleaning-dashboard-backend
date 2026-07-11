@@ -39,7 +39,9 @@ const createSchema = z.object({
   lineItems: z.array(lineItemSchema).min(1).max(100),
   /** VAT rate; taxCents is computed server-side. */
   taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).default(19),
-  paymentTermsDays: z.number().int().min(0).max(120).default(14),
+  paymentTermsDays: z.number().int().min(0).max(120).default(7),
+  /** How the invoice is settled — drives the payment text + bank block. */
+  paymentMethod: z.enum(['transfer', 'card', 'cash']).default('transfer'),
   notes: z.string().max(2000).optional(),
 });
 
@@ -52,6 +54,7 @@ const draftUpdateSchema = z.object({
   lineItems: z.array(lineItemSchema).min(1).max(100).optional(),
   taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).optional(),
   paymentTermsDays: z.number().int().min(0).max(120).optional(),
+  paymentMethod: z.enum(['transfer', 'card', 'cash']).optional(),
   notes: z.string().max(2000).nullable().optional(),
   status: z.enum(['void']).optional(),
   odooInvoiceId: z.string().max(255).nullable().optional(),
@@ -199,6 +202,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           taxCents,
           totalCents,
           paymentTermsDays: body.paymentTermsDays,
+          paymentMethod: body.paymentMethod,
           notes: body.notes,
           status: 'draft',
         })
@@ -287,11 +291,13 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     let row = current;
     if (current.status === 'draft') {
       // §14 UStG: mandatory before issue.
+      // Leistungsdatum is optional — operators can leave it off (it simply
+      // isn't printed). The recipient postal address stays required (§14 UStG
+      // for invoices over 250 €).
       const missing: string[] = [];
       if (!current.recipientAddressLine1) missing.push('Empfänger-Straße');
       if (!current.recipientPostalCode) missing.push('Empfänger-PLZ');
       if (!current.recipientCity) missing.push('Empfänger-Ort');
-      if (!current.serviceDate) missing.push('Leistungsdatum');
       if (missing.length > 0) {
         reply.code(400).send({
           error: `Pflichtangaben fehlen (§14 UStG): ${missing.join(', ')}`,

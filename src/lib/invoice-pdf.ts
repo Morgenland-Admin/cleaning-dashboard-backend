@@ -30,6 +30,8 @@ export interface InvoicePdfData {
   taxRateLabel: string | null;
   total: string;
   notes?: string | null;
+  /** 'transfer' (default) shows bank + due date; 'card'/'cash' show "paid". */
+  paymentMethod?: string | null;
   accentColor: string;
   /** Optional raster brand logo (PNG/JPEG) drawn top-left; falls back to text. */
   logo?: Buffer | null;
@@ -109,6 +111,7 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     doc.on('error', reject);
 
     const accent = /^#[0-9a-fA-F]{6}$/.test(data.accentColor) ? data.accentColor : '#bd5b3e';
+    const paid = data.paymentMethod === 'card' || data.paymentMethod === 'cash';
 
     // ── Header ──────────────────────────────────────────────────────────
     // Right column: full sender / contact block (brand, entity, address,
@@ -196,7 +199,7 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       ['Rechnungsdatum', data.invoiceDate],
     ];
     if (data.serviceDateLabel) meta.push(['Leistungsdatum', data.serviceDateLabel]);
-    if (data.dueDate) meta.push(['Fällig bis', data.dueDate]);
+    if (data.dueDate && !paid) meta.push(['Fällig bis', data.dueDate]);
     let my = Math.max(senderBottom + 12, 150);
     for (const [label, value] of meta) {
       doc
@@ -293,15 +296,19 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       y = doc.y + 6;
     }
 
-    // Payment terms
+    // Payment terms — transfer shows due date + bank ref; card/cash = paid.
     y += 10;
-    const paymentText = data.dueDate
-      ? `Bitte überweisen Sie den Gesamtbetrag bis zum ${data.dueDate} (Zahlungsziel ${data.paymentTermsDays} Tage).`
-      : `Bitte überweisen Sie den Gesamtbetrag innerhalb von ${data.paymentTermsDays} Tagen.`;
+    const paymentText = paid
+      ? data.paymentMethod === 'card'
+        ? 'Der Rechnungsbetrag wurde per Kartenzahlung beglichen. Vielen Dank!'
+        : 'Der Rechnungsbetrag wurde in bar beglichen. Vielen Dank!'
+      : data.dueDate
+        ? `Bitte überweisen Sie den Gesamtbetrag bis zum ${data.dueDate} (Zahlungsziel ${data.paymentTermsDays} Tage).`
+        : `Bitte überweisen Sie den Gesamtbetrag innerhalb von ${data.paymentTermsDays} Tagen.`;
     doc
-      .font('Helvetica')
+      .font(paid ? 'Helvetica-Bold' : 'Helvetica')
       .fontSize(10)
-      .fillColor(INK)
+      .fillColor(paid ? accent : INK)
       .text(paymentText, PAGE_LEFT, y, {
         width: PAGE_RIGHT - PAGE_LEFT,
       });
@@ -318,19 +325,20 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       y = doc.y;
     }
 
-    // Payment reference (Verwendungszweck) so the transfer can be matched.
-    doc
-      .font('Helvetica')
-      .fontSize(9)
-      .fillColor(MUTED)
-      .text(
-        `Bitte geben Sie bei der Überweisung die Rechnungsnummer ${data.invoiceNumber} an.`,
-        PAGE_LEFT,
-        y,
-        {
-          width: PAGE_RIGHT - PAGE_LEFT,
-        },
-      );
+    // Payment reference (Verwendungszweck) — only relevant for a bank transfer.
+    if (!paid)
+      doc
+        .font('Helvetica')
+        .fontSize(9)
+        .fillColor(MUTED)
+        .text(
+          `Bitte geben Sie bei der Überweisung die Rechnungsnummer ${data.invoiceNumber} an.`,
+          PAGE_LEFT,
+          y,
+          {
+            width: PAGE_RIGHT - PAGE_LEFT,
+          },
+        );
 
     // ── Footer: legal Pflichtangaben in three columns (Impressum-style) ──
     const col1 = [

@@ -497,7 +497,9 @@ function buildTenantTables(schemaName: string) {
         .$type<Array<{ label: string; quantity: number; unitPriceCents: number }>>()
         .notNull()
         .default([]),
-      paymentTermsDays: integer('payment_terms_days').notNull().default(14),
+      paymentTermsDays: integer('payment_terms_days').notNull().default(7),
+      /** How the invoice is settled: 'transfer' (default) | 'card' | 'cash'. */
+      paymentMethod: varchar('payment_method', { length: 16 }).notNull().default('transfer'),
       dueAt: timestamp('due_at', { withTimezone: true }),
       sentAt: timestamp('sent_at', { withTimezone: true }),
       paidAt: timestamp('paid_at', { withTimezone: true }),
@@ -1087,7 +1089,8 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
   "tax_cents" integer DEFAULT 0 NOT NULL,
   "total_cents" integer DEFAULT 0 NOT NULL,
   "line_items" jsonb DEFAULT '[]'::jsonb NOT NULL,
-  "payment_terms_days" integer DEFAULT 14 NOT NULL,
+  "payment_terms_days" integer DEFAULT 7 NOT NULL,
+  "payment_method" varchar(16) DEFAULT 'transfer' NOT NULL,
   "due_at" timestamp with time zone,
   "sent_at" timestamp with time zone,
   "paid_at" timestamp with time zone,
@@ -1122,6 +1125,7 @@ ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_country" varchar
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "service_date" date;
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "service_date_end" date;
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "tax_rate_percent" integer DEFAULT 19 NOT NULL;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "payment_method" varchar(16) DEFAULT 'transfer' NOT NULL;
 
 CREATE TABLE IF NOT EXISTS ${q}."invoice_status_log" (
   "id" serial PRIMARY KEY NOT NULL,

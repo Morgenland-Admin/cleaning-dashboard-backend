@@ -26,6 +26,7 @@ export interface InvoiceForEmail {
   totalCents: number;
   lineItems: Array<{ label: string; quantity: number; unitPriceCents: number }>;
   notes: string | null;
+  paymentMethod?: string | null;
 }
 
 interface MinimalLogger {
@@ -71,8 +72,9 @@ export function buildInvoicePdfData(
     recipientName: invoice.recipientName,
     recipientEmail: invoice.recipientEmail,
     recipientAddressLines,
+    // Single date unless a genuinely different end date is set (never "X – X").
     serviceDateLabel: invoice.serviceDate
-      ? invoice.serviceDateEnd
+      ? invoice.serviceDateEnd && invoice.serviceDateEnd !== invoice.serviceDate
         ? `${fmtDateStr(invoice.serviceDate)} – ${fmtDateStr(invoice.serviceDateEnd)}`
         : fmtDateStr(invoice.serviceDate)
       : null,
@@ -87,6 +89,7 @@ export function buildInvoicePdfData(
     taxRateLabel: taxRate > 0 ? `${taxRate} %` : null,
     total: formatEurFromCents(invoice.totalCents),
     notes: invoice.notes,
+    paymentMethod: invoice.paymentMethod ?? 'transfer',
     accentColor: companyRow.primaryColor ?? '#bd5b3e',
     seller: {
       name: companyRow.legalName ?? companyRow.name,
@@ -158,6 +161,7 @@ export async function sendInvoiceEmail(
       notes: pdfData.notes,
       seller: pdfData.seller,
       bank: pdfData.bank,
+      paymentMethod: pdfData.paymentMethod,
     }),
   });
   return { ok: result.ok && !result.skipped, skipped: result.skipped ?? false };
