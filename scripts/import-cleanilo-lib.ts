@@ -19,9 +19,11 @@ export interface RawInvoice {
 }
 
 export interface ParsedInvoice {
-  invoiceNumber: string; // original, e.g. "2023/1201"
+  invoiceNumber: string; // final, unique number ("2023/1238-1" for a de-duped collision)
+  originalNumber: string; // as scanned ("2023/1238"); preserved for GoBD traceability
   sourceFile: string;
-  date: string;
+  date: string; // valid ISO date — resolved to <year>-01-01 when the source was blank
+  dateEstimated: boolean; // true when the source `datum` was missing/unparseable
   grossCents: number;
   service: string;
   name: string;
@@ -64,6 +66,10 @@ export interface ImportPlan {
   invoices: ParsedInvoice[];
   customers: PlannedCustomer[];
   merges: MergeRecord[];
+  /** Empty rows (no customer / no usable data) — skipped, not imported. */
+  skipped: ParsedInvoice[];
+  /** Collisions renumbered with a "-N" suffix (original → final). */
+  renumbered: Array<{ from: string; to: string; name: string }>;
 }
 
 export const CLEANILO_SLUG = 'cleanilo';
@@ -143,14 +149,26 @@ function lev(a: string, b: string): number {
   return prev[n]!;
 }
 
+/** Resolve a usable ISO date; blank/unparseable source dates fall back to the
+ * invoice-number's year (Jan 1) so the record still sorts into the right year. */
+function resolveDate(datum: string, rg: string): { date: string; estimated: boolean } {
+  if (/^\d{4}-\d{2}-\d{2}$/.test((datum ?? '').trim()))
+    return { date: datum.trim(), estimated: false };
+  const year = (rg.split('/')[0] ?? '').trim();
+  return { date: `${/^\d{4}$/.test(year) ? year : '2023'}-01-01`, estimated: true };
+}
+
 export function parseInvoices(jsonPath: string): ParsedInvoice[] {
   const raw = JSON.parse(readFileSync(jsonPath, 'utf8')) as RawInvoice[];
   return raw.map((r) => {
     const { name, street, plz, city } = parseKunde(r.kunde);
+    const { date, estimated } = resolveDate(r.datum, r.rg);
     return {
       invoiceNumber: r.rg,
+      originalNumber: r.rg,
       sourceFile: r.file,
-      date: r.datum,
+      date,
+      dateEstimated: estimated,
       grossCents: Math.round(Number(r.brutto) * 100),
       service: r.leistung,
       name,
@@ -306,9 +324,41 @@ export function buildPlan(invoices: ParsedInvoice[]): {
   return { customers, merges };
 }
 
+/** Empty row: no customer name and no address — skipped per Kabir (e.g. 2023/1224). */
+export function isEmptyInvoice(inv: ParsedInvoice): boolean {
+  return inv.name.trim() === '' && !inv.street && !inv.plz;
+}
+
+/**
+ * The source reused a handful of invoice numbers (manually assigned, duplicated
+ * by accident). Kabir's rule: keep the first occurrence's number, suffix each
+ * later one with "-1", "-2", … so every invoice number is unique for GoBD.
+ * Mutates `invoiceNumber`; `originalNumber` is left untouched.
+ */
+export function renumberCollisions(
+  invoices: ParsedInvoice[],
+): Array<{ from: string; to: string; name: string }> {
+  const seen = new Map<string, number>();
+  const renumbered: Array<{ from: string; to: string; name: string }> = [];
+  for (const inv of invoices) {
+    const count = seen.get(inv.originalNumber) ?? 0;
+    seen.set(inv.originalNumber, count + 1);
+    if (count > 0) {
+      inv.invoiceNumber = `${inv.originalNumber}-${count}`;
+      renumbered.push({ from: inv.originalNumber, to: inv.invoiceNumber, name: inv.name });
+    }
+  }
+  return renumbered;
+}
+
 export function makePlan(jsonPath: string, csvPath: string): ImportPlan {
-  const invoices = parseInvoices(jsonPath);
-  applyMatches(invoices, parseReconciliation(csvPath));
+  const all = parseInvoices(jsonPath);
+  // Match against the CRM by the original scanned number (the CSV uses those)…
+  applyMatches(all, parseReconciliation(csvPath));
+  // …then drop empty rows and make the reused numbers unique.
+  const skipped = all.filter(isEmptyInvoice);
+  const invoices = all.filter((i) => !isEmptyInvoice(i));
+  const renumbered = renumberCollisions(invoices);
   const { customers, merges } = buildPlan(invoices);
-  return { invoices, customers, merges };
+  return { invoices, customers, merges, skipped, renumbered };
 }

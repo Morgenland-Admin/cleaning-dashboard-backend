@@ -20,8 +20,10 @@ import { eur, makePlan, type ImportPlan } from './import-cleanilo-lib.ts';
 type LoyaltyTier = 'neukunde' | 'stammkunde' | 'premium';
 
 function printReport(plan: ImportPlan): void {
-  const { invoices, customers, merges } = plan;
+  const { invoices, customers, merges, skipped, renumbered } = plan;
   const grossTotal = invoices.reduce((s, i) => s + i.grossCents, 0);
+  const skippedTotal = skipped.reduce((s, i) => s + i.grossCents, 0);
+  const originalTotal = grossTotal + skippedTotal;
   const verifiedCount = customers.filter((c) => !c.emailIsPlaceholder).length;
   const b2bCount = customers.filter((c) => c.isB2B).length;
   const tierCounts: Record<LoyaltyTier, number> = { neukunde: 0, stammkunde: 0, premium: 0 };
@@ -33,8 +35,19 @@ function printReport(plan: ImportPlan): void {
   L('  CLEANILO HISTORICAL IMPORT — DRY RUN (nothing written)');
   L('══════════════════════════════════════════════════════════════\n');
   L('TOTALS');
-  L(`  Invoices (order history)      ${invoices.length}`);
-  L(`  Gross volume                  ${eur(grossTotal)}`);
+  L(`  Invoices imported             ${invoices.length}`);
+  L(`  Gross volume imported         ${eur(grossTotal)}`);
+  L(`  Empty rows skipped            ${skipped.length}  (${eur(skippedTotal)})`);
+  L(`    ${skipped.map((s) => s.invoiceNumber).join(', ') || '—'}`);
+  L(
+    `  Reconciliation                ${eur(grossTotal)} + ${eur(skippedTotal)} = ${eur(originalTotal)}`,
+  );
+  L(`  Invoice numbers renumbered    ${renumbered.length}  (reused → "-N" suffix)`);
+  for (const r of renumbered) L(`    ${r.from} → ${r.to}  (${r.name})`);
+  const estimated = invoices.filter((i) => i.dateEstimated);
+  L(
+    `  Missing dates (year est.)     ${estimated.length}  ${estimated.map((i) => i.invoiceNumber).join(', ')}`,
+  );
   L(`  Customers after merge         ${customers.length}`);
   L(`    with verified email         ${verifiedCount}`);
   L(`    with placeholder email      ${customers.length - verifiedCount}  (no-marketing)`);

@@ -111,14 +111,13 @@ export async function commitImport(plan: ImportPlan): Promise<CommitResult> {
           result.skippedExisting += 1;
           continue;
         }
-        await writeOrderAndInvoice(
-          tx,
-          t,
-          inv,
-          c.isB2B,
-          customerId,
-          c.emailIsPlaceholder ? null : c.email,
-        );
+        await writeOrderAndInvoice(tx, t, inv, c.isB2B, customerId, {
+          // Order carries the customer's email (placeholder or verified) so all
+          // of a customer's orders share it; the invoice recipient stays empty
+          // for placeholders — we never store a fake address on an invoice.
+          customerEmail: c.email,
+          invoiceRecipientEmail: c.emailIsPlaceholder ? null : c.email,
+        });
         result.ordersWritten += 1;
         result.invoicesWritten += 1;
       }
@@ -137,12 +136,17 @@ async function writeOrderAndInvoice(
   inv: ParsedInvoice,
   isB2B: boolean,
   customerId: number,
-  recipientEmail: string | null,
+  emails: { customerEmail: string; invoiceRecipientEmail: string | null },
 ): Promise<void> {
   const when = new Date(inv.date);
   const gross = inv.grossCents;
   const net = netFromGross(gross);
   const tax = gross - net;
+  const renumbered = inv.invoiceNumber !== inv.originalNumber;
+  const noteParts = [`Historischer Import (${inv.sourceFile})`];
+  if (renumbered)
+    noteParts.push(`Original-Nr. ${inv.originalNumber} (wegen Doppelvergabe umnummeriert)`);
+  if (inv.dateEstimated) noteParts.push('Datum im Original fehlend (Jahr geschätzt)');
 
   const [order] = await tx
     .insert(t.orders)
@@ -158,8 +162,7 @@ async function writeOrderAndInvoice(
       pickupMode: 'onsite',
       pickupLabel: 'Historischer Auftrag (Import)',
       customerName: inv.name,
-      customerEmail:
-        recipientEmail ?? `kunde-${inv.invoiceNumber.replace(/\//g, '-')}@import.cleanilo.local`,
+      customerEmail: emails.customerEmail,
       addressLine1: inv.street,
       addressCity: inv.city,
       addressPostalCode: inv.plz,
@@ -171,6 +174,7 @@ async function writeOrderAndInvoice(
       metadata: {
         historical: true,
         importedInvoiceNumber: inv.invoiceNumber,
+        originalInvoiceNumber: inv.originalNumber,
         sourceFile: inv.sourceFile,
         service: inv.service,
       },
@@ -193,16 +197,16 @@ async function writeOrderAndInvoice(
   });
 
   await tx.insert(t.invoices).values({
-    number: inv.invoiceNumber, // preserve the original (GoBD continuity)
+    number: inv.invoiceNumber, // original, or "<orig>-N" for a de-duped collision
     orderId,
     customerType: isB2B ? 'b2b' : 'b2c',
     recipientName: inv.name,
-    recipientEmail,
+    recipientEmail: emails.invoiceRecipientEmail,
     recipientAddressLine1: inv.street,
     recipientPostalCode: inv.plz,
     recipientCity: inv.city,
     recipientCountry: inv.country,
-    serviceDate: inv.date,
+    serviceDate: inv.dateEstimated ? null : inv.date, // no false Leistungsdatum
     status: 'paid', // NOT sent/overdue → dunning never touches it
     currency: 'EUR',
     subtotalCents: net,
@@ -214,7 +218,7 @@ async function writeOrderAndInvoice(
     paidAt: when,
     dueAt: new Date(when.getTime() + 14 * DAY_MS),
     dunningLevel: 0,
-    notes: `Historischer Import (${inv.sourceFile})`,
+    notes: noteParts.join(' · '),
     createdAt: when,
     updatedAt: when,
   });
