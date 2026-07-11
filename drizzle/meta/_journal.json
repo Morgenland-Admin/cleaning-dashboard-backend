@@ -22,6 +22,20 @@
       "when": 1783762278337,
       "tag": "0002_add_company_bank_details",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1783765606132,
+      "tag": "0003_add_company_email_signature",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1783766309074,
+      "tag": "0004_add_company_legal_fields",
+      "breakpoints": true
     }
   ]
 }

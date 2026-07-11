@@ -1,6 +1,6 @@
 import { Resend } from 'resend';
 import { env } from '../config/env.js';
-import type { BrandInfo, RenderedEmail } from './templates.js';
+import type { BrandInfo, EmailSignature, RenderedEmail } from './templates.js';
 
 const clients = new Map<string, Resend>();
 
@@ -119,6 +119,7 @@ export function brandInfoFromCompany(
     city?: string | null;
     vatId?: string | null;
     registrationNumber?: string | null;
+    emailSignature?: EmailSignature | null;
   },
 ): BrandInfo {
   const addressLines = [
@@ -138,5 +139,6 @@ export function brandInfoFromCompany(
     addressLines,
     vatId: c.vatId ?? null,
     registrationNumber: c.registrationNumber ?? null,
+    signature: c.emailSignature ?? null,
   };
 }

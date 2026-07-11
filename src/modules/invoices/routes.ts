@@ -7,7 +7,8 @@ import { company } from '../../db/schema/shared.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { notFound, parseIntId } from '../../lib/http-errors.js';
 import { sendDunningEmail } from '../../lib/dunning.js';
-import { sendInvoiceEmail } from './send-invoice.js';
+import { fetchInvoiceLogo, renderInvoicePdf } from '../../lib/invoice-pdf.js';
+import { buildInvoicePdfData, sendInvoiceEmail } from './send-invoice.js';
 import { nextInvoiceNumber } from './number.js';
 
 const lineItemSchema = z.object({
@@ -133,6 +134,36 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const [row] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
     if (!row) throw notFound('Invoice not found');
     return { invoice: row };
+  });
+
+  // Render the invoice as a PDF for on-screen preview / download. Same document
+  // that gets attached to the email (shared buildInvoicePdfData). Works for
+  // drafts too, so operators can proof a Rechnung before issuing it.
+  app.get('/:id/pdf', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { invoices } = request.company!.tables;
+    const [row] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+    if (!row) throw notFound('Invoice not found');
+    const [companyRow] = await db
+      .select()
+      .from(company)
+      .where(eq(company.slug, request.company!.slug))
+      .limit(1);
+    if (!companyRow) throw notFound('Company not found');
+
+    const pdfData = buildInvoicePdfData(companyRow, row);
+    pdfData.logo = await fetchInvoiceLogo(companyRow.logoUrl);
+    const pdf = await renderInvoicePdf(pdfData);
+    const safeName = (row.number ?? `Entwurf-${row.id}`).replace(/[^\w.-]+/g, '_');
+    const download = (request.query as { download?: string }).download === '1';
+    reply
+      .header('Content-Type', 'application/pdf')
+      .header(
+        'Content-Disposition',
+        `${download ? 'attachment' : 'inline'}; filename="Rechnung-${safeName}.pdf"`,
+      )
+      .header('Cache-Control', 'no-store');
+    return reply.send(pdf);
   });
 
   app.post('/', async (request, reply) => {

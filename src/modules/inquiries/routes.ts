@@ -13,6 +13,7 @@ import {
   inquiryQuoteEmail,
 } from '../../email/templates.js';
 import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
+import { formatInquiryNumber } from './number.js';
 import { routeCallback } from '../../lib/geo.js';
 import { metaEventContextSchema, sendMetaServerEvent } from '../../lib/meta-capi.js';
 import type { FastifyBaseLogger } from 'fastify';
@@ -160,7 +161,9 @@ export async function notifyInquiryCreated(
         });
       }
       if (companyRow.email) {
-        const details: Array<{ label: string; value: string }> = [];
+        const details: Array<{ label: string; value: string }> = [
+          { label: 'Anfrage-Nr.', value: formatInquiryNumber(row.id, new Date()) },
+        ];
         if (row.service) details.push({ label: 'Service', value: row.service });
         if (row.preferredDate) details.push({ label: 'Wunschtermin', value: row.preferredDate });
         if (row.budget) details.push({ label: 'Budget', value: row.budget });
@@ -329,7 +332,7 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
       }
 
       reply.code(201);
-      return { ok: true, inquiry: row };
+      return { ok: true, inquiry: row ? withNumber(row) : row };
     },
   );
 };
@@ -342,6 +345,11 @@ function redactPii<T extends { ipAddress?: unknown; userAgent?: unknown; interna
 ): T {
   if (accessLevel && PRIVILEGED_LEVELS.has(accessLevel)) return row;
   return { ...row, ipAddress: null, userAgent: null, internalNotes: null };
+}
+
+/** Attach the customer-facing inquiry number derived from id + creation year. */
+function withNumber<T extends { id: number; createdAt: Date }>(row: T) {
+  return { ...row, inquiryNumber: formatInquiryNumber(row.id, row.createdAt) };
 }
 
 export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
@@ -380,7 +388,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
         : null;
     const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
     return {
-      inquiries: page.map((r) => redactPii(r, accessLevel)),
+      inquiries: page.map((r) => withNumber(redactPii(r, accessLevel))),
       nextCursor,
     };
   });
@@ -394,7 +402,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(serviceInquiries.id, id))
       .limit(1);
     const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
-    return { inquiry: row ? redactPii(row, accessLevel) : null };
+    return { inquiry: row ? withNumber(redactPii(row, accessLevel)) : null };
   });
 
   app.patch('/:id', async (request) => {
@@ -426,7 +434,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .set(patch)
       .where(eq(serviceInquiries.id, id))
       .returning();
-    return { inquiry: row };
+    return { inquiry: row ? withNumber(row) : row };
   });
 
   const quoteSchema = z.object({
@@ -518,7 +526,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .returning();
 
     reply.code(201);
-    return { ok: true, inquiry: updated };
+    return { ok: true, inquiry: updated ? withNumber(updated) : updated };
   });
 
   // Email history for a lead (sent offers/quotes), newest first. Includes the
@@ -706,6 +714,6 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!row) throw notFound('Inquiry not found');
     const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
     reply.code(200);
-    return { ok: true, inquiry: redactPii(row, accessLevel) };
+    return { ok: true, inquiry: withNumber(redactPii(row, accessLevel)) };
   });
 };

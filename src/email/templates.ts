@@ -28,6 +28,41 @@ export interface BrandInfo {
   vatId?: string | null;
   /** Handelsregister / registration number shown in the formal footer. */
   registrationNumber?: string | null;
+  /** Rich, per-brand email sign-off (support hours, HQ, review CTA, …). */
+  signature?: EmailSignature | null;
+}
+
+/**
+ * Rich per-brand email signature rendered under operator-sent / customer-facing
+ * mail. Every field is optional so a brand can fill in as much as it wants; an
+ * unset field is simply skipped. Stored as JSONB on the company row.
+ */
+export interface EmailSignature {
+  /** Closing line, e.g. "Mit freundlichen Grüßen". */
+  signOff?: string | null;
+  /** Person signing off, e.g. "M. Amiri". Shown instead of the operator name. */
+  signatory?: string | null;
+  /** Heading above the opening hours, e.g. "Supportzeiten" / "Support:". */
+  supportLabel?: string | null;
+  /** Opening-hours lines, e.g. ["Mo. – Fr.: 09:00 – 17:00 Uhr", "Sa.: …"]. */
+  supportHours?: string[];
+  phone?: string | null;
+  whatsapp?: string | null;
+  /** Display text for the web/contact line, e.g. "www.cleanilo.de". */
+  web?: string | null;
+  /** Optional href for `web` (else auto-linked if it looks like a URL). */
+  webUrl?: string | null;
+  /** Head-office line, e.g. "Zentrale: Brook 9, 20457 Hamburg-Speicherstadt". */
+  hq?: string | null;
+  /** Warm tagline, e.g. "Frische Teppiche, frisches Zuhause!". */
+  tagline?: string | null;
+  /** Brand slogan in caps, e.g. "CLEANILO – EINFACH. SCHNELL. ZUVERLÄSSIG". */
+  slogan?: string | null;
+  /** Secondary drop-off point ("Weitere Annahmestelle"). */
+  secondaryLocation?: { name?: string | null; lines?: string[]; phone?: string | null } | null;
+  /** Review call-to-action link. */
+  reviewUrl?: string | null;
+  reviewLabel?: string | null;
 }
 
 /** Seller bank details rendered as the "Bankverbindung" block on payment mail. */
@@ -189,49 +224,158 @@ function bankTransferBlock(opts: {
 }): string {
   // No IBAN → nothing to pay into; skip the block entirely.
   if (!opts.bank.iban) return '';
-  const rows: Array<[string, string, boolean]> = [];
+  const accent = opts.accent;
+  const MONO = "font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;";
+  const LABEL =
+    'padding:7px 18px 7px 0;font-size:10px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:#93826a;white-space:nowrap;vertical-align:middle;';
+  const VAL = 'padding:7px 0;font-size:14px;color:#2d2419;line-height:1.4;vertical-align:middle;';
+
+  const line = (label: string, value: string, valStyle = ''): string =>
+    `<tr><td style="${LABEL}">${label}</td><td style="${VAL}${valStyle}">${value}</td></tr>`;
+
+  const account: string[] = [];
   if (opts.bank.accountHolder)
-    rows.push(['Kontoinhaber', escapeHtml(opts.bank.accountHolder), false]);
-  if (opts.bank.iban) rows.push(['IBAN', escapeHtml(formatIban(opts.bank.iban)), true]);
-  if (opts.bank.bic) rows.push(['BIC', escapeHtml(opts.bank.bic), true]);
+    account.push(
+      line(
+        'Kontoinhaber',
+        `<span style="font-weight:600;">${escapeHtml(opts.bank.accountHolder)}</span>`,
+      ),
+    );
+  account.push(
+    line(
+      'IBAN',
+      escapeHtml(formatIban(opts.bank.iban)),
+      `${MONO}font-size:15px;letter-spacing:0.6px;font-weight:600;`,
+    ),
+  );
+  if (opts.bank.bic) account.push(line('BIC', escapeHtml(opts.bank.bic), MONO));
   if (opts.bank.bankName) {
     const bank = opts.bank.bankAddress
       ? `${opts.bank.bankName}, ${opts.bank.bankAddress}`
       : opts.bank.bankName;
-    rows.push(['Bank', escapeHtml(bank), false]);
+    account.push(line('Bank', escapeHtml(bank)));
   }
-  if (opts.reference) rows.push(['Verwendungszweck', escapeHtml(opts.reference), true]);
-  if (opts.amount) rows.push(['Betrag', escapeHtml(opts.amount), true]);
-  if (!rows.length) return '';
 
-  const rowsHtml = rows
-    .map(
-      ([label, value, mono]) => `<tr>
-        <td style="padding:5px 14px 5px 0;font-size:11px;text-transform:uppercase;letter-spacing:0.6px;color:#6b5b48;white-space:nowrap;vertical-align:top;">${label}</td>
-        <td style="padding:5px 0;font-size:14px;color:#2d2419;${mono ? "font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;letter-spacing:0.3px;" : ''}">${value}</td>
-      </tr>`,
-    )
-    .join('');
+  const payment: string[] = [];
+  if (opts.reference)
+    payment.push(line('Verwendungszweck', escapeHtml(opts.reference), `${MONO}font-weight:600;`));
+  if (opts.amount)
+    payment.push(
+      line('Betrag', escapeHtml(opts.amount), `font-size:17px;font-weight:700;color:${accent};`),
+    );
+
+  const divider = payment.length
+    ? `<tr><td colspan="2" style="padding:8px 0 2px;"><div style="height:1px;background:#e6d6b8;line-height:1px;font-size:0;">&nbsp;</div></td></tr>`
+    : '';
 
   return `
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:20px 0 0;background:#f4ebdc;border:1px solid #e2d3b6;border-left:3px solid ${opts.accent};border-radius:10px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:22px 0 0;background:#faf3e3;border:1px solid #e6d6b8;border-radius:12px;">
       <tr>
-        <td style="padding:16px 18px;">
-          <div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:${opts.accent};margin-bottom:10px;">Bankverbindung</div>
-          <table role="presentation" cellpadding="0" cellspacing="0" border="0">${rowsHtml}</table>
+        <td style="padding:15px 20px 3px;border-bottom:1px solid #efe4cc;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+              <td style="font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:${accent};padding-bottom:12px;">Bankverbindung</td>
+              <td align="right" style="font-size:11px;color:#93826a;padding-bottom:12px;">Zahlung per Überweisung</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:8px 20px 16px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            ${account.join('')}
+            ${divider}
+            ${payment.join('')}
+          </table>
         </td>
       </tr>
     </table>`;
 }
 
 /**
- * Shared branded sign-off for operator-sent mail (contact reply, quote, order
- * message). Renders "<person> · <brand>" (or just the brand) followed by the
- * brand's real contact details from the company record — never the bare
- * operator username on its own. Missing fields are simply omitted.
+ * Shared branded sign-off for operator-sent / conversational mail (contact
+ * reply, quote, order message). When the brand carries a rich `signature`
+ * config it renders the full formal sign-off (closing, signatory, support
+ * hours, contacts, HQ, tagline, secondary drop-off, review CTA). Otherwise it
+ * falls back to a compact "<brand> + contact details" block. The operator's
+ * own username is never shown — a configured signatory (e.g. "M. Amiri") is
+ * used instead.
  */
 function signatureBlock(brand: BrandInfo, signedBy?: string | null): string {
   const accent = brand.primaryColor ?? '#bd5b3e';
+  const sig = brand.signature;
+
+  if (sig) {
+    const parts: string[] = [];
+    parts.push(
+      `<div style="font-size:14px;color:#2d2419;">${escapeHtml(sig.signOff ?? 'Mit freundlichen Grüßen')}</div>`,
+    );
+    parts.push(
+      `<div style="margin-top:2px;font-size:15px;font-weight:700;color:#2d2419;">${escapeHtml(
+        sig.signatory ?? brand.name,
+      )}</div>`,
+    );
+
+    // Support hours + contact channels + HQ, one muted block.
+    const contact: string[] = [];
+    if (sig.supportLabel)
+      contact.push(
+        `<div style="font-weight:600;color:#2d2419;">${escapeHtml(sig.supportLabel)}</div>`,
+      );
+    for (const h of sig.supportHours ?? []) contact.push(`<div>${escapeHtml(h)}</div>`);
+    const chan: string[] = [];
+    if (sig.phone) chan.push(`Tel.: ${escapeHtml(sig.phone)}`);
+    if (sig.whatsapp) chan.push(`WhatsApp: ${escapeHtml(sig.whatsapp)}`);
+    if (sig.web) {
+      const href = sig.webUrl
+        ? sig.webUrl
+        : /@/.test(sig.web)
+          ? `mailto:${sig.web}`
+          : `https://${sig.web.replace(/^https?:\/\//i, '')}`;
+      chan.push(
+        `Web: <a href="${escapeHtml(href)}" style="color:${accent};text-decoration:none;">${escapeHtml(sig.web)}</a>`,
+      );
+    }
+    for (const c of chan) contact.push(`<div>${c}</div>`);
+    if (sig.hq) contact.push(`<div style="margin-top:8px;">${escapeHtml(sig.hq)}</div>`);
+    if (contact.length)
+      parts.push(
+        `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.7;">${contact.join('')}</div>`,
+      );
+
+    if (sig.tagline)
+      parts.push(
+        `<div style="margin-top:14px;font-size:13px;font-style:italic;color:${accent};">${escapeHtml(sig.tagline)}</div>`,
+      );
+    if (sig.slogan)
+      parts.push(
+        `<div style="margin-top:6px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#93826a;">${escapeHtml(sig.slogan)}</div>`,
+      );
+
+    const loc = sig.secondaryLocation;
+    if (loc && (loc.name || loc.lines?.length)) {
+      const locLines: string[] = [
+        `<div style="font-weight:600;color:#2d2419;">Weitere Annahmestelle</div>`,
+      ];
+      if (loc.name) locLines.push(`<div>${escapeHtml(loc.name)}</div>`);
+      for (const l of loc.lines ?? []) locLines.push(`<div>${escapeHtml(l)}</div>`);
+      if (loc.phone) locLines.push(`<div>Tel.: ${escapeHtml(loc.phone)}</div>`);
+      parts.push(
+        `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.6;">${locLines.join('')}</div>`,
+      );
+    }
+
+    if (sig.reviewUrl)
+      parts.push(
+        `<div style="margin-top:16px;"><a href="${escapeHtml(sig.reviewUrl)}" style="display:inline-block;font-size:13px;font-weight:600;color:${accent};text-decoration:none;">👉 ${escapeHtml(
+          sig.reviewLabel ?? 'Jetzt Bewertung abgeben',
+        )}</a></div>`,
+      );
+
+    return `<div style="margin:24px 0 0;padding-top:16px;border-top:1px solid #e2d3b6;">${parts.join('')}</div>`;
+  }
+
+  // Fallback: compact brand sign-off from the plain company fields.
   const nameLine = signedBy
     ? `${escapeHtml(signedBy)} · <span style="color:#6b5b48;">${escapeHtml(brand.name)}</span>`
     : escapeHtml(brand.name);
@@ -369,26 +513,26 @@ export function newsletterConfirmEmail(opts: {
   const greeting = opts.firstName ? `Hallo ${escapeHtml(opts.firstName)},` : 'Hallo,';
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
   return {
-    subject: `Bitte bestätige deine Newsletter-Anmeldung · ${opts.brand.name}`,
+    subject: `Bitte bestätigen Sie Ihre Newsletter-Anmeldung · ${opts.brand.name}`,
     html: layout({
       brand: opts.brand,
-      preheader: `Bitte bestätige deine Anmeldung beim Newsletter von ${opts.brand.name}.`,
+      preheader: `Bitte bestätigen Sie Ihre Anmeldung beim Newsletter von ${opts.brand.name}.`,
       contentHtml: `
         <p style="margin:0 0 16px;">${greeting}</p>
         <p style="margin:0 0 8px;">
-          danke für dein Interesse am Newsletter von <strong>${escapeHtml(opts.brand.name)}</strong>.
-          Bitte bestätige kurz, dass du wirklich Nachrichten von uns erhalten möchtest.
+          danke für Ihr Interesse am Newsletter von <strong>${escapeHtml(opts.brand.name)}</strong>.
+          Bitte bestätigen Sie kurz, dass Sie wirklich Nachrichten von uns erhalten möchten.
         </p>
         ${button(opts.confirmUrl, 'Anmeldung bestätigen', accent)}
         <p style="margin:0 0 6px;font-size:12px;color:#6b5b48;">
-          Funktioniert der Button nicht? Kopiere diesen Link in deinen Browser:
+          Funktioniert der Button nicht? Kopieren Sie diesen Link in Ihren Browser:
         </p>
         <p style="margin:0 0 16px;font-size:12px;color:#6b5b48;word-break:break-all;">
           <a href="${escapeHtml(opts.confirmUrl)}" style="color:#6b5b48;">${escapeHtml(opts.confirmUrl)}</a>
         </p>
         <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
-          Hast du diese Anmeldung nicht angefordert, kannst du diese E-Mail einfach ignorieren —
-          oder dich direkt
+          Haben Sie diese Anmeldung nicht angefordert, können Sie diese E-Mail einfach ignorieren —
+          oder sich direkt
           <a href="${escapeHtml(opts.unsubscribeUrl)}" style="color:#6b5b48;text-decoration:underline;">austragen</a>.
         </p>
       `,
@@ -468,18 +612,18 @@ export function inquiryQuoteEmail(opts: {
     : '';
   const signature = signatureBlock(opts.brand, opts.signedBy);
   return {
-    subject: `Dein Angebot von ${opts.brand.name}`,
+    subject: `Ihr Angebot von ${opts.brand.name}`,
     html: layout({
       brand: opts.brand,
-      preheader: `Dein Angebot von ${opts.brand.name}.`,
+      preheader: `Ihr Angebot von ${opts.brand.name}.`,
       contentHtml: `
         <p style="margin:0 0 12px;">Hallo ${escapeHtml(opts.recipientName)},</p>
-        <p style="margin:0 0 8px;">danke für deine Anfrage. Hier ist unser Angebot:</p>
+        <p style="margin:0 0 8px;">danke für Ihre Anfrage. Hier ist unser Angebot:</p>
         <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.quoteBody)}</div>
         ${amountLine}
         ${signature}
       `,
-      footerNote: `Du kannst direkt auf diese Mail antworten, falls du Fragen hast.`,
+      footerNote: `Sie können direkt auf diese Mail antworten, falls Sie Fragen haben.`,
     }),
   };
 }
@@ -503,7 +647,7 @@ export function contactReplyEmail(opts: {
   const quoted = opts.originalMessage
     ? `<div style="margin-top:28px;padding-top:16px;border-top:1px solid #e2d3b6;">
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;margin-bottom:6px;">
-          Deine ursprüngliche Nachricht
+          Ihre ursprüngliche Nachricht
         </div>
         <div style="margin:0;padding:12px 14px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:13px;color:#5b4b38;white-space:pre-wrap;">
           ${nl2br(opts.originalMessage)}
@@ -515,14 +659,14 @@ export function contactReplyEmail(opts: {
     subject: subjectLine,
     html: layout({
       brand: opts.brand,
-      preheader: `Antwort auf deine Nachricht an ${opts.brand.name}.`,
+      preheader: `Antwort auf Ihre Nachricht an ${opts.brand.name}.`,
       contentHtml: `
         <p style="margin:0 0 12px;">Hallo ${escapeHtml(opts.recipientName)},</p>
         <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.replyBody)}</div>
         ${signature}
         ${quoted}
       `,
-      footerNote: `Du kannst direkt auf diese Mail antworten — wir lesen mit.`,
+      footerNote: `Sie können direkt auf diese Mail antworten — wir lesen mit.`,
     }),
   };
 }
@@ -945,15 +1089,15 @@ export function contactAckEmail(opts: {
   subject?: string | null;
 }): RenderedEmail {
   return {
-    subject: `Wir haben deine Nachricht erhalten · ${opts.brand.name}`,
+    subject: `Wir haben Ihre Nachricht erhalten · ${opts.brand.name}`,
     html: layout({
       brand: opts.brand,
-      preheader: `Vielen Dank für deine Anfrage bei ${opts.brand.name}.`,
+      preheader: `Vielen Dank für Ihre Anfrage bei ${opts.brand.name}.`,
       contentHtml: `
         <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.name)},</p>
         <p style="margin:0 0 8px;">
-          vielen Dank für deine Nachricht an <strong>${escapeHtml(opts.brand.name)}</strong>.
-          Wir melden uns in der Regel innerhalb eines Werktages bei dir zurück.
+          vielen Dank für Ihre Nachricht an <strong>${escapeHtml(opts.brand.name)}</strong>.
+          Wir melden uns in der Regel innerhalb eines Werktages bei Ihnen zurück.
         </p>
         ${
           opts.subject
@@ -961,14 +1105,14 @@ export function contactAckEmail(opts: {
         <p style="margin:0 0 12px;font-weight:600;">${escapeHtml(opts.subject)}</p>`
             : ''
         }
-        <p style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Deine Nachricht</p>
+        <p style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Ihre Nachricht</p>
         <div style="margin:0;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.message)}</div>
         <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
-          Diese Bestätigung wurde automatisch erstellt. Du kannst direkt auf
+          Diese Bestätigung wurde automatisch erstellt. Sie können direkt auf
           diese Mail antworten, um Ergänzungen zu schicken.
         </p>
       `,
-      footerNote: `Du erhältst diese E-Mail, weil du das Kontaktformular auf ${opts.brand.domain} ausgefüllt hast.`,
+      footerNote: `Sie erhalten diese E-Mail, weil das Kontaktformular auf ${opts.brand.domain} ausgefüllt wurde.`,
     }),
   };
 }

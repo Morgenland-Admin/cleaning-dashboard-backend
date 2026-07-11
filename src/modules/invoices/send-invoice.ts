@@ -1,12 +1,12 @@
 import type { company } from '../../db/schema/shared.js';
 import { formatEurFromCents } from '../../lib/pricing.js';
-import { renderInvoicePdf } from '../../lib/invoice-pdf.js';
+import { fetchInvoiceLogo, renderInvoicePdf, type InvoicePdfData } from '../../lib/invoice-pdf.js';
 import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
 import { invoiceEmail } from '../../email/templates.js';
 
 type CompanyFull = typeof company.$inferSelect;
 
-interface InvoiceForEmail {
+export interface InvoiceForEmail {
   id: number;
   number: string | null;
   recipientName: string;
@@ -32,13 +32,15 @@ interface MinimalLogger {
   error(obj: unknown, msg?: string): void;
 }
 
-export async function sendInvoiceEmail(
+/**
+ * Map a company + invoice row into the fully-formatted `InvoicePdfData` the
+ * renderer expects. Single source of truth so the emailed PDF, the on-screen
+ * preview and the download endpoint all render byte-for-byte the same document.
+ */
+export function buildInvoicePdfData(
   companyRow: CompanyFull,
   invoice: InvoiceForEmail,
-  log?: MinimalLogger,
-): Promise<{ ok: boolean; skipped: boolean }> {
-  if (!invoice.recipientEmail) return { ok: false, skipped: true };
-
+): InvoicePdfData {
   const now = new Date();
   const dueAt = invoice.dueAt ?? now;
   const fmtDate = (d: Date) =>
@@ -54,69 +56,78 @@ export async function sendInvoiceEmail(
     [companyRow.postalCode, companyRow.city].filter(Boolean).join(' ') || null,
   ].filter((x): x is string => Boolean(x));
 
-  const invoiceNumber = invoice.number ?? `#${invoice.id}`;
-  const invoiceDate = fmtDate(invoice.sentAt ?? now);
-  const dueDate = fmtDate(dueAt);
-  const serviceDateLabel = invoice.serviceDate
-    ? invoice.serviceDateEnd
-      ? `${fmtDateStr(invoice.serviceDate)} – ${fmtDateStr(invoice.serviceDateEnd)}`
-      : fmtDateStr(invoice.serviceDate)
-    : null;
   const recipientAddressLines = [
     invoice.recipientAddressLine1,
     invoice.recipientAddressLine2,
     [invoice.recipientPostalCode, invoice.recipientCity].filter(Boolean).join(' ') || null,
   ].filter((x): x is string => Boolean(x));
-  const taxFormatted = invoice.taxCents > 0 ? formatEurFromCents(invoice.taxCents) : null;
-  const taxRateLabel = taxRate > 0 ? `${taxRate} %` : null;
-  const subtotalFormatted = formatEurFromCents(invoice.subtotalCents);
-  const totalFormatted = formatEurFromCents(invoice.totalCents);
-  const lineItems = invoice.lineItems.map((li) => ({
-    label: li.label,
-    quantity: li.quantity.toLocaleString('de-DE'),
-    unitPrice: formatEurFromCents(li.unitPriceCents),
-    lineTotal: formatEurFromCents(Math.round(li.quantity * li.unitPriceCents)),
-  }));
-  const seller = {
-    name: companyRow.legalName ?? companyRow.name,
-    addressLines,
-    vatId: companyRow.vatId,
-    registrationNumber: companyRow.registrationNumber,
-    email: companyRow.email,
-    phone: companyRow.phone,
+
+  return {
+    brandName: companyRow.name,
+    invoiceNumber: invoice.number ?? `#${invoice.id}`,
+    invoiceDate: fmtDate(invoice.sentAt ?? now),
+    dueDate: fmtDate(dueAt),
+    paymentTermsDays: invoice.paymentTermsDays,
+    recipientName: invoice.recipientName,
+    recipientEmail: invoice.recipientEmail,
+    recipientAddressLines,
+    serviceDateLabel: invoice.serviceDate
+      ? invoice.serviceDateEnd
+        ? `${fmtDateStr(invoice.serviceDate)} – ${fmtDateStr(invoice.serviceDateEnd)}`
+        : fmtDateStr(invoice.serviceDate)
+      : null,
+    lineItems: invoice.lineItems.map((li) => ({
+      label: li.label,
+      quantity: li.quantity.toLocaleString('de-DE'),
+      unitPrice: formatEurFromCents(li.unitPriceCents),
+      lineTotal: formatEurFromCents(Math.round(li.quantity * li.unitPriceCents)),
+    })),
+    subtotal: formatEurFromCents(invoice.subtotalCents),
+    tax: invoice.taxCents > 0 ? formatEurFromCents(invoice.taxCents) : null,
+    taxRateLabel: taxRate > 0 ? `${taxRate} %` : null,
+    total: formatEurFromCents(invoice.totalCents),
+    notes: invoice.notes,
+    accentColor: companyRow.primaryColor ?? '#bd5b3e',
+    seller: {
+      name: companyRow.legalName ?? companyRow.name,
+      addressLines,
+      vatId: companyRow.vatId,
+      registrationNumber: companyRow.registrationNumber,
+      email: companyRow.email,
+      phone: companyRow.phone,
+      mobile: companyRow.mobile,
+      website: companyRow.websiteUrl ? companyRow.websiteUrl.replace(/^https?:\/\//i, '') : null,
+      taxNumber: companyRow.taxNumber,
+      businessId: companyRow.businessId,
+      legalForm: companyRow.legalForm,
+      managingDirectors: companyRow.managingDirectors,
+      chamber: companyRow.chamber,
+    },
+    bank: {
+      accountHolder: companyRow.accountHolder ?? companyRow.legalName ?? companyRow.name,
+      iban: companyRow.iban,
+      bic: companyRow.bic,
+      bankName: companyRow.bankName,
+      bankAddress: companyRow.bankAddress,
+    },
   };
-  const bank = {
-    accountHolder: companyRow.accountHolder ?? companyRow.legalName ?? companyRow.name,
-    iban: companyRow.iban,
-    bic: companyRow.bic,
-    bankName: companyRow.bankName,
-    bankAddress: companyRow.bankAddress,
-  };
+}
+
+export async function sendInvoiceEmail(
+  companyRow: CompanyFull,
+  invoice: InvoiceForEmail,
+  log?: MinimalLogger,
+): Promise<{ ok: boolean; skipped: boolean }> {
+  if (!invoice.recipientEmail) return { ok: false, skipped: true };
+
+  const pdfData = buildInvoicePdfData(companyRow, invoice);
+  pdfData.logo = await fetchInvoiceLogo(companyRow.logoUrl);
 
   // Render the PDF attachment (best-effort — fall back to HTML-only).
   let attachments: Array<{ filename: string; content: Buffer }> | undefined;
   try {
-    const pdf = await renderInvoicePdf({
-      brandName: companyRow.name,
-      invoiceNumber,
-      invoiceDate,
-      dueDate,
-      paymentTermsDays: invoice.paymentTermsDays,
-      recipientName: invoice.recipientName,
-      recipientEmail: invoice.recipientEmail,
-      recipientAddressLines,
-      serviceDateLabel,
-      lineItems,
-      subtotal: subtotalFormatted,
-      tax: taxFormatted,
-      taxRateLabel,
-      total: totalFormatted,
-      notes: invoice.notes,
-      accentColor: companyRow.primaryColor ?? '#bd5b3e',
-      seller,
-      bank,
-    });
-    attachments = [{ filename: `Rechnung-${invoiceNumber}.pdf`, content: pdf }];
+    const pdf = await renderInvoicePdf(pdfData);
+    attachments = [{ filename: `Rechnung-${pdfData.invoiceNumber}.pdf`, content: pdf }];
   } catch (err) {
     log?.error({ err, invoiceId: invoice.id }, 'Failed to render invoice PDF');
   }
@@ -129,24 +140,24 @@ export async function sendInvoiceEmail(
     attachments,
     email: invoiceEmail({
       brand: brandInfoFromCompany(companyRow),
-      recipientName: invoice.recipientName,
-      invoiceNumber,
-      invoiceDateFormatted: invoiceDate,
-      dueDateFormatted: dueDate,
-      paymentTermsDays: invoice.paymentTermsDays,
-      lineItems: lineItems.map((li) => ({
+      recipientName: pdfData.recipientName,
+      invoiceNumber: pdfData.invoiceNumber,
+      invoiceDateFormatted: pdfData.invoiceDate,
+      dueDateFormatted: pdfData.dueDate,
+      paymentTermsDays: pdfData.paymentTermsDays,
+      lineItems: pdfData.lineItems.map((li) => ({
         label: li.label,
         quantityLabel: li.quantity,
         unitPriceFormatted: li.unitPrice,
         lineTotalFormatted: li.lineTotal,
       })),
-      subtotalFormatted,
-      taxFormatted,
-      taxRateLabel,
-      totalFormatted,
-      notes: invoice.notes,
-      seller,
-      bank,
+      subtotalFormatted: pdfData.subtotal,
+      taxFormatted: pdfData.tax,
+      taxRateLabel: pdfData.taxRateLabel,
+      totalFormatted: pdfData.total,
+      notes: pdfData.notes,
+      seller: pdfData.seller,
+      bank: pdfData.bank,
     }),
   });
   return { ok: result.ok && !result.skipped, skipped: result.skipped ?? false };

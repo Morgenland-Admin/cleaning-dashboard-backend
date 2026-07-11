@@ -24,6 +24,7 @@ import pg from 'pg';
 
 import { env } from '../config/env.js';
 import { type LEGACY_COMPANY_SLUGS } from '../config/companies.js';
+import type { EmailSignature } from '../email/templates.js';
 import { company } from './schema/shared.js';
 import { createTenantSchemaSql } from './schema/tenant.js';
 
@@ -40,6 +41,18 @@ interface LegacyConfig {
   websiteUrl: string;
   resendApiKey: string | null;
   logoUrl: string | null;
+  /** Public phone (coalesced — an admin edit is never clobbered). */
+  phone?: string;
+  /** Public mobile shown in the invoice header (coalesced). */
+  mobile?: string;
+  /** Brand accent colour for emails + invoice PDF (coalesced). */
+  primaryColor?: string;
+  /**
+   * Rich email sign-off. Unlike legal/bank identity this is brand marketing
+   * content owned by the seed, so it is OVERWRITTEN on every boot (there is no
+   * admin UI for it) — edit it here and redeploy to update all mail.
+   */
+  emailSignature?: EmailSignature;
   /**
    * Legal + banking identity for invoices / dunning. Only seeded where we have
    * confirmed real-world data — brands left undefined keep their existing values
@@ -57,8 +70,23 @@ interface LegacyConfig {
     bic: string;
     bankName: string;
     bankAddress: string;
+    /** German invoice Pflichtangaben (shared across the GbR's brands). */
+    taxNumber?: string; // Steuernummer
+    businessId?: string; // Betriebsnummer
+    legalForm?: string; // Rechtsform
+    managingDirectors?: string; // Geschäftsführer
+    chamber?: string; // Handwerkskammer
   };
 }
+
+// The GbR that operates all three brands — one tax/registration identity.
+const GBR_LEGAL = {
+  taxNumber: '245/642/02539',
+  businessId: '2931209889',
+  legalForm: 'GbR',
+  managingDirectors: 'K. Madjidian, M. Amiri',
+  chamber: 'Handwerkskammer Hamburg',
+} as const;
 
 const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConfig> = {
   cleanilo: {
@@ -72,6 +100,26 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     websiteUrl: 'https://cleanilo.de',
     resendApiKey: env.RESEND_API_KEY_CLEANILO ?? null,
     logoUrl: 'https://reinigungs-portal.com/cleanilo.png',
+    phone: '+49 40 432 189 15',
+    mobile: '+49 177 6909604',
+    primaryColor: '#1f8a4c', // eco green — "ökologisch sauber"
+    emailSignature: {
+      signOff: 'Mit freundlichen Grüßen',
+      signatory: 'M. Amiri',
+      supportLabel: 'Supportzeiten',
+      supportHours: ['Mo. – Fr.: 09:00 – 17:00 Uhr', 'Sa.: 11:00 – 17:00 Uhr'],
+      phone: '+49 40 432 189 15',
+      whatsapp: '+49 177 6909604',
+      web: 'www.cleanilo.de',
+      webUrl: 'https://www.cleanilo.de',
+      hq: 'Zentrale: Brook 9, 20457 Hamburg-Speicherstadt',
+      slogan: 'CLEANILO – EINFACH. SCHNELL. ZUVERLÄSSIG',
+      secondaryLocation: {
+        name: 'Morgenland Teppiche',
+        lines: ['Brook 9', '20457 Hamburg-Speicherstadt'],
+        phone: '+49 40 386 327 75',
+      },
+    },
     legal: {
       legalName: 'Cleanilo – M. Kabir Madjidian & M. Amiri GbR',
       addressLine1: 'Brook 9',
@@ -83,6 +131,7 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
       bic: 'SXPYDEHHXXX',
       bankName: 'Banking Circle S.A. – German Branch',
       bankAddress: 'Maximilianstraße 54, 80538 München, Deutschland',
+      ...GBR_LEGAL,
     },
   },
   hamburg_teppichreinigung: {
@@ -96,6 +145,23 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     websiteUrl: 'https://hamburg-teppichreinigung.de',
     resendApiKey: env.RESEND_API_KEY_HAMBURG ?? null,
     logoUrl: 'https://reinigungs-portal.com/hamburg-teppichreinigung.png',
+    phone: '+49 40 432 189 19',
+    primaryColor: '#bd5b3e', // warm rust/brown
+    emailSignature: {
+      signOff: 'Mit freundlichen Grüßen',
+      signatory: 'M. Amiri',
+      supportLabel: 'Supportzeiten',
+      supportHours: ['Mo. – Fr.: 09:00 – 17:00 Uhr', 'Sa.: 11:00 – 17:00 Uhr'],
+      phone: '+49 40 432 189 19',
+      web: 'info@hamburg-teppichreinigung.de',
+      hq: 'Zentrale: Brook 9, 20457 Hamburg',
+      tagline: 'Frische Teppiche, frisches Zuhause!',
+      secondaryLocation: {
+        name: 'Morgenland Teppiche',
+        lines: ['Brook 9', '20457 Hamburg'],
+        phone: '+49 40 386 327 75',
+      },
+    },
     legal: {
       // Same GbR bank account as Cleanilo, but shown under the bare GbR name
       // (no brand prefix) on HTR invoices.
@@ -109,6 +175,7 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
       bic: 'SXPYDEHHXXX',
       bankName: 'Banking Circle S.A. – German Branch',
       bankAddress: 'Maximilianstraße 54, 80538 München, Deutschland',
+      ...GBR_LEGAL,
     },
   },
   teppichreinigen_lassen: {
@@ -122,6 +189,7 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     websiteUrl: 'https://teppichreinigen-lassen.de',
     resendApiKey: env.RESEND_API_KEY_TRL ?? null,
     logoUrl: null,
+    primaryColor: '#0f766e', // deep teal
     legal: {
       // Same GbR bank account, bare GbR name (no brand prefix) on TRL invoices.
       legalName: 'M. Kabir Madjidian & M. Amiri GbR',
@@ -134,6 +202,7 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
       bic: 'SXPYDEHHXXX',
       bankName: 'Banking Circle S.A. – German Branch',
       bankAddress: 'Maximilianstraße 54, 80538 München, Deutschland',
+      ...GBR_LEGAL,
     },
   },
 };
@@ -175,6 +244,13 @@ async function main(): Promise<void> {
     if (cfg.resendApiKey) updateSet.resendApiKey = cfg.resendApiKey;
     // Only set a default logo when none exists — never clobber an admin upload.
     if (cfg.logoUrl) updateSet.logoUrl = sql`coalesce(${company.logoUrl}, ${cfg.logoUrl})`;
+    // Phone / mobile / accent: seed only where blank so an admin edit wins.
+    if (cfg.phone) updateSet.phone = sql`coalesce(${company.phone}, ${cfg.phone})`;
+    if (cfg.mobile) updateSet.mobile = sql`coalesce(${company.mobile}, ${cfg.mobile})`;
+    if (cfg.primaryColor)
+      updateSet.primaryColor = sql`coalesce(${company.primaryColor}, ${cfg.primaryColor})`;
+    // Email signature is seed-owned brand content → overwrite on every boot.
+    if (cfg.emailSignature) updateSet.emailSignature = cfg.emailSignature;
     // Legal + banking identity: seed only where blank so admin edits always win.
     if (cfg.legal) {
       const l = cfg.legal;
@@ -188,6 +264,13 @@ async function main(): Promise<void> {
       updateSet.bic = sql`coalesce(${company.bic}, ${l.bic})`;
       updateSet.bankName = sql`coalesce(${company.bankName}, ${l.bankName})`;
       updateSet.bankAddress = sql`coalesce(${company.bankAddress}, ${l.bankAddress})`;
+      if (l.taxNumber) updateSet.taxNumber = sql`coalesce(${company.taxNumber}, ${l.taxNumber})`;
+      if (l.businessId)
+        updateSet.businessId = sql`coalesce(${company.businessId}, ${l.businessId})`;
+      if (l.legalForm) updateSet.legalForm = sql`coalesce(${company.legalForm}, ${l.legalForm})`;
+      if (l.managingDirectors)
+        updateSet.managingDirectors = sql`coalesce(${company.managingDirectors}, ${l.managingDirectors})`;
+      if (l.chamber) updateSet.chamber = sql`coalesce(${company.chamber}, ${l.chamber})`;
     }
 
     await db
@@ -204,6 +287,10 @@ async function main(): Promise<void> {
         logoUrl: cfg.logoUrl,
         websiteUrl: cfg.websiteUrl,
         email: cfg.senderEmail,
+        phone: cfg.phone,
+        mobile: cfg.mobile,
+        primaryColor: cfg.primaryColor,
+        emailSignature: cfg.emailSignature,
         isActive: true,
         ...(cfg.legal
           ? {
@@ -217,6 +304,11 @@ async function main(): Promise<void> {
               bic: cfg.legal.bic,
               bankName: cfg.legal.bankName,
               bankAddress: cfg.legal.bankAddress,
+              taxNumber: cfg.legal.taxNumber,
+              businessId: cfg.legal.businessId,
+              legalForm: cfg.legal.legalForm,
+              managingDirectors: cfg.legal.managingDirectors,
+              chamber: cfg.legal.chamber,
             }
           : {}),
       })

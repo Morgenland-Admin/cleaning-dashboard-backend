@@ -14,6 +14,8 @@ import {
   varchar,
 } from 'drizzle-orm/pg-core';
 
+import type { EmailSignature } from '../../email/templates.js';
+
 export const user = pgTable('user', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
@@ -113,6 +115,13 @@ export const company = pgTable('company', {
   country: varchar('country', { length: 2 }).default('DE'),
   vatId: varchar('vat_id', { length: 32 }),
   registrationNumber: varchar('registration_number', { length: 64 }),
+  // German invoice Pflichtangaben shown in the PDF header/footer.
+  taxNumber: varchar('tax_number', { length: 32 }), // Steuernummer
+  businessId: varchar('business_id', { length: 32 }), // Betriebsnummer
+  legalForm: varchar('legal_form', { length: 64 }), // Rechtsform, e.g. GbR
+  managingDirectors: text('managing_directors'), // Geschäftsführer / Inhaber
+  chamber: text('chamber'), // e.g. "Handwerkskammer Hamburg"
+  mobile: varchar('mobile', { length: 32 }),
   // Bank details for the seller's own invoicing (Bankverbindung on Rechnungen +
   // Mahnungen). Per-brand so each legal entity can carry its own account.
   accountHolder: text('account_holder'),
@@ -120,6 +129,8 @@ export const company = pgTable('company', {
   bic: varchar('bic', { length: 11 }),
   bankName: text('bank_name'),
   bankAddress: text('bank_address'),
+  // Rich per-brand email sign-off (support hours, HQ, tagline, review CTA, …).
+  emailSignature: jsonb('email_signature').$type<EmailSignature>(),
   logoUrl: text('logo_url'),
   primaryColor: varchar('primary_color', { length: 9 }),
   senderEmail: text('sender_email'),

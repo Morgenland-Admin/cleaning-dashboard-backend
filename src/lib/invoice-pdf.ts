@@ -31,6 +31,8 @@ export interface InvoicePdfData {
   total: string;
   notes?: string | null;
   accentColor: string;
+  /** Optional raster brand logo (PNG/JPEG) drawn top-left; falls back to text. */
+  logo?: Buffer | null;
   seller: {
     name: string;
     addressLines: string[];
@@ -38,6 +40,14 @@ export interface InvoicePdfData {
     registrationNumber?: string | null;
     email?: string | null;
     phone?: string | null;
+    mobile?: string | null;
+    website?: string | null;
+    // German Pflichtangaben for the legal footer.
+    taxNumber?: string | null; // Steuernummer
+    businessId?: string | null; // Betriebsnummer
+    legalForm?: string | null; // Rechtsform
+    managingDirectors?: string | null; // Geschäftsführer
+    chamber?: string | null; // Handwerkskammer
   };
   /** Seller bank details rendered as the Bankverbindung block. */
   bank?: {
@@ -47,6 +57,26 @@ export interface InvoicePdfData {
     bankName?: string | null;
     bankAddress?: string | null;
   };
+}
+
+/**
+ * Best-effort fetch of a brand logo for embedding in the PDF. Returns undefined
+ * on any failure (network, timeout, non-image) so the renderer falls back to
+ * the text wordmark — a logo must never block invoice generation. Only raster
+ * PNG/JPEG are usable by pdfkit; SVG/others are rejected.
+ */
+export async function fetchInvoiceLogo(url?: string | null): Promise<Buffer | undefined> {
+  if (!url || !/^https?:\/\/.+\.(png|jpe?g)(\?.*)?$/i.test(url)) return undefined;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return undefined;
+    const type = res.headers.get('content-type') ?? '';
+    if (!/image\/(png|jpe?g)/i.test(type)) return undefined;
+    const buf = Buffer.from(await res.arrayBuffer());
+    return buf.length > 0 && buf.length < 2_000_000 ? buf : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Group an IBAN into blocks of four for readability. */
@@ -80,31 +110,70 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
 
     const accent = /^#[0-9a-fA-F]{6}$/.test(data.accentColor) ? data.accentColor : '#bd5b3e';
 
-    // Header: brand name + "RECHNUNG"
-    doc.fillColor(accent).font('Helvetica-Bold').fontSize(18).text(data.brandName, PAGE_LEFT, 50);
+    // ── Header ──────────────────────────────────────────────────────────
+    // Right column: full sender / contact block (brand, entity, address,
+    // phone, mobile, web, email, Betriebsnummer).
+    const SENDER_X = 350;
+    const SENDER_W = PAGE_RIGHT - SENDER_X;
+    let sy = 48;
+    doc
+      .fillColor(accent)
+      .font('Helvetica-Bold')
+      .fontSize(12)
+      .text(data.brandName.toUpperCase(), SENDER_X, sy, { width: SENDER_W });
+    sy = doc.y + 1;
+    const senderLines: string[] = [];
+    if (data.seller.name && data.seller.name !== data.brandName) senderLines.push(data.seller.name);
+    const [addr0, ...addrRest] = data.seller.addressLines;
+    if (addr0) senderLines.push(`Zentrale: ${addr0}`);
+    for (const a of addrRest) senderLines.push(a);
+    if (data.seller.phone) senderLines.push(`Tel.: ${data.seller.phone}`);
+    if (data.seller.mobile) senderLines.push(`Mobil: ${data.seller.mobile}`);
+    if (data.seller.website) senderLines.push(`Internet: ${data.seller.website}`);
+    if (data.seller.email) senderLines.push(`E-Mail: ${data.seller.email}`);
+    if (data.seller.businessId) senderLines.push(`Betriebsnummer: ${data.seller.businessId}`);
+    doc.font('Helvetica').fontSize(9).fillColor(INK);
+    for (const line of senderLines) {
+      doc.text(line, SENDER_X, sy, { width: SENDER_W });
+      sy = doc.y + 1;
+    }
+    const senderBottom = sy;
+
+    // Left: brand logo (raster) if we have one, else the brand wordmark.
+    let logoDrawn = false;
+    if (data.logo) {
+      try {
+        doc.image(data.logo, PAGE_LEFT, 46, { height: 40 });
+        logoDrawn = true;
+      } catch {
+        logoDrawn = false;
+      }
+    }
+    if (!logoDrawn) {
+      doc
+        .fillColor(accent)
+        .font('Helvetica-Bold')
+        .fontSize(22)
+        .text(data.brandName, PAGE_LEFT, 50, { width: 280 });
+    }
+
+    // From-line + recipient (left column).
+    let ly = 112;
     doc
       .fillColor(MUTED)
       .font('Helvetica')
-      .fontSize(20)
-      .text('RECHNUNG', PAGE_LEFT, 50, { width: PAGE_RIGHT - PAGE_LEFT, align: 'right' });
-
-    // Seller line (small, under the brand name)
-    doc
-      .fillColor(MUTED)
-      .fontSize(8)
-      .text([data.seller.name, ...data.seller.addressLines].join(' · '), PAGE_LEFT, 76, {
+      .fontSize(7.5)
+      .text(`${data.brandName} · ${data.seller.addressLines.join(' · ')}`, PAGE_LEFT, ly, {
         width: 300,
       });
-
-    // Recipient + meta block
-    let y = 120;
-    doc.fillColor(MUTED).font('Helvetica').fontSize(9).text('RECHNUNG AN', PAGE_LEFT, y);
+    ly = doc.y + 10;
+    doc.fillColor(MUTED).font('Helvetica').fontSize(9).text('RECHNUNG AN', PAGE_LEFT, ly);
     doc
       .fillColor(INK)
       .font('Helvetica-Bold')
       .fontSize(11)
-      .text(data.recipientName, PAGE_LEFT, y + 14);
-    let recipientY = y + 30;
+      .text(data.recipientName, PAGE_LEFT, ly + 14);
+    let recipientY = ly + 30;
     for (const line of data.recipientAddressLines ?? []) {
       doc.fillColor(INK).font('Helvetica').fontSize(9).text(line, PAGE_LEFT, recipientY);
       recipientY += 13;
@@ -118,8 +187,9 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       recipientY += 13;
     }
 
-    const metaX = 330;
-    const metaLabelW = 110;
+    // Meta block (right), below the sender block.
+    const metaX = 350;
+    const metaLabelW = 105;
     const metaValW = PAGE_RIGHT - (metaX + metaLabelW);
     const meta: Array<[string, string]> = [
       ['Rechnungsnummer', data.invoiceNumber],
@@ -127,7 +197,7 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     ];
     if (data.serviceDateLabel) meta.push(['Leistungsdatum', data.serviceDateLabel]);
     if (data.dueDate) meta.push(['Fällig bis', data.dueDate]);
-    let my = y;
+    let my = Math.max(senderBottom + 12, 150);
     for (const [label, value] of meta) {
       doc
         .fillColor(MUTED)
@@ -139,10 +209,13 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
         .font('Helvetica-Bold')
         .fontSize(9)
         .text(value, metaX + metaLabelW, my, { width: metaValW, align: 'right' });
-      my += 16;
+      my += 15;
     }
 
-    y = Math.max(recipientY + 10, my + 10);
+    // "Rechnung" title above the items table.
+    let y = Math.max(recipientY + 8, my + 8);
+    doc.fillColor(INK).font('Helvetica-Bold').fontSize(16).text('Rechnung', PAGE_LEFT, y);
+    y = doc.y + 8;
 
     // Items table header
     doc.rect(PAGE_LEFT, y, PAGE_RIGHT - PAGE_LEFT, 22).fill('#f4ebdc');
@@ -245,77 +318,60 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       y = doc.y;
     }
 
-    // Bankverbindung — payment card so the customer can pay by transfer.
-    const bankRows: Array<[string, string]> = [];
-    if (data.bank?.accountHolder) bankRows.push(['Kontoinhaber', data.bank.accountHolder]);
-    if (data.bank?.iban) bankRows.push(['IBAN', formatIbanPdf(data.bank.iban)]);
-    if (data.bank?.bic) bankRows.push(['BIC', data.bank.bic]);
-    if (data.bank?.bankName) {
-      bankRows.push([
-        'Bank',
-        data.bank.bankAddress
-          ? `${data.bank.bankName}, ${data.bank.bankAddress}`
-          : data.bank.bankName,
-      ]);
-    }
-    bankRows.push(['Verwendungszweck', data.invoiceNumber]);
-    if (data.bank?.iban) {
-      y += 16;
-      const boxTop = y;
-      const bankLabelX = PAGE_LEFT + 12;
-      const bankValX = PAGE_LEFT + 120;
-      let by = boxTop + 12;
-      doc
-        .fillColor(accent)
-        .font('Helvetica-Bold')
-        .fontSize(9)
-        .text('BANKVERBINDUNG', bankLabelX, by);
-      by += 16;
-      const bankValW = PAGE_RIGHT - bankValX - 12;
-      doc.fontSize(9);
-      for (const [label, value] of bankRows) {
-        // Values can wrap (e.g. the bank name + address) — advance by the real
-        // rendered height so the next row never overlaps the wrapped line.
-        const valH = doc.font('Helvetica-Bold').heightOfString(value, { width: bankValW });
-        doc.fillColor(MUTED).font('Helvetica').text(label, bankLabelX, by, { width: 100 });
-        doc.fillColor(INK).font('Helvetica-Bold').text(value, bankValX, by, { width: bankValW });
-        by += Math.max(15, valH + 4);
-      }
-      const boxBottom = by + 4;
-      // Draw the framing box behind the text we just laid out.
-      doc
-        .save()
-        .rect(PAGE_LEFT, boxTop, PAGE_RIGHT - PAGE_LEFT, boxBottom - boxTop)
-        .fillOpacity(1)
-        .lineWidth(0.75)
-        .strokeColor(accent)
-        .stroke()
-        .restore();
-      y = boxBottom;
-    }
-
-    // Footer: seller legal block (Pflichtangaben)
-    const footerLines = [
-      data.seller.name,
-      ...data.seller.addressLines,
-      data.seller.vatId ? `USt-IdNr.: ${data.seller.vatId}` : null,
-      data.seller.registrationNumber ? `Reg-Nr.: ${data.seller.registrationNumber}` : null,
-      data.seller.email ? `E-Mail: ${data.seller.email}` : null,
-      data.seller.phone ? `Tel.: ${data.seller.phone}` : null,
-    ].filter((x): x is string => Boolean(x));
+    // Payment reference (Verwendungszweck) so the transfer can be matched.
     doc
       .font('Helvetica')
-      .fontSize(8)
+      .fontSize(9)
       .fillColor(MUTED)
-      .moveTo(PAGE_LEFT, 790)
-      .lineTo(PAGE_RIGHT, 790)
+      .text(
+        `Bitte geben Sie bei der Überweisung die Rechnungsnummer ${data.invoiceNumber} an.`,
+        PAGE_LEFT,
+        y,
+        {
+          width: PAGE_RIGHT - PAGE_LEFT,
+        },
+      );
+
+    // ── Footer: legal Pflichtangaben in three columns (Impressum-style) ──
+    const col1 = [
+      data.seller.legalForm ? `Rechtsform: ${data.seller.legalForm}` : null,
+      data.seller.managingDirectors ? `Geschäftsführer: ${data.seller.managingDirectors}` : null,
+      data.seller.chamber,
+    ].filter((x): x is string => Boolean(x));
+    const col2 = [
+      data.seller.taxNumber ? `Steuernummer: ${data.seller.taxNumber}` : null,
+      data.seller.vatId ? `USt-IdNr.: ${data.seller.vatId}` : null,
+      data.seller.businessId ? `Betriebsnummer: ${data.seller.businessId}` : null,
+    ].filter((x): x is string => Boolean(x));
+    // Bank name only (no address) — keeps the narrow footer column to one line;
+    // full bank/holder detail lives in the email's Bankverbindung card.
+    const col3 = [
+      data.bank?.bankName ? `Bank: ${data.bank.bankName}` : null,
+      data.bank?.iban ? `IBAN: ${formatIbanPdf(data.bank.iban)}` : null,
+      data.bank?.bic ? `BIC: ${data.bank.bic}` : null,
+    ].filter((x): x is string => Boolean(x));
+
+    const FOOTER_TOP = 738;
+    doc
+      .moveTo(PAGE_LEFT, FOOTER_TOP)
+      .lineTo(PAGE_RIGHT, FOOTER_TOP)
       .strokeColor(RULE)
       .lineWidth(0.5)
       .stroke();
-    doc.text(footerLines.join('  ·  '), PAGE_LEFT, 796, {
-      width: PAGE_RIGHT - PAGE_LEFT,
-      align: 'center',
-    });
+    const colY = FOOTER_TOP + 8;
+    const cols: Array<{ x: number; w: number; lines: string[] }> = [
+      { x: PAGE_LEFT, w: 165, lines: col1 },
+      { x: PAGE_LEFT + 170, w: 120, lines: col2 },
+      { x: PAGE_LEFT + 295, w: PAGE_RIGHT - (PAGE_LEFT + 295), lines: col3 },
+    ];
+    doc.font('Helvetica').fontSize(7.5).fillColor(MUTED);
+    for (const c of cols) {
+      let cy = colY;
+      for (const line of c.lines) {
+        doc.text(line, c.x, cy, { width: c.w, lineBreak: false });
+        cy = doc.y + 2;
+      }
+    }
 
     doc.end();
   });
