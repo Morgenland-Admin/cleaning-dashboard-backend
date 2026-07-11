@@ -129,6 +129,11 @@ export const company = pgTable('company', {
   bic: varchar('bic', { length: 11 }),
   bankName: text('bank_name'),
   bankAddress: text('bank_address'),
+  // Per-brand invoice number series "<prefix>-<n>" (e.g. "CL-1426"), a continuous
+  // counter bumped atomically at issue time (see modules/invoices/number.ts).
+  // Nullable so the boot seed can coalesce a start value without resetting a live counter.
+  invoiceNumberPrefix: varchar('invoice_number_prefix', { length: 8 }),
+  invoiceNumberNext: integer('invoice_number_next'),
   // Rich per-brand email sign-off (support hours, HQ, tagline, review CTA, …).
   emailSignature: jsonb('email_signature').$type<EmailSignature>(),
   logoUrl: text('logo_url'),

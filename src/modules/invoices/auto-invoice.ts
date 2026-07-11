@@ -66,7 +66,7 @@ export async function autoCreateInvoiceForPaidOrder(
   invoiceId?: number;
   number?: string | null;
 }> {
-  const { invoices, invoiceStatusLog, orderItems } = tables;
+  const { invoices, invoiceStatusLog, orderItems, customers } = tables;
 
   // Idempotency — never create a second invoice for the same order.
   const [existing] = await db
@@ -129,6 +129,15 @@ export async function autoCreateInvoiceForPaidOrder(
   const taxCents = gross - subtotalCents;
   const serviceDate = berlinDate(order.paidAt ?? new Date());
 
+  // Inherit the customer's preferred payment term (e.g. a B2B firm on net-14),
+  // falling back to the 7-day column default when they have none.
+  const [cust] = await db
+    .select({ d: customers.defaultPaymentTermsDays })
+    .from(customers)
+    .where(eq(customers.email, order.customerEmail.toLowerCase()))
+    .limit(1);
+  const paymentTermsDays = cust?.d ?? 7;
+
   // Draft carries no number — assigned from the gapless sequence at issue.
   // The partial unique index on order_id is the real idempotency guard: if a
   // concurrent webhook already inserted, the insert throws 23505 → no-op.
@@ -154,6 +163,7 @@ export async function autoCreateInvoiceForPaidOrder(
           taxRatePercent: VAT_RATE,
           taxCents,
           totalCents: gross,
+          paymentTermsDays,
           status: 'draft',
         })
         .returning();
@@ -192,7 +202,7 @@ export async function autoCreateInvoiceForPaidOrder(
   const now = new Date();
   const dueAt = new Date(now.getTime() + invoice.paymentTermsDays * 24 * 60 * 60 * 1000);
   const issued = await db.transaction(async (tx) => {
-    const number = await nextInvoiceNumber(tx, tables, now);
+    const number = await nextInvoiceNumber(tx, companySlug);
     const [r] = await tx
       .update(invoices)
       .set({ status: 'sent', number, sentAt: now, dueAt, updatedAt: now })

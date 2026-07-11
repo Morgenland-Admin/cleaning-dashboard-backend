@@ -4,6 +4,20 @@ import type { BrandInfo, EmailSignature, RenderedEmail } from './templates.js';
 
 const clients = new Map<string, Resend>();
 
+/**
+ * Domain used for synthetic placeholder addresses on imported customers that
+ * have no real email (see scripts/import-cleanilo-*). These are non-routable
+ * and must never receive mail — transactional, dunning, review or newsletter.
+ * Contactability is derived purely from the address, so replacing a placeholder
+ * with a real email automatically re-enables sending (no flag to clear).
+ */
+export const NONCONTACTABLE_EMAIL_DOMAIN = 'import.cleanilo.local';
+
+/** True if `addr` is a synthetic placeholder that must never be emailed. */
+export function isNonContactableEmail(addr: string): boolean {
+  return addr.trim().toLowerCase().endsWith(`@${NONCONTACTABLE_EMAIL_DOMAIN}`);
+}
+
 function getResend(apiKey?: string | null): Resend | null {
   const key = apiKey || env.RESEND_API_KEY;
   if (!key) return null;
@@ -63,12 +77,25 @@ export async function sendEmail(opts: SendOptions): Promise<{
   id?: string;
   error?: string;
 }> {
+  // Hard-block synthetic placeholder addresses at the source. This is the single
+  // choke point every send path (transactional, dunning, review, newsletter) flows
+  // through, so one guard covers them all.
+  const requested = Array.isArray(opts.to) ? opts.to : [opts.to];
+  const to = requested.filter((addr) => !isNonContactableEmail(addr));
+  if (to.length < requested.length) {
+    const blocked = requested.filter(isNonContactableEmail);
+    console.info(
+      `[email] (blocked — non-contactable) recipients=${blocked.join(',')} subject="${opts.email.subject}"`,
+    );
+  }
+  if (to.length === 0) {
+    return { ok: true, skipped: true };
+  }
+
   const resend = getResend(opts.apiKey);
   if (!resend) {
     console.info(
-      `[email] (skipped — no Resend API key) to=${
-        Array.isArray(opts.to) ? opts.to.join(',') : opts.to
-      } subject="${opts.email.subject}"`,
+      `[email] (skipped — no Resend API key) to=${to.join(',')} subject="${opts.email.subject}"`,
     );
     return { ok: true, skipped: true };
   }
@@ -78,7 +105,7 @@ export async function sendEmail(opts: SendOptions): Promise<{
     try {
       const res = await resend.emails.send({
         from: opts.from,
-        to: opts.to,
+        to,
         subject: opts.email.subject,
         html: opts.email.html,
         replyTo: opts.replyTo,

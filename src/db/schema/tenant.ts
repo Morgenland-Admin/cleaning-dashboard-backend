@@ -406,6 +406,8 @@ function buildTenantTables(schemaName: string) {
       loyaltyTier: varchar('loyalty_tier', { length: 16 }).notNull().default('neukunde'),
       tags: jsonb('tags').$type<string[]>().notNull().default([]),
       internalNotes: text('internal_notes'),
+      /** Preferred invoice payment term (days) for this customer; null → brand default (7). */
+      defaultPaymentTermsDays: integer('default_payment_terms_days'),
       firstOrderAt: timestamp('first_order_at', { withTimezone: true }),
       lastOrderAt: timestamp('last_order_at', { withTimezone: true }),
       marketingOptIn: boolean('marketing_opt_in').notNull().default(false),
@@ -494,7 +496,15 @@ function buildTenantTables(schemaName: string) {
       taxCents: integer('tax_cents').notNull().default(0),
       totalCents: integer('total_cents').notNull().default(0),
       lineItems: jsonb('line_items')
-        .$type<Array<{ label: string; quantity: number; unitPriceCents: number }>>()
+        .$type<
+          Array<{
+            label: string;
+            quantity: number;
+            unitPriceCents: number;
+            /** Render as a package/section header line (bold) on the invoice. */
+            isPackage?: boolean;
+          }>
+        >()
         .notNull()
         .default([]),
       paymentTermsDays: integer('payment_terms_days').notNull().default(7),
@@ -1018,6 +1028,7 @@ CREATE TABLE IF NOT EXISTS ${q}."customers" (
   "loyalty_tier" varchar(16) DEFAULT 'neukunde' NOT NULL,
   "tags" jsonb DEFAULT '[]'::jsonb NOT NULL,
   "internal_notes" text,
+  "default_payment_terms_days" integer,
   "first_order_at" timestamp with time zone,
   "last_order_at" timestamp with time zone,
   "marketing_opt_in" boolean DEFAULT false NOT NULL,
@@ -1204,6 +1215,7 @@ ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "city" text;
 ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "country" varchar(2) DEFAULT 'DE';
 ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "tags" jsonb DEFAULT '[]'::jsonb NOT NULL;
 ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "internal_notes" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "default_payment_terms_days" integer;
 
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "customer_id" integer;
 ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "customer_id" integer;

@@ -24,13 +24,39 @@ export interface InvoiceForEmail {
   taxCents: number;
   subtotalCents: number;
   totalCents: number;
-  lineItems: Array<{ label: string; quantity: number; unitPriceCents: number }>;
+  lineItems: Array<{
+    label: string;
+    quantity: number;
+    unitPriceCents: number;
+    isPackage?: boolean;
+  }>;
   notes: string | null;
   paymentMethod?: string | null;
 }
 
 interface MinimalLogger {
   error(obj: unknown, msg?: string): void;
+}
+
+/**
+ * Download / attachment filename for an invoice PDF:
+ *   "<number>-Rechnung-<Kundenname>.pdf"  →  "CL-1426-Rechnung-Hartmann-Leu.pdf"
+ * Drafts (no number yet) fall back to "Entwurf-<id>". The recipient name is
+ * slugified to filename-safe ASCII-ish (umlauts collapsed to a single word).
+ */
+export function invoicePdfFilename(numberOrRef: string, recipientName: string): string {
+  const namePart = recipientName
+    .trim()
+    .replace(/[äÄ]/g, 'ae')
+    .replace(/[öÖ]/g, 'oe')
+    .replace(/[üÜ]/g, 'ue')
+    .replace(/ß/g, 'ss')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+    .replace(/-+$/g, '');
+  const base = [numberOrRef, 'Rechnung', namePart].filter(Boolean).join('-');
+  return `${base.replace(/[^\w.-]+/g, '_')}.pdf`;
 }
 
 /**
@@ -83,6 +109,7 @@ export function buildInvoicePdfData(
       quantity: li.quantity.toLocaleString('de-DE'),
       unitPrice: formatEurFromCents(li.unitPriceCents),
       lineTotal: formatEurFromCents(Math.round(li.quantity * li.unitPriceCents)),
+      isPackage: li.isPackage ?? false,
     })),
     subtotal: formatEurFromCents(invoice.subtotalCents),
     tax: invoice.taxCents > 0 ? formatEurFromCents(invoice.taxCents) : null,
@@ -130,7 +157,12 @@ export async function sendInvoiceEmail(
   let attachments: Array<{ filename: string; content: Buffer }> | undefined;
   try {
     const pdf = await renderInvoicePdf(pdfData);
-    attachments = [{ filename: `Rechnung-${pdfData.invoiceNumber}.pdf`, content: pdf }];
+    attachments = [
+      {
+        filename: invoicePdfFilename(pdfData.invoiceNumber, pdfData.recipientName),
+        content: pdf,
+      },
+    ];
   } catch (err) {
     log?.error({ err, invoiceId: invoice.id }, 'Failed to render invoice PDF');
   }

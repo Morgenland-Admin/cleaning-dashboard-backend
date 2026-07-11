@@ -24,6 +24,8 @@ export interface InvoicePdfData {
     quantity: string;
     unitPrice: string;
     lineTotal: string;
+    /** Package/section header line — rendered bold to group the items below it. */
+    isPackage?: boolean;
   }>;
   subtotal: string;
   tax: string | null;
@@ -233,6 +235,8 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     // Items rows
     doc.font('Helvetica').fontSize(10).fillColor(INK);
     for (const item of data.lineItems) {
+      const labelFont = item.isPackage ? 'Helvetica-Bold' : 'Helvetica';
+      doc.font(labelFont).fontSize(10);
       const descH = doc.heightOfString(item.label, { width: COL_DESC.w - 6 });
       const rowH = Math.max(descH, 14) + 10;
       if (y + rowH > 760) {
@@ -240,19 +244,25 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
         y = 50;
       }
       const ty = y + 5;
-      doc.fillColor(INK).text(item.label, COL_DESC.x + 6, ty, { width: COL_DESC.w - 6 });
       doc
+        .font(labelFont)
+        .fillColor(INK)
+        .text(item.label, COL_DESC.x + 6, ty, { width: COL_DESC.w - 6 });
+      doc
+        .font('Helvetica')
         .fillColor(MUTED)
         .text(item.quantity, COL_QTY.x, ty, { width: COL_QTY.w, align: 'center' });
       doc
         .fillColor(MUTED)
         .text(item.unitPrice, COL_UNIT.x, ty, { width: COL_UNIT.w, align: 'right' });
       doc
+        .font(item.isPackage ? 'Helvetica-Bold' : 'Helvetica')
         .fillColor(INK)
         .text(item.lineTotal, COL_AMT.x, ty, { width: COL_AMT.w - 6, align: 'right' });
       y += rowH;
       doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(RULE).lineWidth(0.5).stroke();
     }
+    doc.font('Helvetica').fontSize(10);
 
     // Totals
     y += 8;

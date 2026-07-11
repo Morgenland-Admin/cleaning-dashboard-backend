@@ -47,6 +47,14 @@ interface LegacyConfig {
   mobile?: string;
   /** Brand accent colour for emails + invoice PDF (coalesced). */
   primaryColor?: string;
+  /** Invoice number prefix, e.g. 'CL' → "CL-1426" (coalesced). */
+  invoiceNumberPrefix?: string;
+  /**
+   * First dashboard-issued invoice number. Seeded only while the counter is null
+   * (coalesced), so a live counter is never reset. Cleanilo continues at 1426;
+   * confirm Hamburg/TRL's real numbers before their first issue.
+   */
+  invoiceNumberStart?: number;
   /**
    * Rich email sign-off. Unlike legal/bank identity this is brand marketing
    * content owned by the seed, so it is OVERWRITTEN on every boot (there is no
@@ -103,6 +111,8 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     phone: '+49 40 432 189 15',
     mobile: '+49 177 6909604',
     primaryColor: '#1f8a4c', // eco green — "ökologisch sauber"
+    invoiceNumberPrefix: 'CL',
+    invoiceNumberStart: 1426, // continues the imported series (latest was 1425)
     emailSignature: {
       signOff: 'Mit freundlichen Grüßen',
       signatory: 'M. Amiri',
@@ -147,6 +157,8 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     logoUrl: 'https://reinigungs-portal.com/hamburg-teppichreinigung.png',
     phone: '+49 40 432 189 19',
     primaryColor: '#bd5b3e', // warm rust/brown
+    invoiceNumberPrefix: 'HT',
+    invoiceNumberStart: 1426, // TODO(Kabir): confirm HTR's real starting number before first issue
     emailSignature: {
       signOff: 'Mit freundlichen Grüßen',
       signatory: 'M. Amiri',
@@ -190,6 +202,8 @@ const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], LegacyConf
     resendApiKey: env.RESEND_API_KEY_TRL ?? null,
     logoUrl: null,
     primaryColor: '#0f766e', // deep teal
+    invoiceNumberPrefix: 'TR',
+    invoiceNumberStart: 1426, // TODO(Kabir): confirm TRL's real starting number before first issue
     legal: {
       // Same GbR bank account, bare GbR name (no brand prefix) on TRL invoices.
       legalName: 'M. Kabir Madjidian & M. Amiri GbR',
@@ -249,6 +263,11 @@ async function main(): Promise<void> {
     if (cfg.mobile) updateSet.mobile = sql`coalesce(${company.mobile}, ${cfg.mobile})`;
     if (cfg.primaryColor)
       updateSet.primaryColor = sql`coalesce(${company.primaryColor}, ${cfg.primaryColor})`;
+    // Invoice numbering: seed only where blank so an admin edit / live counter wins.
+    if (cfg.invoiceNumberPrefix)
+      updateSet.invoiceNumberPrefix = sql`coalesce(${company.invoiceNumberPrefix}, ${cfg.invoiceNumberPrefix})`;
+    if (cfg.invoiceNumberStart != null)
+      updateSet.invoiceNumberNext = sql`coalesce(${company.invoiceNumberNext}, ${cfg.invoiceNumberStart})`;
     // Email signature is seed-owned brand content → overwrite on every boot.
     if (cfg.emailSignature) updateSet.emailSignature = cfg.emailSignature;
     // Legal + banking identity: seed only where blank so admin edits always win.
@@ -290,6 +309,8 @@ async function main(): Promise<void> {
         phone: cfg.phone,
         mobile: cfg.mobile,
         primaryColor: cfg.primaryColor,
+        invoiceNumberPrefix: cfg.invoiceNumberPrefix,
+        invoiceNumberNext: cfg.invoiceNumberStart,
         emailSignature: cfg.emailSignature,
         isActive: true,
         ...(cfg.legal

@@ -8,13 +8,15 @@ import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { notFound, parseIntId } from '../../lib/http-errors.js';
 import { sendDunningEmail } from '../../lib/dunning.js';
 import { fetchInvoiceLogo, renderInvoicePdf } from '../../lib/invoice-pdf.js';
-import { buildInvoicePdfData, sendInvoiceEmail } from './send-invoice.js';
+import { buildInvoicePdfData, invoicePdfFilename, sendInvoiceEmail } from './send-invoice.js';
 import { nextInvoiceNumber } from './number.js';
 
 const lineItemSchema = z.object({
   label: z.string().min(1).max(200),
   quantity: z.number().min(0).max(100000),
-  unitPriceCents: z.number().int().min(0).max(100_000_000),
+  // Allow negative unit prices for discount / credit lines.
+  unitPriceCents: z.number().int().min(-100_000_000).max(100_000_000),
+  isPackage: z.boolean().optional(),
 });
 
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -39,7 +41,8 @@ const createSchema = z.object({
   lineItems: z.array(lineItemSchema).min(1).max(100),
   /** VAT rate; taxCents is computed server-side. */
   taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).default(19),
-  paymentTermsDays: z.number().int().min(0).max(120).default(7),
+  /** Omit to inherit the recipient customer's default term (falls back to 7). */
+  paymentTermsDays: z.number().int().min(0).max(120).optional(),
   /** How the invoice is settled — drives the payment text + bank block. */
   paymentMethod: z.enum(['transfer', 'card', 'cash']).default('transfer'),
   notes: z.string().max(2000).optional(),
@@ -157,13 +160,13 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const pdfData = buildInvoicePdfData(companyRow, row);
     pdfData.logo = await fetchInvoiceLogo(companyRow.logoUrl);
     const pdf = await renderInvoicePdf(pdfData);
-    const safeName = (row.number ?? `Entwurf-${row.id}`).replace(/[^\w.-]+/g, '_');
+    const filename = invoicePdfFilename(row.number ?? `Entwurf-${row.id}`, row.recipientName);
     const download = (request.query as { download?: string }).download === '1';
     reply
       .header('Content-Type', 'application/pdf')
       .header(
         'Content-Disposition',
-        `${download ? 'attachment' : 'inline'}; filename="Rechnung-${safeName}.pdf"`,
+        `${download ? 'attachment' : 'inline'}; filename="${filename}"`,
       )
       .header('Cache-Control', 'no-store');
     return reply.send(pdf);
@@ -171,7 +174,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/', async (request, reply) => {
     const body = createSchema.parse(request.body);
-    const { invoices, invoiceStatusLog } = request.company!.tables;
+    const { invoices, invoiceStatusLog, customers } = request.company!.tables;
     const adminId = request.authUser!.id;
     const subtotalCents = body.lineItems.reduce(
       (a, l) => a + Math.round(l.quantity * l.unitPriceCents),
@@ -179,6 +182,17 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     );
     const taxCents = computeTaxCents(subtotalCents, body.taxRatePercent);
     const totalCents = subtotalCents + taxCents;
+    // Payment term: explicit value wins; else the recipient customer's default; else 7.
+    let paymentTermsDays = body.paymentTermsDays;
+    if (paymentTermsDays == null && body.recipientEmail) {
+      const [cust] = await db
+        .select({ d: customers.defaultPaymentTermsDays })
+        .from(customers)
+        .where(eq(customers.email, body.recipientEmail.toLowerCase()))
+        .limit(1);
+      if (cust?.d != null) paymentTermsDays = cust.d;
+    }
+    paymentTermsDays ??= 7;
     const invoice = await db.transaction(async (tx) => {
       // Drafts carry no number — it's assigned from the gapless sequence at issue.
       const [row] = await tx
@@ -201,7 +215,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           taxRatePercent: body.taxRatePercent,
           taxCents,
           totalCents,
-          paymentTermsDays: body.paymentTermsDays,
+          paymentTermsDays,
           paymentMethod: body.paymentMethod,
           notes: body.notes,
           status: 'draft',
@@ -309,8 +323,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       // invoice number is assigned here (issue time), in the same transaction.
       const dueAt = new Date(now.getTime() + current.paymentTermsDays * 24 * 60 * 60 * 1000);
       const issued = await db.transaction(async (tx) => {
-        const number =
-          current.number ?? (await nextInvoiceNumber(tx, request.company!.tables, now));
+        const number = current.number ?? (await nextInvoiceNumber(tx, request.company!.slug));
         const [r] = await tx
           .update(invoices)
           .set({ status: 'sent', number, sentAt: now, dueAt, updatedAt: now })

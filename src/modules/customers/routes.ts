@@ -29,6 +29,7 @@ const updateSchema = z.object({
   tags: tagsSchema.optional(),
   internalNotes: z.string().max(5000).nullable().optional(),
   marketingOptIn: z.boolean().optional(),
+  defaultPaymentTermsDays: z.number().int().min(0).max(120).nullable().optional(),
 });
 
 const createSchema = z.object({
@@ -44,6 +45,7 @@ const createSchema = z.object({
   tags: tagsSchema.default([]),
   internalNotes: z.string().trim().max(5000).optional(),
   marketingOptIn: z.boolean().default(false),
+  defaultPaymentTermsDays: z.number().int().min(0).max(120).nullable().optional(),
 });
 
 const importSchema = z.object({
@@ -110,6 +112,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
         tags: body.tags,
         internalNotes: body.internalNotes ?? null,
         marketingOptIn: body.marketingOptIn,
+        defaultPaymentTermsDays: body.defaultPaymentTermsDays ?? null,
       })
       .onConflictDoNothing({ target: customers.email })
       .returning();
