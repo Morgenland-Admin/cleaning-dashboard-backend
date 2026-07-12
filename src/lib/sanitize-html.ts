@@ -1,29 +1,61 @@
-// Dependency-free blocklist sanitizer for stored SEO bodyHtml (served raw to
-// public storefronts). Defense-in-depth at the write path; swap for an
-// allowlist lib (sanitize-html) when a network install is possible.
+import sanitize from 'sanitize-html';
 
-const DANGEROUS_TAGS = ['script', 'style', 'iframe', 'object', 'embed', 'link', 'meta', 'base'];
-
+// Allowlist sanitizer for stored SEO/blog bodyHtml (served raw to public
+// storefronts). Anything not explicitly permitted is dropped, which closes the
+// entity-encoded-scheme and novel-vector bypasses a blocklist can't.
 export function sanitizeHtml(input: string): string {
-  let html = input;
-
-  // Drop dangerous elements entirely, including their content.
-  for (const tag of DANGEROUS_TAGS) {
-    const withBody = new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}\\s*>`, 'gi');
-    const selfClosing = new RegExp(`<${tag}\\b[^>]*\\/?>`, 'gi');
-    html = html.replace(withBody, '').replace(selfClosing, '');
-  }
-
-  // Strip inline event handlers: on*="…" / on*='…' / on*=value.
-  html = html.replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, '');
-  html = html.replace(/\son[a-z]+\s*=\s*'[^']*'/gi, '');
-  html = html.replace(/\son[a-z]+\s*=\s*[^\s>]+/gi, '');
-
-  // Neutralize javascript:/vbscript:/data: URIs in href/src attributes.
-  html = html.replace(
-    /\b(href|src|xlink:href)\s*=\s*("|')\s*(javascript|vbscript|data):[^"']*\2/gi,
-    '$1=$2#$2',
-  );
-
-  return html;
+  return sanitize(input, {
+    allowedTags: [
+      'h1',
+      'h2',
+      'h3',
+      'h4',
+      'h5',
+      'h6',
+      'p',
+      'br',
+      'hr',
+      'span',
+      'div',
+      'strong',
+      'b',
+      'em',
+      'i',
+      'u',
+      's',
+      'small',
+      'sub',
+      'sup',
+      'a',
+      'ul',
+      'ol',
+      'li',
+      'blockquote',
+      'pre',
+      'code',
+      'figure',
+      'figcaption',
+      'img',
+      'table',
+      'thead',
+      'tbody',
+      'tfoot',
+      'tr',
+      'th',
+      'td',
+    ],
+    allowedAttributes: {
+      a: ['href', 'title', 'target', 'rel'],
+      img: ['src', 'alt', 'title', 'width', 'height', 'loading'],
+      th: ['colspan', 'rowspan', 'scope'],
+      td: ['colspan', 'rowspan'],
+      '*': ['id', 'class'],
+    },
+    allowedSchemes: ['http', 'https', 'mailto', 'tel'],
+    allowedSchemesByTag: { img: ['http', 'https'] },
+    // Force safe rel on any link that opens a new tab.
+    transformTags: {
+      a: sanitize.simpleTransform('a', { rel: 'noopener noreferrer nofollow' }),
+    },
+  });
 }

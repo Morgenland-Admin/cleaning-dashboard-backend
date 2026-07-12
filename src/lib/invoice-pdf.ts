@@ -222,7 +222,6 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     doc.fillColor(INK).font('Helvetica-Bold').fontSize(16).text('Rechnung', PAGE_LEFT, y);
     y = doc.y + 8;
 
-    // Items table header
     doc.rect(PAGE_LEFT, y, PAGE_RIGHT - PAGE_LEFT, 22).fill('#f4ebdc');
     doc.fillColor(MUTED).font('Helvetica-Bold').fontSize(9);
     const headY = y + 7;
@@ -232,7 +231,6 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     doc.text('Betrag', COL_AMT.x, headY, { width: COL_AMT.w - 6, align: 'right' });
     y += 22;
 
-    // Items rows
     doc.font('Helvetica').fontSize(10).fillColor(INK);
     for (const item of data.lineItems) {
       const labelFont = item.isPackage ? 'Helvetica-Bold' : 'Helvetica';
@@ -264,7 +262,6 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     }
     doc.font('Helvetica').fontSize(10);
 
-    // Totals
     y += 8;
     const totalsLabelX = 330;
     const totalsLabelW = 120;
