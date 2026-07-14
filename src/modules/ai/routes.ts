@@ -28,6 +28,22 @@ const assistSchema = z.object({
   fresh: z.boolean().optional(), // ignore `current`, write from scratch
 });
 
+// Structured extraction: turn an inquiry's request + drafted offer text into
+// offer line items. Grounded on the inquiry by refId; `current` is the offer
+// text box (optional). Returns JSON, unlike the free-text /assist endpoint.
+const extractItemsSchema = z.object({
+  refId: z.number().int().positive(),
+  current: z.string().max(8000).optional(), // offer text box, if the operator drafted one
+});
+
+// One extracted service position. Prices are filled only when the text names
+// one (unitPriceGross null otherwise) — Claude is told never to invent prices.
+const extractedItemSchema = z.object({
+  label: z.string().trim().min(1).max(200),
+  quantity: z.coerce.number().positive().max(100_000).catch(1),
+  unitPriceGross: z.coerce.number().nonnegative().max(1_000_000).nullable().catch(null),
+});
+
 interface PromptParts {
   system: string;
   context: string;
@@ -42,6 +58,33 @@ const OUTPUT_RULES =
   'Erfinde keine Preise, Termine oder Zusagen, die nicht vorgegeben sind.';
 // Default: formal address. inquiry_quote overrides the address form (du) below.
 const SHARED_RULES = `Schreibe auf Deutsch, per Sie, höflich und professionell. ${OUTPUT_RULES}`;
+
+// Grounding context for an inquiry, shared by the quote draft and the
+// structured line-item extraction below. Loaded server-side by refId.
+async function loadInquiryQuoteContext(refId: number, tables: TenantTables): Promise<string> {
+  const [inq] = await db
+    .select()
+    .from(tables.serviceInquiries)
+    .where(eq(tables.serviceInquiries.id, refId))
+    .limit(1);
+  if (!inq) throw notFound('Inquiry not found');
+  // The AI vision pipeline drops carpet/dirt details into metadata.carpet;
+  // surface it so the offer can reference what was actually requested.
+  const carpet = (inq.metadata as { carpet?: unknown } | null)?.carpet;
+  return [
+    line('Name', inq.name),
+    line('Service', inq.service),
+    line('Objekt/Details', inq.propertyDetails),
+    line('Wunschtermin', inq.preferredDate),
+    line('Budget', inq.budget),
+    line('Bereits genannter Angebotsbetrag', inq.quotedAmount),
+    line('PLZ', inq.plz),
+    line('Nachricht des Kunden', inq.message),
+    carpet ? line('Erkannte Teppich-Details', JSON.stringify(carpet)) : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
 
 // System prompt + grounding context for a kind, from its loaded row.
 async function buildPrompt(
@@ -126,28 +169,7 @@ async function buildPrompt(
       };
     }
     case 'inquiry_quote': {
-      const [inq] = await db
-        .select()
-        .from(tables.serviceInquiries)
-        .where(eq(tables.serviceInquiries.id, refId))
-        .limit(1);
-      if (!inq) throw notFound('Inquiry not found');
-      // The AI vision pipeline drops carpet/dirt details into metadata.carpet;
-      // surface it so the offer can reference what was actually requested.
-      const carpet = (inq.metadata as { carpet?: unknown } | null)?.carpet;
-      const context = [
-        line('Name', inq.name),
-        line('Service', inq.service),
-        line('Objekt/Details', inq.propertyDetails),
-        line('Wunschtermin', inq.preferredDate),
-        line('Budget', inq.budget),
-        line('Bereits genannter Angebotsbetrag', inq.quotedAmount),
-        line('PLZ', inq.plz),
-        line('Nachricht des Kunden', inq.message),
-        carpet ? line('Erkannte Teppich-Details', JSON.stringify(carpet)) : null,
-      ]
-        .filter(Boolean)
-        .join('\n');
+      const context = await loadInquiryQuoteContext(refId, tables);
       return {
         system:
           `Du bist im Vertriebsteam von ${brand}, einem deutschen Reinigungsunternehmen. ` +
@@ -238,6 +260,67 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
       } catch (err) {
         if (err instanceof AnthropicError) {
           request.log.error({ err, kind: body.kind }, 'Anthropic assist failed');
+          reply.code(502);
+          return { error: 'Claude konnte gerade nicht antworten. Bitte erneut versuchen.' };
+        }
+        throw err;
+      }
+    },
+  );
+
+  // Extract offer line items from the inquiry request + drafted offer text.
+  app.post(
+    '/extract-offer-items',
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      if (!isAiConfigured()) {
+        reply.code(503);
+        return { error: 'KI-Textassistent ist nicht konfiguriert (ANTHROPIC_API_KEY fehlt).' };
+      }
+
+      const body = extractItemsSchema.parse(request.body);
+      const context = await loadInquiryQuoteContext(body.refId, request.company!.tables);
+      const brand = request.company!.name;
+
+      const system =
+        `Du extrahierst die angefragten Reinigungs-Leistungen als strukturierte ` +
+        `Angebotspositionen für ${brand}, ein deutsches Reinigungsunternehmen. ` +
+        `Gib ausschließlich ein JSON-Array zurück — kein Fließtext, keine Erklärung, kein Markdown. ` +
+        `Jedes Element hat die Form {"label": string, "quantity": number, "unitPriceGross": number|null}. ` +
+        `label: kurze, konkrete Leistungsbezeichnung auf Deutsch (z. B. "Teppichreinigung 200×300 cm"). ` +
+        `quantity: Menge als Zahl (Standard 1). ` +
+        `unitPriceGross: Bruttopreis pro Einheit in Euro, NUR wenn im Text ausdrücklich genannt; ` +
+        `sonst null. Preise niemals erfinden, schätzen oder runden. ` +
+        `Wenn keine Leistungen erkennbar sind, gib [] zurück. Höchstens 20 Positionen.`;
+
+      const user = [
+        context,
+        body.current && body.current.trim() ? `\nAngebotstext (Entwurf):\n${body.current}` : '',
+        '\nAufgabe: Extrahiere die Angebotspositionen als JSON-Array.',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      try {
+        const text = await generateText({ system, user });
+        let parsed: unknown = null;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = null;
+        }
+        const items = Array.isArray(parsed)
+          ? parsed
+              .flatMap((raw) => {
+                const r = extractedItemSchema.safeParse(raw);
+                return r.success ? [r.data] : [];
+              })
+              .slice(0, 20)
+          : [];
+        return { items };
+      } catch (err) {
+        if (err instanceof AnthropicError) {
+          request.log.error({ err }, 'Anthropic item extraction failed');
           reply.code(502);
           return { error: 'Claude konnte gerade nicht antworten. Bitte erneut versuchen.' };
         }

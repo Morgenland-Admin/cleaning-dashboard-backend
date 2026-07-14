@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { and, desc, eq, inArray, lt, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
@@ -93,9 +93,57 @@ function computeTaxCents(subtotalCents: number, taxRatePercent: number): number 
   return Math.round((subtotalCents * taxRatePercent) / 100);
 }
 
+/** §14 UStG mandatory recipient address fields, checked before a draft is issued. */
+function missingIssueFields(current: {
+  recipientAddressLine1: string | null;
+  recipientPostalCode: string | null;
+  recipientCity: string | null;
+}): string[] {
+  const missing: string[] = [];
+  if (!current.recipientAddressLine1) missing.push('Empfänger-Straße');
+  if (!current.recipientPostalCode) missing.push('Empfänger-PLZ');
+  if (!current.recipientCity) missing.push('Empfänger-Ort');
+  return missing;
+}
+
 export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
   app.addHook('preHandler', app.requireAccess('super_admin', 'admin', 'manager'));
+
+  /**
+   * Shared draft → issued transition (GoBD): assigns the gapless per-brand
+   * number + dueAt in one transaction. Used by both `/send` (issue + email) and
+   * `/issue` (issue + print, no email). Returns the issued row, or null if the
+   * draft was changed/issued concurrently. Assumes §14 fields already validated.
+   */
+  async function issueDraftTx(
+    request: FastifyRequest,
+    id: number,
+    current: { number: string | null; paymentTermsDays: number },
+    now: Date,
+    reason: string,
+  ) {
+    const { invoices, invoiceStatusLog } = request.company!.tables;
+    const adminId = request.authUser!.id;
+    const dueAt = new Date(now.getTime() + current.paymentTermsDays * 24 * 60 * 60 * 1000);
+    return db.transaction(async (tx) => {
+      const number = current.number ?? (await nextInvoiceNumber(tx, request.company!.slug));
+      const [r] = await tx
+        .update(invoices)
+        .set({ status: 'sent', number, sentAt: now, dueAt, updatedAt: now })
+        .where(and(eq(invoices.id, id), eq(invoices.status, 'draft')))
+        .returning();
+      if (!r) return null;
+      await tx.insert(invoiceStatusLog).values({
+        invoiceId: id,
+        fromStatus: 'draft',
+        toStatus: 'sent',
+        changedByUserId: adminId,
+        reason,
+      });
+      return r;
+    });
+  }
 
   app.get('/', async (request) => {
     const { limit, cursor, status, customerType, overdue } = listQuerySchema.parse(request.query);
@@ -304,14 +352,9 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const now = new Date();
     let row = current;
     if (current.status === 'draft') {
-      // §14 UStG: mandatory before issue.
-      // Leistungsdatum is optional — operators can leave it off (it simply
-      // isn't printed). The recipient postal address stays required (§14 UStG
-      // for invoices over 250 €).
-      const missing: string[] = [];
-      if (!current.recipientAddressLine1) missing.push('Empfänger-Straße');
-      if (!current.recipientPostalCode) missing.push('Empfänger-PLZ');
-      if (!current.recipientCity) missing.push('Empfänger-Ort');
+      // §14 UStG: mandatory before issue. Leistungsdatum is optional — the
+      // recipient postal address stays required.
+      const missing = missingIssueFields(current);
       if (missing.length > 0) {
         reply.code(400).send({
           error: `Pflichtangaben fehlen (§14 UStG): ${missing.join(', ')}`,
@@ -321,24 +364,13 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       }
       // dueAt is set once at first issue; re-sends never move it. The gapless
       // invoice number is assigned here (issue time), in the same transaction.
-      const dueAt = new Date(now.getTime() + current.paymentTermsDays * 24 * 60 * 60 * 1000);
-      const issued = await db.transaction(async (tx) => {
-        const number = current.number ?? (await nextInvoiceNumber(tx, request.company!.slug));
-        const [r] = await tx
-          .update(invoices)
-          .set({ status: 'sent', number, sentAt: now, dueAt, updatedAt: now })
-          .where(and(eq(invoices.id, id), eq(invoices.status, 'draft')))
-          .returning();
-        if (!r) return null;
-        await tx.insert(invoiceStatusLog).values({
-          invoiceId: id,
-          fromStatus: 'draft',
-          toStatus: 'sent',
-          changedByUserId: adminId,
-          reason: 'Rechnung ausgestellt & versendet',
-        });
-        return r;
-      });
+      const issued = await issueDraftTx(
+        request,
+        id,
+        current,
+        now,
+        'Rechnung ausgestellt & versendet',
+      );
       if (!issued) {
         reply.code(409).send({ error: 'Rechnung wurde zwischenzeitlich geändert.' });
         return;
@@ -376,6 +408,42 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     return { invoice: row, emailSent, emailSkipped };
+  });
+
+  // Issue a draft WITHOUT emailing it (offline / print flow). Assigns the
+  // gapless number and freezes the invoice exactly like `/send`, but never
+  // touches Resend — the operator prints or downloads the PDF instead.
+  app.post('/:id/issue', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { invoices } = request.company!.tables;
+    const [current] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
+    if (!current) throw notFound('Invoice not found');
+    if (current.status !== 'draft') {
+      reply.code(409).send({
+        error: `Nur Entwürfe können ausgestellt werden (Status: "${current.status}").`,
+      });
+      return;
+    }
+    const missing = missingIssueFields(current);
+    if (missing.length > 0) {
+      reply.code(400).send({
+        error: `Pflichtangaben fehlen (§14 UStG): ${missing.join(', ')}`,
+        missing,
+      });
+      return;
+    }
+    const issued = await issueDraftTx(
+      request,
+      id,
+      current,
+      new Date(),
+      'Rechnung ausgestellt (ohne E-Mail)',
+    );
+    if (!issued) {
+      reply.code(409).send({ error: 'Rechnung wurde zwischenzeitlich geändert.' });
+      return;
+    }
+    return { invoice: issued };
   });
 
   app.post('/:id/mark-paid', async (request, reply) => {
