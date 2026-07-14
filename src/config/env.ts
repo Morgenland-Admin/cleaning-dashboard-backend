@@ -30,6 +30,26 @@ const envSchema = z.object({
   RESEND_API_KEY_TRL: optionalString,
   ADMIN_FROM_EMAIL: z.string().email().default('admin@reinigungs-portal.com'),
   ADMIN_FROM_NAME: z.string().default('Reinigungs-Portal'),
+  // Our own brand domains. An inquiry whose contact email is one of these is
+  // almost certainly loop traffic — our own confirmation/notification mail
+  // re-ingested by the inbound-email workflow — never a real external customer,
+  // so we never send it confirmation/notification mail. Defense in depth behind
+  // the n8n self-sender filter. Comma-separated; matches the domain or any
+  // subdomain of it.
+  OWN_EMAIL_DOMAINS: z
+    .string()
+    .default(
+      'cleanilo.de,hamburg-teppichreinigung.de,teppichreinigen-lassen.de,reinigungs-portal.com',
+    )
+    .transform((v) =>
+      v
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  // Max inquiries a single contact email may create per rolling hour. Hard
+  // backstop that caps any runaway feedback loop regardless of source.
+  INQUIRY_MAX_PER_EMAIL_PER_HOUR: z.coerce.number().int().positive().default(10),
   APP_BASE_URL: z.string().url().default('http://localhost:5173'),
   AWS_REGION: z.string().default('eu-central-1'),
   AWS_ACCESS_KEY_ID: optionalString,

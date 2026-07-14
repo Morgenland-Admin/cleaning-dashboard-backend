@@ -6,7 +6,8 @@ import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
-import { buildCallbackFields, notifyInquiryCreated } from './routes.js';
+import { tooManyRequests } from '../../lib/http-errors.js';
+import { buildCallbackFields, isInquiryRateLimited, notifyInquiryCreated } from './routes.js';
 
 // Machine-to-machine intake for the voice-AI / web-form callback funnel (via n8n):
 // creates an inquiry, runs the same geo-routing as the public form, and returns
@@ -106,6 +107,15 @@ export const inquiriesIntakeRoutes: FastifyPluginAsync = async (app) => {
       // Nameless phone leads still need a dashboard label.
       const name = body.name?.trim() || 'Telefon-Lead';
       const email = body.email?.trim() || null;
+
+      // Per-email backstop against a runaway loop (checked after idempotency so a
+      // legitimate retry of the same call still returns its existing lead above).
+      if (await isInquiryRateLimited(serviceInquiries, email)) {
+        request.log.warn({ email }, 'Intake rejected — per-email hourly rate limit exceeded');
+        throw tooManyRequests(
+          'Too many inquiries from this email address. Please try again later.',
+        );
+      }
 
       const consentMarketing = body.consentMarketing ?? false;
       // No email ⇒ can't dedupe a customer; the inquiry stands alone.

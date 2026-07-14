@@ -18,6 +18,21 @@ export function isNonContactableEmail(addr: string): boolean {
   return addr.trim().toLowerCase().endsWith(`@${NONCONTACTABLE_EMAIL_DOMAIN}`);
 }
 
+/**
+ * True if `addr` belongs to one of our own brand domains (env.OWN_EMAIL_DOMAINS)
+ * or a subdomain of one. Used to suppress confirmation/notification mail for
+ * inquiries whose contact address is our own — a self-sender feedback-loop guard.
+ */
+export function isOwnDomainEmail(addr: string | null | undefined): boolean {
+  if (!addr) return false;
+  const at = addr.trim().toLowerCase();
+  const sep = at.lastIndexOf('@');
+  if (sep < 0) return false; // not an email address — no domain to match
+  const domain = at.slice(sep + 1);
+  if (!domain) return false;
+  return env.OWN_EMAIL_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`));
+}
+
 function getResend(apiKey?: string | null): Resend | null {
   const key = apiKey || env.RESEND_API_KEY;
   if (!key) return null;

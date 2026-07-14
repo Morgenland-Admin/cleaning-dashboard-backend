@@ -6,13 +6,19 @@ import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
 import { company, user } from '../../db/schema/shared.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
-import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
+import {
+  brandInfoFromCompany,
+  brandSender,
+  isOwnDomainEmail,
+  sendEmail,
+} from '../../email/service.js';
 import {
   adminInboxNotificationEmail,
   contactAckEmail,
   inquiryQuoteEmail,
 } from '../../email/templates.js';
-import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
+import { badRequest, notFound, parseIntId, tooManyRequests } from '../../lib/http-errors.js';
+import type { TenantTables } from '../../db/schema/tenant.js';
 import { formatInquiryNumber } from './number.js';
 import { routeCallback } from '../../lib/geo.js';
 import { metaEventContextSchema, sendMetaServerEvent } from '../../lib/meta-capi.js';
@@ -126,6 +132,32 @@ export function buildCallbackFields(
 }
 
 /**
+ * Per-email inquiry rate limit. Counts inquiries created by `email` in the
+ * trailing hour and reports whether it has hit env.INQUIRY_MAX_PER_EMAIL_PER_HOUR.
+ * A hard backstop against a feedback loop (e.g. inbound mail re-ingesting our
+ * own notifications) that caps a single address regardless of where the
+ * inquiries originate. Phone-only leads (no email) are never limited here.
+ */
+export async function isInquiryRateLimited(
+  serviceInquiries: TenantTables['serviceInquiries'],
+  email: string | null | undefined,
+): Promise<boolean> {
+  const addr = email?.trim().toLowerCase();
+  if (!addr) return false;
+  const since = new Date(Date.now() - 3_600_000).toISOString();
+  const [agg] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(serviceInquiries)
+    .where(
+      and(
+        sql`lower(${serviceInquiries.email}) = ${addr}`,
+        sql`${serviceInquiries.createdAt} >= ${since}::timestamptz`,
+      ),
+    );
+  return (agg?.count ?? 0) >= env.INQUIRY_MAX_PER_EMAIL_PER_HOUR;
+}
+
+/**
  * Fire-and-forget side-effects after an inquiry is created: customer ack email,
  * admin inbox email, push, and a dashboard task. Human (Hamburg-area) leads get
  * a flagged `human_callback` task assigned to their owner; everything else keeps
@@ -137,13 +169,26 @@ export async function notifyInquiryCreated(
   log: FastifyBaseLogger,
 ): Promise<void> {
   const isHuman = row.callbackOwner === 'human';
+  // Feedback-loop guard: if the inquiry's contact address is one of our own
+  // domains, it's almost certainly our own confirmation/notification mail
+  // re-ingested by the inbound-email workflow, not a real customer. Sending an
+  // ack or admin notification would feed the loop, so suppress all mail for it.
+  // (Defense in depth behind the n8n self-sender filter.) The dashboard task /
+  // push still fire so nothing is silently dropped from the operators' view.
+  const suppressMail = isOwnDomainEmail(row.email);
+  if (suppressMail) {
+    log.warn(
+      { inquiryId: row.id, recipientEmail: row.email },
+      'Suppressing inquiry mail — contact address is an own domain (loop guard)',
+    );
+  }
   try {
     const [companyRow] = await db
       .select()
       .from(company)
       .where(eq(company.slug, companySlug))
       .limit(1);
-    if (companyRow) {
+    if (companyRow && !suppressMail) {
       const brand = brandInfoFromCompany(companyRow);
       // No email (e.g. a voice-AI phone lead) → no customer acknowledgement to send.
       if (row.email) {
@@ -270,6 +315,16 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
         }
       }
       const { serviceInquiries, customers } = request.company!.tables;
+      // Per-email backstop against a runaway loop, independent of the n8n filter.
+      if (await isInquiryRateLimited(serviceInquiries, body.email)) {
+        request.log.warn(
+          { email: body.email },
+          'Inquiry rejected — per-email hourly rate limit exceeded',
+        );
+        throw tooManyRequests(
+          'Too many inquiries from this email address. Please try again later.',
+        );
+      }
       const customerId = await linkCustomerByEmail(db, customers, {
         email: body.email,
         name: body.name,
