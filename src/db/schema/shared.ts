@@ -275,3 +275,29 @@ export const exportJobs = pgTable(
     byRequester: index('export_jobs_requester_idx').on(t.requestedByUserId, t.createdAt),
   }),
 );
+
+/**
+ * Per-brand overrides for the "✦ Claude" assistant prompts. A row exists only
+ * when an operator edited that kind — absent means the code default is used, so
+ * resetting is a delete. Only the instruction text is stored; the output-format
+ * rules are appended server-side and are not editable.
+ */
+export const aiPrompts = pgTable(
+  'ai_prompts',
+  {
+    id: serial('id').primaryKey(),
+    companySlug: varchar('company_slug', { length: 63 })
+      .notNull()
+      .references(() => company.slug, { onDelete: 'cascade' }),
+    kind: varchar('kind', { length: 64 }).notNull(),
+    body: text('body').notNull(),
+    updatedByUserId: text('updated_by_user_id').references(() => user.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    brandKindUnique: uniqueIndex('ai_prompts_brand_kind_unique_idx').on(t.companySlug, t.kind),
+  }),
+);

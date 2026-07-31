@@ -1,7 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../../db/index.js';
+import { aiPrompts } from '../../db/schema/shared.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
 import { generateText, isAiConfigured, AnthropicError } from '../../lib/anthropic.js';
 import { notFound } from '../../lib/http-errors.js';
@@ -44,20 +45,92 @@ const extractedItemSchema = z.object({
   unitPriceGross: z.coerce.number().nonnegative().max(1_000_000).nullable().catch(null),
 });
 
-interface PromptParts {
-  system: string;
-  context: string;
-}
-
 const line = (label: string, value: string | number | null | undefined): string | null =>
   value === null || value === undefined || value === '' ? null : `${label}: ${value}`;
 
 // Output-format + honesty rules every kind shares, independent of address form.
+// Appended to every prompt and NOT editable: an operator edit must not be able
+// to produce output the mail template can't use, or invented prices.
 const OUTPUT_RULES =
   'Gib ausschließlich den fertigen Text zurück — keine Einleitung, keine Erklärung, keine Anführungszeichen, kein Markdown. ' +
   'Erfinde keine Preise, Termine oder Zusagen, die nicht vorgegeben sind.';
-// Default: formal address. inquiry_quote overrides the address form (du) below.
-const SHARED_RULES = `Schreibe auf Deutsch, per Sie, höflich und professionell. ${OUTPUT_RULES}`;
+// Kinds that fill the body of a templated mail: the template owns the rest.
+const EMAIL_BODY_RULES =
+  'Keine Betreffzeile, keine Anrede, keine Signatur — diese ergänzt die Vorlage. ';
+
+interface PromptSpec {
+  /** Editable instruction text. `{{brand}}` is replaced with the company name. */
+  instructions: string;
+  /** Always appended verbatim; operators cannot change or remove this. */
+  locked: string;
+}
+
+// Defaults for every kind. An `ai_prompts` row for (brand, kind) replaces
+// `instructions`; `locked` always applies. Keep prices out of the defaults —
+// they belong in a per-brand override, which is the point of the editor.
+const PROMPT_SPECS: Record<AssistKind, PromptSpec> = {
+  contact_reply: {
+    instructions:
+      'Du bist im Kundenservice-Team von {{brand}}, einem deutschen Reinigungsunternehmen. ' +
+      'Verfasse eine hilfreiche, freundliche E-Mail-Antwort auf die Kontaktanfrage. ' +
+      'Gehe auf das Anliegen ein, biete den nächsten Schritt an und halte dich kurz. ' +
+      'Schreibe auf Deutsch, per Sie, höflich und professionell.',
+    locked: EMAIL_BODY_RULES + OUTPUT_RULES,
+  },
+  review_response: {
+    instructions:
+      'Du antwortest im Namen von {{brand}}, einem deutschen Reinigungsunternehmen, ' +
+      'öffentlich auf eine Kundenbewertung. Bedanke dich, gehe konkret auf das Feedback ein ' +
+      'und bleibe wertschätzend. Bei Kritik: ernst nehmen, Lösung/Kontakt anbieten, nicht rechtfertigen. ' +
+      'Halte die Antwort knapp (2–4 Sätze). Schreibe auf Deutsch, per Sie, höflich und professionell.',
+    locked: OUTPUT_RULES,
+  },
+  inquiry_note: {
+    instructions:
+      'Du unterstützt das Vertriebsteam von {{brand}}, einem deutschen Reinigungsunternehmen. ' +
+      'Schreibe eine kompakte interne Notiz zu dieser Anfrage: kurze Einschätzung, offene Punkte ' +
+      'und ein konkreter nächster Schritt (z. B. Rückruf, Angebot, fehlende Infos). ' +
+      'Stichpunkte sind erlaubt. Dies ist eine interne Notiz, kein Kundentext. ' +
+      'Schreibe auf Deutsch, per Sie, höflich und professionell.',
+    locked: OUTPUT_RULES,
+  },
+  inquiry_quote: {
+    instructions:
+      'Du bist im Vertriebsteam von {{brand}}, einem deutschen Reinigungsunternehmen. ' +
+      'Verfasse den Fließtext für eine Angebots-E-Mail an den Kunden — den Teil, der zwischen ' +
+      'Anrede und Signatur steht. Gehe konkret auf die Anfrage ein, beschreibe die vorgeschlagene ' +
+      'Leistung und nenne, falls vorgegeben, den Preis; lade zur Beauftragung ein. ' +
+      'Schreibe auf Deutsch, freundlich und per "du" (so wie die Marke ihre Kunden anspricht).',
+    locked: EMAIL_BODY_RULES + OUTPUT_RULES,
+  },
+  order_message: {
+    instructions:
+      'Du bist im Kundenservice-Team von {{brand}}, einem deutschen Reinigungsunternehmen. ' +
+      'Verfasse eine kurze, freundliche E-Mail an den Kunden zu seinem laufenden Auftrag ' +
+      '(z. B. Rückfrage, Statusinfo, Terminabstimmung). Gehe konkret auf den Auftrag ein und ' +
+      'nenne den nächsten Schritt. Schreibe auf Deutsch, per Sie, höflich und professionell.',
+    locked: EMAIL_BODY_RULES + OUTPUT_RULES,
+  },
+};
+
+const renderBrand = (text: string, brand: string): string =>
+  text.replace(/\{\{\s*brand\s*\}\}/g, brand);
+
+/** Effective system prompt: the brand's override (or the default) + locked rules. */
+async function systemPromptFor(
+  kind: AssistKind,
+  brand: string,
+  companySlug: string,
+): Promise<string> {
+  const spec = PROMPT_SPECS[kind];
+  const [override] = await db
+    .select({ body: aiPrompts.body })
+    .from(aiPrompts)
+    .where(and(eq(aiPrompts.companySlug, companySlug), eq(aiPrompts.kind, kind)))
+    .limit(1);
+  const instructions = (override?.body ?? spec.instructions).trim();
+  return `${renderBrand(instructions, brand)} ${spec.locked}`;
+}
 
 // Grounding context for an inquiry, shared by the quote draft and the
 // structured line-item extraction below. Loaded server-side by refId.
@@ -86,13 +159,9 @@ async function loadInquiryQuoteContext(refId: number, tables: TenantTables): Pro
     .join('\n');
 }
 
-// System prompt + grounding context for a kind, from its loaded row.
-async function buildPrompt(
-  kind: AssistKind,
-  refId: number,
-  brand: string,
-  tables: TenantTables,
-): Promise<PromptParts> {
+// Grounding context for a kind, from its loaded row. The system prompt comes
+// from systemPromptFor() so a brand override can replace the instructions.
+async function loadContext(kind: AssistKind, refId: number, tables: TenantTables): Promise<string> {
   switch (kind) {
     case 'contact_reply': {
       const [msg] = await db
@@ -101,21 +170,13 @@ async function buildPrompt(
         .where(eq(tables.contactMessages.id, refId))
         .limit(1);
       if (!msg) throw notFound('Contact message not found');
-      const context = [
+      return [
         line('Name', msg.name),
         line('Betreff', msg.subject),
         line('Nachricht des Kunden', msg.message),
       ]
         .filter(Boolean)
         .join('\n');
-      return {
-        system:
-          `Du bist im Kundenservice-Team von ${brand}, einem deutschen Reinigungsunternehmen. ` +
-          `Verfasse eine hilfreiche, freundliche E-Mail-Antwort auf die Kontaktanfrage. ` +
-          `Gehe auf das Anliegen ein, biete den nächsten Schritt an und halte dich kurz. ` +
-          `Keine Betreffzeile, keine Grußformel-Signatur mit Platzhaltern. ${SHARED_RULES}`,
-        context,
-      };
     }
     case 'review_response': {
       const [review] = await db
@@ -124,21 +185,13 @@ async function buildPrompt(
         .where(eq(tables.reviews.id, refId))
         .limit(1);
       if (!review) throw notFound('Review not found');
-      const context = [
+      return [
         line('Name', review.customerName),
         line('Bewertung (Sterne)', `${review.rating}/5`),
         line('Kommentar des Kunden', review.comment),
       ]
         .filter(Boolean)
         .join('\n');
-      return {
-        system:
-          `Du antwortest im Namen von ${brand}, einem deutschen Reinigungsunternehmen, ` +
-          `öffentlich auf eine Kundenbewertung. Bedanke dich, gehe konkret auf das Feedback ein ` +
-          `und bleibe wertschätzend. Bei Kritik: ernst nehmen, Lösung/Kontakt anbieten, nicht rechtfertigen. ` +
-          `Halte die Antwort knapp (2–4 Sätze). ${SHARED_RULES}`,
-        context,
-      };
     }
     case 'inquiry_note': {
       const [inq] = await db
@@ -147,7 +200,7 @@ async function buildPrompt(
         .where(eq(tables.serviceInquiries.id, refId))
         .limit(1);
       if (!inq) throw notFound('Inquiry not found');
-      const context = [
+      return [
         line('Name', inq.name),
         line('Service', inq.service),
         line('Objekt/Details', inq.propertyDetails),
@@ -159,28 +212,9 @@ async function buildPrompt(
       ]
         .filter(Boolean)
         .join('\n');
-      return {
-        system:
-          `Du unterstützt das Vertriebsteam von ${brand}, einem deutschen Reinigungsunternehmen. ` +
-          `Schreibe eine kompakte interne Notiz zu dieser Anfrage: kurze Einschätzung, offene Punkte ` +
-          `und ein konkreter nächster Schritt (z. B. Rückruf, Angebot, fehlende Infos). ` +
-          `Stichpunkte sind erlaubt. Dies ist eine interne Notiz, kein Kundentext. ${SHARED_RULES}`,
-        context,
-      };
     }
-    case 'inquiry_quote': {
-      const context = await loadInquiryQuoteContext(refId, tables);
-      return {
-        system:
-          `Du bist im Vertriebsteam von ${brand}, einem deutschen Reinigungsunternehmen. ` +
-          `Verfasse den Fließtext für eine Angebots-E-Mail an den Kunden — den Teil, der zwischen ` +
-          `Anrede und Signatur steht. Gehe konkret auf die Anfrage ein, beschreibe die vorgeschlagene ` +
-          `Leistung und nenne, falls vorgegeben, den Preis; lade zur Beauftragung ein. ` +
-          `Keine Betreffzeile, keine Anrede ("Hallo …"), keine Signatur — diese ergänzt die Vorlage. ` +
-          `Schreibe auf Deutsch, freundlich und per "du" (so wie die Marke ihre Kunden anspricht). ${OUTPUT_RULES}`,
-        context,
-      };
-    }
+    case 'inquiry_quote':
+      return loadInquiryQuoteContext(refId, tables);
     case 'order_message': {
       const [order] = await db
         .select()
@@ -193,7 +227,7 @@ async function buildPrompt(
         .from(tables.orderItems)
         .where(eq(tables.orderItems.orderId, refId));
       const meta = (order.metadata ?? {}) as { confirmedSlot?: string };
-      const context = [
+      return [
         line('Auftragsnummer', order.orderNumber ?? `#${order.id}`),
         line('Kunde', order.customerName),
         line('Leistung', order.kind),
@@ -206,15 +240,6 @@ async function buildPrompt(
       ]
         .filter(Boolean)
         .join('\n');
-      return {
-        system:
-          `Du bist im Kundenservice-Team von ${brand}, einem deutschen Reinigungsunternehmen. ` +
-          `Verfasse eine kurze, freundliche E-Mail an den Kunden zu seinem laufenden Auftrag ` +
-          `(z. B. Rückfrage, Statusinfo, Terminabstimmung). Gehe konkret auf den Auftrag ein und ` +
-          `nenne den nächsten Schritt. Keine Betreffzeile, keine Signatur — diese ergänzt die Vorlage. ` +
-          `${SHARED_RULES}`,
-        context,
-      };
     }
   }
 }
@@ -234,12 +259,8 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const body = assistSchema.parse(request.body);
-      const { system, context } = await buildPrompt(
-        body.kind,
-        body.refId,
-        request.company!.name,
-        request.company!.tables,
-      );
+      const context = await loadContext(body.kind, body.refId, request.company!.tables);
+      const system = await systemPromptFor(body.kind, request.company!.name, request.company!.slug);
 
       const useCurrent = !body.fresh && body.current && body.current.trim().length > 0;
       const user = [
@@ -267,6 +288,76 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
       }
     },
   );
+
+  // --- Prompt editor -----------------------------------------------------
+  // Operators tune the instructions per brand (prices change, tone changes).
+  // Reads are open to any admin user; writes are admin-only, because a prompt
+  // decides what goes out to customers.
+  const requirePromptWrite = { preHandler: app.requireAccess('super_admin', 'admin') };
+
+  app.get('/prompts', async (request) => {
+    const slug = request.company!.slug;
+    const brand = request.company!.name;
+    const overrides = await db.select().from(aiPrompts).where(eq(aiPrompts.companySlug, slug));
+
+    return {
+      prompts: KINDS.map((kind) => {
+        const override = overrides.find((o) => o.kind === kind) ?? null;
+        const spec = PROMPT_SPECS[kind];
+        return {
+          kind,
+          // What the editor shows: the override if any, else the default.
+          body: override?.body ?? spec.instructions,
+          defaultBody: spec.instructions,
+          // Appended on every call, read-only in the UI.
+          lockedRules: spec.locked,
+          isCustom: !!override,
+          updatedAt: override?.updatedAt ?? null,
+          // Rendered preview so the operator sees what {{brand}} becomes.
+          brand,
+        };
+      }),
+    };
+  });
+
+  const promptParams = z.object({ kind: z.enum(KINDS) });
+  const promptBody = z.object({ body: z.string().trim().min(20).max(8000) });
+
+  // PATCH, not PUT: the shared frontend request helper only speaks GET/POST/PATCH/DELETE.
+  app.patch('/prompts/:kind', requirePromptWrite, async (request) => {
+    const { kind } = promptParams.parse(request.params);
+    const { body } = promptBody.parse(request.body);
+    const slug = request.company!.slug;
+    const userId = request.authUser?.id ?? null;
+
+    // Saving the untouched default is a reset, not an override — keeps the row
+    // absent so future default changes still reach this brand.
+    if (body === PROMPT_SPECS[kind].instructions.trim()) {
+      await db
+        .delete(aiPrompts)
+        .where(and(eq(aiPrompts.companySlug, slug), eq(aiPrompts.kind, kind)));
+      return { kind, isCustom: false, body: PROMPT_SPECS[kind].instructions };
+    }
+
+    const [row] = await db
+      .insert(aiPrompts)
+      .values({ companySlug: slug, kind, body, updatedByUserId: userId })
+      .onConflictDoUpdate({
+        target: [aiPrompts.companySlug, aiPrompts.kind],
+        set: { body, updatedByUserId: userId, updatedAt: new Date() },
+      })
+      .returning();
+
+    return { kind, isCustom: true, body: row!.body, updatedAt: row!.updatedAt };
+  });
+
+  app.delete('/prompts/:kind', requirePromptWrite, async (request) => {
+    const { kind } = promptParams.parse(request.params);
+    await db
+      .delete(aiPrompts)
+      .where(and(eq(aiPrompts.companySlug, request.company!.slug), eq(aiPrompts.kind, kind)));
+    return { kind, isCustom: false, body: PROMPT_SPECS[kind].instructions };
+  });
 
   // Extract offer line items from the inquiry request + drafted offer text.
   app.post(
