@@ -485,6 +485,8 @@ function buildTenantTables(schemaName: string) {
       recipientPostalCode: varchar('recipient_postal_code', { length: 16 }),
       recipientCity: text('recipient_city'),
       recipientCountry: varchar('recipient_country', { length: 2 }).default('DE'),
+      /** Betreff line under the invoice headline, e.g. "Teppichbodenreinigung – Premiumreinigung". */
+      subject: varchar('subject', { length: 200 }),
       // §14 UStG: Leistungsdatum / Leistungszeitraum.
       serviceDate: date('service_date'),
       serviceDateEnd: date('service_date_end'),
@@ -499,6 +501,8 @@ function buildTenantTables(schemaName: string) {
         .$type<
           Array<{
             label: string;
+            /** Second line under the label on the invoice, e.g. "Premiumreinigung". */
+            note?: string | null;
             quantity: number;
             unitPriceCents: number;
             /** Render as a package/section header line (bold) on the invoice. */
@@ -1091,6 +1095,7 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
   "recipient_postal_code" varchar(16),
   "recipient_city" text,
   "recipient_country" varchar(2) DEFAULT 'DE',
+  "subject" varchar(200),
   "service_date" date,
   "service_date_end" date,
   "status" varchar(16) DEFAULT 'draft' NOT NULL,
@@ -1137,6 +1142,8 @@ ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "service_date" date;
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "service_date_end" date;
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "tax_rate_percent" integer DEFAULT 19 NOT NULL;
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "payment_method" varchar(16) DEFAULT 'transfer' NOT NULL;
+-- Betreff line for the DIN 5008 invoice template.
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "subject" varchar(200);
 
 CREATE TABLE IF NOT EXISTS ${q}."invoice_status_log" (
   "id" serial PRIMARY KEY NOT NULL,

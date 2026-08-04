@@ -753,8 +753,12 @@ export function invoiceEmail(opts: {
   invoiceDateFormatted: string;
   dueDateFormatted: string | null;
   paymentTermsDays: number;
+  /** Betreff line, mirrors the PDF headline subject. */
+  subject?: string | null;
   lineItems: Array<{
     label: string;
+    /** Second line under the label, mirrors the PDF. */
+    note?: string | null;
     quantityLabel: string;
     unitPriceFormatted: string;
     lineTotalFormatted: string;
@@ -782,7 +786,11 @@ export function invoiceEmail(opts: {
   const itemRowsHtml = opts.lineItems
     .map(
       (l) => `<tr>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;">${escapeHtml(l.label)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;">${escapeHtml(l.label)}${
+          l.note
+            ? `<br /><span style="font-size:12px;color:#6b5b48;">${escapeHtml(l.note)}</span>`
+            : ''
+        }</td>
         <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:center;white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>
         <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:right;white-space:nowrap;">${escapeHtml(l.unitPriceFormatted)}</td>
         <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.lineTotalFormatted)}</td>
@@ -853,6 +861,11 @@ export function invoiceEmail(opts: {
         <p style="margin:0 0 16px;">
           anbei erhalten Sie Ihre Rechnung von <strong>${escapeHtml(opts.brand.name)}</strong>.
         </p>
+        ${
+          opts.subject
+            ? `<p style="margin:0 0 16px;font-size:14px;"><strong>Betreff:</strong> ${escapeHtml(opts.subject)}</p>`
+            : ''
+        }
 
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 16px;">
           <tr>

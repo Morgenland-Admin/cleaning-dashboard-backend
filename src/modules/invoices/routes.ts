@@ -13,6 +13,8 @@ import { nextInvoiceNumber } from './number.js';
 
 const lineItemSchema = z.object({
   label: z.string().min(1).max(200),
+  /** Second line under the label on the invoice ({{POSn_ZUSATZ}}). */
+  note: z.string().max(200).nullable().optional(),
   quantity: z.number().min(0).max(100000),
   // Allow negative unit prices for discount / credit lines.
   unitPriceCents: z.number().int().min(-100_000_000).max(100_000_000),
@@ -36,6 +38,8 @@ const createSchema = z.object({
   recipientName: z.string().min(1).max(200),
   recipientEmail: z.string().email().optional(),
   ...recipientAddressFields,
+  /** Betreff line under the invoice headline ({{BETREFF}}). */
+  subject: z.string().max(200).nullable().optional(),
   serviceDate: dateStr.nullable().optional(),
   serviceDateEnd: dateStr.nullable().optional(),
   lineItems: z.array(lineItemSchema).min(1).max(100),
@@ -52,6 +56,7 @@ const draftUpdateSchema = z.object({
   recipientName: z.string().min(1).max(200).optional(),
   recipientEmail: z.string().email().nullable().optional(),
   ...recipientAddressFields,
+  subject: z.string().max(200).nullable().optional(),
   serviceDate: dateStr.nullable().optional(),
   serviceDateEnd: dateStr.nullable().optional(),
   lineItems: z.array(lineItemSchema).min(1).max(100).optional(),
@@ -256,6 +261,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           recipientPostalCode: body.recipientPostalCode,
           recipientCity: body.recipientCity,
           recipientCountry: body.recipientCountry ?? 'DE',
+          subject: body.subject ?? null,
           serviceDate: body.serviceDate ?? null,
           serviceDateEnd: body.serviceDateEnd ?? null,
           lineItems: body.lineItems,

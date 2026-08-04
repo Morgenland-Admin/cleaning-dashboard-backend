@@ -2,9 +2,47 @@
  * Renders a German "Rechnung" PDF for an invoice using pdfkit (pure JS, no
  * headless browser). Returns a Buffer ready to attach to a Resend email.
  *
+ * Layout implements the CLEANILO invoice template (Kabir, 08/2026) to DIN 5008
+ * Form B: address field 25 mm from the left / 45 mm from the top, fold marks at
+ * 105 mm and 210 mm, punch mark at 148.5 mm, legal footer at 264 mm. Every
+ * position below is expressed in millimetres via `mm()` so the printed sheet can
+ * be measured against the spec with a ruler.
+ *
+ * The template is brand-neutral: logo, accent colour, sender, legal footer and
+ * bank block all come from the company row, so CLEANILO, Hamburg
+ * Teppichreinigung and TRL share one renderer.
+ *
  * Mirrors the data shown in `invoiceEmail` so the PDF and the HTML body match.
  * Strings are pre-formatted (German EUR / dates) by the caller.
+ *
+ * Placeholders of the automation template ("CL-1428 Rechnung - Vorlage.html")
+ * map 1:1 onto this data, which `buildInvoicePdfData` fills from the invoice +
+ * company row — automations set the invoice fields, never the strings:
+ *
+ *   {{RECHNUNGSNUMMER}}   invoiceNumber      ← invoices.number (assigned at issue)
+ *   {{RECHNUNGSDATUM}}    invoiceDate        ← invoices.sent_at
+ *   {{LEISTUNGSDATUM}}    serviceDateLabel   ← invoices.service_date [+ _end]
+ *   {{FAELLIG_BIS}}       dueDate            ← invoices.due_at
+ *   {{ZAHLUNGSZIEL_TAGE}} paymentTermsDays   ← invoices.payment_terms_days
+ *   {{KUNDE_NAME}}        recipientName      ← invoices.recipient_name
+ *   {{KUNDE_STRASSE}}     recipientAddressLines[0] ← recipient_address_line1 [+2]
+ *   {{KUNDE_PLZ_ORT}}     recipientAddressLines[1] ← recipient_postal_code + _city
+ *   {{BETREFF}}           subject            ← invoices.subject
+ *   {{POSn_TITEL}}        lineItems[n].label     ← invoices.line_items[n].label
+ *   {{POSn_ZUSATZ}}       lineItems[n].note      ← invoices.line_items[n].note
+ *   {{POSn_MENGE}}        lineItems[n].quantity  ← …quantity
+ *   {{POSn_EP}}           lineItems[n].unitPrice ← …unitPriceCents
+ *   {{POSn_BETRAG}}       lineItems[n].lineTotal ← quantity × unitPriceCents
+ *   {{NETTO}}             subtotal           ← invoices.subtotal_cents
+ *   {{UST_SATZ}}          taxRateLabel       ← invoices.tax_rate_percent
+ *   {{UST_BETRAG}}        tax                ← invoices.tax_cents
+ *   {{GESAMT}}            total              ← invoices.total_cents
+ *
+ * The sender, legal footer and Bankverbindung are not placeholders — they are
+ * read from the company row so every brand stays correct without editing here.
  */
+import { readFileSync } from 'node:fs';
+
 import PDFDocument from 'pdfkit';
 
 export interface InvoicePdfData {
@@ -13,14 +51,17 @@ export interface InvoicePdfData {
   invoiceDate: string;
   dueDate: string | null;
   paymentTermsDays: number;
+  /** Betreff line under the "Rechnung Nr. …" headline ({{BETREFF}}). */
+  subject?: string | null;
   recipientName: string;
-  recipientEmail?: string | null;
   /** §14 UStG: recipient postal address lines (street, "PLZ Ort", country). */
   recipientAddressLines?: string[];
   /** §14 UStG: pre-formatted Leistungsdatum or "von – bis" Leistungszeitraum. */
   serviceDateLabel?: string | null;
   lineItems: Array<{
     label: string;
+    /** Optional second line under the label ({{POSn_ZUSATZ}}), e.g. "Premiumreinigung". */
+    note?: string | null;
     quantity: string;
     unitPrice: string;
     lineTotal: string;
@@ -37,6 +78,8 @@ export interface InvoicePdfData {
   accentColor: string;
   /** Optional raster brand logo (PNG/JPEG) drawn top-left; falls back to text. */
   logo?: Buffer | null;
+  /** Claim under the wordmark — only used by the text fallback (raster logos carry their own). */
+  claim?: string | null;
   seller: {
     name: string;
     addressLines: string[];
@@ -47,7 +90,6 @@ export interface InvoicePdfData {
     mobile?: string | null;
     website?: string | null;
     // German Pflichtangaben for the legal footer.
-    taxNumber?: string | null; // Steuernummer
     businessId?: string | null; // Betriebsnummer
     legalForm?: string | null; // Rechtsform
     managingDirectors?: string | null; // Geschäftsführer
@@ -92,299 +134,725 @@ function formatIbanPdf(iban: string): string {
     .trim();
 }
 
-const PAGE_LEFT = 50;
-const PAGE_RIGHT = 545; // A4 width 595 - 50 margin
-const MUTED = '#6b5b48';
-const INK = '#2d2419';
-const RULE = '#d8c7a8';
+// ── Design tokens (CLEANILO invoice template) ─────────────────────────────
+const INK = '#0A182D';
+const MUTED = '#5A6875';
+const RULE = '#DCE1E6';
+const MARK = '#B8C0C8'; // fold / punch marks
+const PAY_BAR = '#FFBF00'; // accent bar next to the payment terms
+const ACCENT_FALLBACK = '#bd5b3e';
 
-// Item table columns (left x / width).
-const COL_DESC = { x: 50, w: 250 };
-const COL_QTY = { x: 300, w: 45 };
-const COL_UNIT = { x: 350, w: 95 };
-const COL_AMT = { x: 450, w: 95 };
+// ── Geometry, all millimetres (DIN 5008 Form B) ───────────────────────────
+const MM = 72 / 25.4;
+const mm = (v: number) => v * MM;
+const L = 25; // left type area
+const R = 190; // right type area (210 − 20)
+const CONTENT_W = R - L; // 165
+const HEADER_TOP = 13.5;
+const ADDR_TOP = 45;
+const ADDR_W = 85;
+const INFO_X = 125;
+const INFO_W = R - INFO_X; // 65
+const BODY_TOP = 100;
+const FOOTER_TOP = 264;
+const FOLD_1 = 105;
+const FOLD_2 = 210;
+const PUNCH = 148.5;
+/** Last y a body element may occupy before it has to move to the next page. */
+const BODY_BOTTOM = FOOTER_TOP - 6;
+
+// Item table columns (x / width in mm) — 16 + 26 + 28 numeric, rest description.
+const COL_DESC = { x: L, w: 92 }; // 95 mm cell, 3 mm gutter before "Menge"
+const COL_QTY = { x: 120, w: 16 };
+const COL_UNIT = { x: 136, w: 26 };
+const COL_AMT = { x: 162, w: 28 };
+
+// ── Embedded fonts (OFL, vendored in src/assets/fonts) ────────────────────
+const FONT_DIR = new URL('../assets/fonts/', import.meta.url);
+const FONT_FILES = {
+  body: 'Cabin-Regular.ttf',
+  bodyMed: 'Cabin-Medium.ttf',
+  bodySemi: 'Cabin-SemiBold.ttf',
+  bodyBold: 'Cabin-Bold.ttf',
+  headMed: 'Urbanist-Medium.ttf',
+  headSemi: 'Urbanist-SemiBold.ttf',
+  headBold: 'Urbanist-Bold.ttf',
+} as const;
+type FontKey = keyof typeof FONT_FILES;
+/** Used when a TTF is missing (e.g. assets not copied) — layout stays intact. */
+const FONT_FALLBACK: Record<FontKey, string> = {
+  body: 'Helvetica',
+  bodyMed: 'Helvetica',
+  bodySemi: 'Helvetica-Bold',
+  bodyBold: 'Helvetica-Bold',
+  headMed: 'Helvetica',
+  headSemi: 'Helvetica-Bold',
+  headBold: 'Helvetica-Bold',
+};
+
+let fontCache: Partial<Record<FontKey, Buffer>> | undefined;
+function loadFonts(): Partial<Record<FontKey, Buffer>> {
+  if (fontCache) return fontCache;
+  const loaded: Partial<Record<FontKey, Buffer>> = {};
+  for (const [key, file] of Object.entries(FONT_FILES) as Array<[FontKey, string]>) {
+    try {
+      loaded[key] = readFileSync(new URL(file, FONT_DIR));
+    } catch {
+      // Missing font → the Helvetica fallback keeps invoices renderable.
+    }
+  }
+  fontCache = loaded;
+  return loaded;
+}
+
+interface TextOpts {
+  x: number;
+  y: number;
+  /** Wrap width in mm; omit for a single unbreakable line. */
+  w?: number;
+  font?: FontKey;
+  size: number;
+  color?: string;
+  align?: 'left' | 'center' | 'right';
+  /** CSS line-height multiplier (the template's body default is 1.45). */
+  lh?: number;
+  /** Letter spacing in em, as in the CSS (`.1em`). */
+  tracking?: number;
+  upper?: boolean;
+  /** Tabular figures for money / quantity columns. */
+  tnum?: boolean;
+}
+
+interface Run {
+  text: string;
+  font?: FontKey;
+  color?: string;
+}
 
 export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    const doc = new PDFDocument({ size: 'A4', margin: 0, bufferPages: true });
     const chunks: Buffer[] = [];
     doc.on('data', (c: Buffer) => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    const accent = /^#[0-9a-fA-F]{6}$/.test(data.accentColor) ? data.accentColor : '#bd5b3e';
+    const fonts = loadFonts();
+    const registered = new Set<FontKey>();
+    for (const [key, buf] of Object.entries(fonts) as Array<[FontKey, Buffer]>) {
+      try {
+        doc.registerFont(key, buf);
+        registered.add(key);
+      } catch {
+        // Corrupt font file → fall back for that weight only.
+      }
+    }
+    const fontOf = (key: FontKey) => (registered.has(key) ? key : FONT_FALLBACK[key]);
+
+    const accent = /^#[0-9a-fA-F]{6}$/.test(data.accentColor) ? data.accentColor : ACCENT_FALLBACK;
     const paid = data.paymentMethod === 'card' || data.paymentMethod === 'cash';
 
-    // ── Header ──────────────────────────────────────────────────────────
-    // Right column: full sender / contact block (brand, entity, address,
-    // phone, mobile, web, email, Betriebsnummer).
-    const SENDER_X = 350;
-    const SENDER_W = PAGE_RIGHT - SENDER_X;
-    let sy = 48;
-    doc
-      .fillColor(accent)
-      .font('Helvetica-Bold')
-      .fontSize(12)
-      .text(data.brandName.toUpperCase(), SENDER_X, sy, { width: SENDER_W });
-    sy = doc.y + 1;
-    const senderLines: string[] = [];
-    if (data.seller.name && data.seller.name !== data.brandName) senderLines.push(data.seller.name);
-    const [addr0, ...addrRest] = data.seller.addressLines;
-    if (addr0) senderLines.push(`Zentrale: ${addr0}`);
-    for (const a of addrRest) senderLines.push(a);
-    if (data.seller.phone) senderLines.push(`Tel.: ${data.seller.phone}`);
-    if (data.seller.mobile) senderLines.push(`Mobil: ${data.seller.mobile}`);
-    if (data.seller.website) senderLines.push(`Internet: ${data.seller.website}`);
-    if (data.seller.email) senderLines.push(`E-Mail: ${data.seller.email}`);
-    if (data.seller.businessId) senderLines.push(`Betriebsnummer: ${data.seller.businessId}`);
-    doc.font('Helvetica').fontSize(9).fillColor(INK);
-    for (const line of senderLines) {
-      doc.text(line, SENDER_X, sy, { width: SENDER_W });
-      sy = doc.y + 1;
-    }
-    const senderBottom = sy;
+    // ── Primitives ────────────────────────────────────────────────────────
+    /** Horizontal hairline. `weight` is in pt, matching the CSS border widths. */
+    const rule = (x1: number, y: number, x2: number, weight: number, color: string) =>
+      doc.moveTo(mm(x1), mm(y)).lineTo(mm(x2), mm(y)).lineWidth(weight).strokeColor(color).stroke();
 
-    // Left: brand logo (raster) if we have one, else the brand wordmark.
+    const pdfOpts = (o: TextOpts) => {
+      const lh = o.lh ?? 1.45;
+      doc.font(fontOf(o.font ?? 'body')).fontSize(o.size);
+      const boxH = o.size * lh;
+      const gap = boxH - doc.currentLineHeight(false);
+      return {
+        gap,
+        boxH,
+        opts: {
+          width: o.w != null ? mm(o.w) : undefined,
+          align: o.align ?? 'left',
+          characterSpacing: o.tracking ? o.tracking * o.size : 0,
+          lineBreak: o.w != null,
+          lineGap: gap,
+          ...(o.tnum ? { features: ['tnum' as const] } : {}),
+        },
+      };
+    };
+
+    /**
+     * Draws text as a CSS line box: `y` is the top of the box, glyphs are
+     * centred inside it via half-leading. Returns the block height in mm so
+     * callers can stack elements exactly like the HTML template does.
+     */
+    const text = (str: string, o: TextOpts): number => {
+      const { gap, opts } = pdfOpts(o);
+      const s = o.upper ? str.toUpperCase() : str;
+      doc.fillColor(o.color ?? INK);
+      const h = doc.heightOfString(s, opts);
+      doc.text(s, mm(o.x), mm(o.y) + gap / 2, opts);
+      return h / MM;
+    };
+
+    /** Measures `text()` without drawing (for row-height maths). */
+    const measure = (str: string, o: TextOpts): number => {
+      const { opts } = pdfOpts(o);
+      return doc.heightOfString(o.upper ? str.toUpperCase() : str, opts) / MM;
+    };
+
+    /**
+     * A line built from differently-styled runs (e.g. "IBAN: <bold>"). Returns
+     * the height actually drawn — runs may wrap to several lines, and reporting
+     * one line would let the next element overlap them.
+     */
+    const textRuns = (runs: Run[], o: TextOpts): number => {
+      const parts = runs.filter((r) => r.text);
+      if (!parts.length) return 0;
+      const { gap, opts } = pdfOpts(o);
+      const y = mm(o.y) + gap / 2;
+      parts.forEach((run, i) => {
+        const runOpts = { ...opts, continued: i < parts.length - 1 };
+        doc.font(fontOf(run.font ?? o.font ?? 'body')).fontSize(o.size);
+        doc.fillColor(run.color ?? o.color ?? INK);
+        if (i === 0) doc.text(run.text, mm(o.x), y, runOpts);
+        else doc.text(run.text, runOpts);
+      });
+      // pdfkit advances doc.y past the whole (possibly wrapped) chain.
+      return (doc.y - y) / MM;
+    };
+
+    /** Bottom edge of a text block, given its top and height. */
+    const stack = (y: number, h: number) => y + h;
+
+    // ── Legal footer (drawn on every page) ────────────────────────────────
+    const footerCols = () => {
+      // CSS grid 1fr 1fr 1.15fr with 6 mm gaps across the 165 mm type area.
+      const unit = (CONTENT_W - 12) / 3.15;
+      return [
+        { x: L, w: unit },
+        { x: L + unit + 6, w: unit },
+        { x: L + 2 * unit + 12, w: unit * 1.15 },
+      ];
+    };
+
+    const drawFooter = () => {
+      const cols = footerCols();
+      rule(L, FOOTER_TOP, R, 0.25, RULE);
+      const top = FOOTER_TOP + 3;
+
+      const groups: Array<{ title: string; lines: Run[][] }> = [
+        {
+          title: 'Unternehmen',
+          lines: [
+            data.seller.legalForm
+              ? [
+                  { text: 'Rechtsform: ', color: MUTED },
+                  { text: data.seller.legalForm, font: 'bodyMed', color: INK },
+                ]
+              : [],
+            data.seller.managingDirectors
+              ? [
+                  { text: 'Geschäftsführer: ', color: MUTED },
+                  { text: data.seller.managingDirectors, font: 'bodyMed', color: INK },
+                ]
+              : [],
+            data.seller.chamber ? [{ text: data.seller.chamber, color: MUTED }] : [],
+          ],
+        },
+        {
+          // Steuernummer is deliberately absent — only the USt-IdNr. is shown.
+          title: 'Steuer',
+          lines: [
+            data.seller.vatId
+              ? [
+                  { text: 'USt-IdNr.: ', color: MUTED },
+                  { text: data.seller.vatId, font: 'bodyMed', color: INK },
+                ]
+              : [],
+            data.seller.businessId
+              ? [
+                  { text: 'Betriebsnummer: ', color: MUTED },
+                  { text: data.seller.businessId, font: 'bodyMed', color: INK },
+                ]
+              : [],
+            data.seller.registrationNumber
+              ? [
+                  { text: 'Reg-Nr.: ', color: MUTED },
+                  { text: data.seller.registrationNumber, font: 'bodyMed', color: INK },
+                ]
+              : [],
+          ],
+        },
+        {
+          title: 'Bankverbindung',
+          lines: data.bank?.iban
+            ? [
+                data.bank.bankName
+                  ? [
+                      { text: 'Bank: ', color: MUTED },
+                      { text: data.bank.bankName, color: MUTED },
+                    ]
+                  : [],
+                [
+                  { text: 'IBAN: ', color: MUTED },
+                  { text: formatIbanPdf(data.bank.iban), font: 'bodyMed', color: INK },
+                ],
+                data.bank.bic
+                  ? [
+                      { text: 'BIC: ', color: MUTED },
+                      { text: data.bank.bic, font: 'bodyMed', color: INK },
+                    ]
+                  : [],
+              ]
+            : [],
+        },
+      ];
+
+      groups.forEach((group, i) => {
+        const col = cols[i]!;
+        const lines = group.lines.filter((l) => l.length);
+        if (!lines.length) return;
+        let y = top;
+        y = stack(
+          y,
+          text(group.title, {
+            x: col.x,
+            y,
+            w: col.w,
+            font: 'headSemi',
+            size: 6.8,
+            color: accent,
+            tracking: 0.1,
+            upper: true,
+          }),
+        );
+        y += 1.1; // CSS margin-bottom on the column head
+        for (const line of lines) {
+          y = stack(y, textRuns(line, { x: col.x, y, w: col.w, size: 7.2, lh: 1.5 }));
+        }
+      });
+    };
+
+    // ── Page 1: fold + punch marks, header, address, info block ───────────
+    rule(0, FOLD_1, 5, 0.25, MARK);
+    rule(0, FOLD_2, 5, 0.25, MARK);
+    rule(0, PUNCH, 8, 0.4, MARK);
+
+    // Logo: the official raster wordmark (it already carries the claim). Falls
+    // back to a drawn tile + wordmark only when no usable image is available.
     let logoDrawn = false;
     if (data.logo) {
       try {
-        doc.image(data.logo, PAGE_LEFT, 46, { height: 40 });
+        doc.image(data.logo, mm(L), mm(HEADER_TOP), { fit: [mm(70), mm(12.4)] });
         logoDrawn = true;
       } catch {
         logoDrawn = false;
       }
     }
     if (!logoDrawn) {
-      doc
-        .fillColor(accent)
-        .font('Helvetica-Bold')
-        .fontSize(22)
-        .text(data.brandName, PAGE_LEFT, 50, { width: 280 });
-    }
-
-    // From-line + recipient (left column).
-    let ly = 112;
-    doc
-      .fillColor(MUTED)
-      .font('Helvetica')
-      .fontSize(7.5)
-      .text(`${data.brandName} · ${data.seller.addressLines.join(' · ')}`, PAGE_LEFT, ly, {
-        width: 300,
+      const tile = 8.2;
+      doc.roundedRect(mm(L), mm(HEADER_TOP), mm(tile), mm(tile), mm(2.4)).fillColor(accent).fill();
+      const initialH = 12.5 / MM;
+      text(data.brandName.slice(0, 1).toUpperCase(), {
+        x: L,
+        y: HEADER_TOP + (tile - initialH) / 2,
+        w: tile,
+        font: 'headBold',
+        size: 12.5,
+        color: '#ffffff',
+        align: 'center',
+        lh: 1,
       });
-    ly = doc.y + 10;
-    doc.fillColor(MUTED).font('Helvetica').fontSize(9).text('RECHNUNG AN', PAGE_LEFT, ly);
-    doc
-      .fillColor(INK)
-      .font('Helvetica-Bold')
-      .fontSize(11)
-      .text(data.recipientName, PAGE_LEFT, ly + 14);
-    let recipientY = ly + 30;
+      const markH = (19 * 1.45) / MM;
+      text(data.brandName, {
+        x: L + tile + 2.4,
+        y: HEADER_TOP + (tile - markH) / 2,
+        font: 'headBold',
+        size: 19,
+        tracking: -0.02,
+      });
+      if (data.claim)
+        text(data.claim, {
+          x: L + 10.6,
+          y: HEADER_TOP + tile + 1.6,
+          w: CONTENT_W - 10.6,
+          font: 'headMed',
+          size: 7.4,
+          color: accent,
+          tracking: 0.11,
+          upper: true,
+        });
+    }
+
+    // Sender block, right-aligned against the 190 mm type edge.
+    const senderLines: Run[][] = [[{ text: data.brandName.toUpperCase(), font: 'bodySemi' }]];
+    if (data.seller.name && data.seller.name !== data.brandName)
+      senderLines.push([{ text: data.seller.name, color: MUTED }]);
+    const [addr0, ...addrRest] = data.seller.addressLines;
+    if (addr0) senderLines.push([{ text: `Zentrale: ${addr0}`, color: MUTED }]);
+    for (const a of addrRest) senderLines.push([{ text: a, color: MUTED }]);
+    if (data.seller.phone) senderLines.push([{ text: `Tel.: ${data.seller.phone}`, color: MUTED }]);
+    if (data.seller.mobile)
+      senderLines.push([{ text: `Mobil: ${data.seller.mobile}`, color: MUTED }]);
+    const contact = [data.seller.website, data.seller.email].filter(Boolean).join(' · ');
+    if (contact) senderLines.push([{ text: contact, color: MUTED }]);
+    if (data.seller.businessId)
+      senderLines.push([{ text: `Betriebsnummer: ${data.seller.businessId}`, color: MUTED }]);
+    let sy = HEADER_TOP;
+    for (const line of senderLines) {
+      sy = stack(
+        sy,
+        // A long "web · mail" line wraps inside the 65 mm block and pushes the
+        // following lines down (the template's nowrap has no pdfkit equivalent).
+        textRuns(line, { x: INFO_X, y: sy, w: INFO_W, size: 7.9, align: 'right', color: MUTED }),
+      );
+    }
+
+    // Address field — 25 mm / 45 mm, DIN lang window. No email address here.
+    let ay = ADDR_TOP;
+    ay = stack(
+      ay,
+      text(`${data.brandName} · ${data.seller.addressLines.join(' · ')}`, {
+        x: L,
+        y: ay,
+        w: 80,
+        size: 6.6,
+        color: MUTED,
+        tracking: 0.01,
+      }),
+    );
+    ay += 0.6; // CSS padding-bottom on the return line
+    rule(L, ay, L + 80, 0.25, RULE);
+    ay += 4.4; // CSS margin-top on the address block
+    ay = stack(
+      ay,
+      text(data.recipientName, { x: L, y: ay, w: ADDR_W, font: 'bodySemi', size: 10.4, lh: 1.5 }),
+    );
     for (const line of data.recipientAddressLines ?? []) {
-      doc.fillColor(INK).font('Helvetica').fontSize(9).text(line, PAGE_LEFT, recipientY);
-      recipientY += 13;
-    }
-    if (data.recipientEmail) {
-      doc
-        .fillColor(MUTED)
-        .font('Helvetica')
-        .fontSize(9)
-        .text(data.recipientEmail, PAGE_LEFT, recipientY);
-      recipientY += 13;
+      ay = stack(ay, text(line, { x: L, y: ay, w: ADDR_W, size: 10.4, lh: 1.5 }));
     }
 
-    // Meta block (right), below the sender block.
-    const metaX = 350;
-    const metaLabelW = 105;
-    const metaValW = PAGE_RIGHT - (metaX + metaLabelW);
-    const meta: Array<[string, string]> = [
-      ['Rechnungsnummer', data.invoiceNumber],
-      ['Rechnungsdatum', data.invoiceDate],
+    // Information block (right of the address field).
+    let iy = ADDR_TOP;
+    iy = stack(
+      iy,
+      text('Rechnung', {
+        x: INFO_X,
+        y: iy,
+        w: INFO_W,
+        font: 'headSemi',
+        size: 7.2,
+        color: accent,
+        tracking: 0.12,
+        upper: true,
+      }),
+    );
+    iy += 1.4;
+    rule(INFO_X, iy, R, 1, accent);
+    const infoRows: Array<[string, string, boolean]> = [
+      ['Rechnungsnummer', data.invoiceNumber, false],
+      ['Rechnungsdatum', data.invoiceDate, false],
     ];
-    if (data.serviceDateLabel) meta.push(['Leistungsdatum', data.serviceDateLabel]);
-    if (data.dueDate && !paid) meta.push(['Fällig bis', data.dueDate]);
-    let my = Math.max(senderBottom + 12, 150);
-    for (const [label, value] of meta) {
-      doc
-        .fillColor(MUTED)
-        .font('Helvetica')
-        .fontSize(9)
-        .text(label, metaX, my, { width: metaLabelW });
-      doc
-        .fillColor(INK)
-        .font('Helvetica-Bold')
-        .fontSize(9)
-        .text(value, metaX + metaLabelW, my, { width: metaValW, align: 'right' });
-      my += 15;
+    if (data.serviceDateLabel)
+      infoRows.push([
+        data.serviceDateLabel.includes('–') ? 'Leistungszeitraum' : 'Leistungsdatum',
+        data.serviceDateLabel,
+        false,
+      ]);
+    if (data.dueDate && !paid) infoRows.push(['Fällig bis', data.dueDate, true]);
+    for (const [label, value, due] of infoRows) {
+      iy += 1.5; // CSS padding-top
+      const h = Math.max(
+        measure(label, { x: INFO_X, y: iy, size: 8.8 }),
+        measure(value, { x: INFO_X, y: iy, size: 8.8 }),
+      );
+      text(label, { x: INFO_X, y: iy, size: 8.8, color: MUTED });
+      text(value, {
+        x: INFO_X,
+        y: iy,
+        w: INFO_W,
+        font: 'bodySemi',
+        size: 8.8,
+        align: 'right',
+        color: due ? accent : INK,
+        tnum: true,
+      });
+      iy = stack(iy, h) + 1.5; // CSS padding-bottom
+      rule(INFO_X, iy, R, 0.25, RULE);
     }
 
-    // "Rechnung" title above the items table.
-    let y = Math.max(recipientY + 8, my + 8);
-    doc.fillColor(INK).font('Helvetica-Bold').fontSize(16).text('Rechnung', PAGE_LEFT, y);
-    y = doc.y + 8;
+    // ── Body ──────────────────────────────────────────────────────────────
+    let pageNo = 1;
+    let y = BODY_TOP;
 
-    doc.rect(PAGE_LEFT, y, PAGE_RIGHT - PAGE_LEFT, 22).fill('#f4ebdc');
-    doc.fillColor(MUTED).font('Helvetica-Bold').fontSize(9);
-    const headY = y + 7;
-    doc.text('Bezeichnung', COL_DESC.x + 6, headY, { width: COL_DESC.w });
-    doc.text('Menge', COL_QTY.x, headY, { width: COL_QTY.w, align: 'center' });
-    doc.text('Einzelpreis', COL_UNIT.x, headY, { width: COL_UNIT.w, align: 'right' });
-    doc.text('Betrag', COL_AMT.x, headY, { width: COL_AMT.w - 6, align: 'right' });
-    y += 22;
-
-    doc.font('Helvetica').fontSize(10).fillColor(INK);
-    for (const item of data.lineItems) {
-      const labelFont = item.isPackage ? 'Helvetica-Bold' : 'Helvetica';
-      doc.font(labelFont).fontSize(10);
-      const descH = doc.heightOfString(item.label, { width: COL_DESC.w - 6 });
-      const rowH = Math.max(descH, 14) + 10;
-      if (y + rowH > 760) {
-        doc.addPage();
-        y = 50;
-      }
-      const ty = y + 5;
-      doc
-        .font(labelFont)
-        .fillColor(INK)
-        .text(item.label, COL_DESC.x + 6, ty, { width: COL_DESC.w - 6 });
-      doc
-        .font('Helvetica')
-        .fillColor(MUTED)
-        .text(item.quantity, COL_QTY.x, ty, { width: COL_QTY.w, align: 'center' });
-      doc
-        .fillColor(MUTED)
-        .text(item.unitPrice, COL_UNIT.x, ty, { width: COL_UNIT.w, align: 'right' });
-      doc
-        .font(item.isPackage ? 'Helvetica-Bold' : 'Helvetica')
-        .fillColor(INK)
-        .text(item.lineTotal, COL_AMT.x, ty, { width: COL_AMT.w - 6, align: 'right' });
-      y += rowH;
-      doc.moveTo(PAGE_LEFT, y).lineTo(PAGE_RIGHT, y).strokeColor(RULE).lineWidth(0.5).stroke();
-    }
-    doc.font('Helvetica').fontSize(10);
-
-    y += 8;
-    const totalsLabelX = 330;
-    const totalsLabelW = 120;
-    const totalsValX = totalsLabelX + totalsLabelW;
-    const totalsValW = PAGE_RIGHT - totalsValX;
-    const drawTotal = (label: string, value: string, bold = false) => {
-      doc
-        .font(bold ? 'Helvetica-Bold' : 'Helvetica')
-        .fontSize(bold ? 12 : 10)
-        .fillColor(bold ? INK : MUTED)
-        .text(label, totalsLabelX, y, { width: totalsLabelW });
-      doc
-        .font('Helvetica-Bold')
-        .fontSize(bold ? 12 : 10)
-        .fillColor(INK)
-        .text(value, totalsValX, y, { width: totalsValW, align: 'right' });
-      y += bold ? 22 : 16;
+    /**
+     * Starts a continuation page: compact header, plus the table head when more
+     * item rows follow (a totals-only page must not carry an empty head).
+     */
+    const nextPage = (repeatTableHead: boolean) => {
+      drawFooter();
+      doc.addPage();
+      pageNo += 1;
+      text(`Rechnung Nr. ${data.invoiceNumber} · ${data.brandName}`, {
+        x: L,
+        y: 20,
+        w: CONTENT_W,
+        size: 8,
+        color: MUTED,
+      });
+      y = 30;
+      if (repeatTableHead) y = drawTableHead(y);
     };
-    if (data.tax && data.taxRateLabel) {
-      drawTotal('Zwischensumme (netto)', data.subtotal);
-      drawTotal(`zzgl. USt. (${data.taxRateLabel})`, data.tax);
+    /** Moves to a new page when `need` mm would run into the footer. */
+    const ensure = (need: number, repeatTableHead = true) => {
+      if (y + need > BODY_BOTTOM) nextPage(repeatTableHead);
+    };
+
+    function drawTableHead(top: number): number {
+      const h = text('Bezeichnung', {
+        x: COL_DESC.x,
+        y: top,
+        w: COL_DESC.w,
+        font: 'headSemi',
+        size: 7.4,
+        color: MUTED,
+        tracking: 0.1,
+        upper: true,
+      });
+      for (const [label, col] of [
+        ['Menge', COL_QTY],
+        ['Einzelpreis', COL_UNIT],
+        ['Betrag', COL_AMT],
+      ] as Array<[string, { x: number; w: number }]>) {
+        text(label, {
+          x: col.x,
+          y: top,
+          w: col.w,
+          font: 'headSemi',
+          size: 7.4,
+          color: MUTED,
+          tracking: 0.1,
+          upper: true,
+          align: 'right',
+        });
+      }
+      const bottom = top + h + 1.8; // CSS padding-bottom on th
+      rule(L, bottom, R, 0.75, INK);
+      return bottom;
     }
-    doc.moveTo(totalsLabelX, y).lineTo(PAGE_RIGHT, y).strokeColor(accent).lineWidth(1).stroke();
-    y += 6;
-    drawTotal('Gesamtbetrag', data.total, true);
+
+    y = stack(
+      y,
+      text(`Rechnung Nr. ${data.invoiceNumber}`, {
+        x: L,
+        y,
+        w: CONTENT_W,
+        font: 'headBold',
+        size: 16.5,
+        tracking: -0.015,
+      }),
+    );
+    if (data.subject) {
+      y += 1.4;
+      y = stack(y, text(data.subject, { x: L, y, w: CONTENT_W, size: 9.6, color: MUTED }));
+    }
+    y += 9; // CSS margin-top on the table
+    y = drawTableHead(y);
+
+    for (const item of data.lineItems) {
+      // Template weight for a position title is 600; package headers go to 700.
+      const titleFont: FontKey = item.isPackage ? 'bodyBold' : 'bodySemi';
+      const titleH = measure(item.label, {
+        x: COL_DESC.x,
+        y,
+        w: COL_DESC.w,
+        font: titleFont,
+        size: 9.6,
+      });
+      const noteH = item.note
+        ? measure(item.note, { x: COL_DESC.x, y, w: COL_DESC.w, size: 8.8 })
+        : 0;
+      const rowH = 3.2 + Math.max(titleH + noteH, 4) + 3.2;
+      ensure(rowH);
+      const ty = y + 3.2; // CSS padding-top on td
+      let dy = ty;
+      dy = stack(
+        dy,
+        text(item.label, {
+          x: COL_DESC.x,
+          y: dy,
+          w: COL_DESC.w,
+          font: titleFont,
+          size: 9.6,
+        }),
+      );
+      if (item.note)
+        text(item.note, { x: COL_DESC.x, y: dy, w: COL_DESC.w, size: 8.8, color: MUTED });
+      for (const [value, col, bold] of [
+        [item.quantity, COL_QTY, false],
+        [item.unitPrice, COL_UNIT, false],
+        [item.lineTotal, COL_AMT, item.isPackage ?? false],
+      ] as Array<[string, { x: number; w: number }, boolean]>) {
+        text(value, {
+          x: col.x,
+          y: ty,
+          w: col.w,
+          font: bold ? 'bodyBold' : 'body',
+          size: 9.6,
+          align: 'right',
+          tnum: true,
+        });
+      }
+      y += rowH;
+      rule(L, y, R, 0.25, RULE);
+    }
+
+    // Totals — 78 mm block flush right.
+    const SUM_X = R - 78;
+    const SUM_W = 78;
+    const sumRows: Array<[string, string]> = [];
+    if (data.tax && data.taxRateLabel) {
+      sumRows.push(['Zwischensumme (netto)', data.subtotal]);
+      sumRows.push([`zzgl. USt. (${data.taxRateLabel})`, data.tax]);
+    }
+    // Keep the totals + payment terms together on one page.
+    ensure(6 + sumRows.length * 13.5 + 30, false);
+    y += 6; // CSS margin-top on .sums
+    sumRows.forEach(([label, value], i) => {
+      if (i > 0) rule(SUM_X, y, R, 0.25, RULE);
+      y += 1.9; // CSS padding-top
+      const h = Math.max(
+        measure(label, { x: SUM_X, y, size: 9.6 }),
+        measure(value, { x: SUM_X, y, size: 9.6 }),
+      );
+      text(label, { x: SUM_X, y, size: 9.6, color: MUTED });
+      text(value, {
+        x: SUM_X,
+        y,
+        w: SUM_W,
+        font: 'bodyMed',
+        size: 9.6,
+        align: 'right',
+        tnum: true,
+      });
+      y = stack(y, h) + 1.9; // CSS padding-bottom
+    });
+
+    y += 2; // CSS margin-top on .total
+    rule(SUM_X, y, R, 1.6, accent);
+    y += 2.6; // CSS padding-top
+    // Baseline-align the 10.5 pt label with the 15 pt amount by matching the
+    // bottom of their line boxes (same family → visually identical baselines).
+    const totalValueH = measure(data.total, { x: SUM_X, y, size: 15, font: 'headBold', lh: 1 });
+    const totalLabelH = measure('Gesamtbetrag', {
+      x: SUM_X,
+      y,
+      size: 10.5,
+      font: 'headSemi',
+      lh: 1,
+    });
+    text('Gesamtbetrag', {
+      x: SUM_X,
+      y: y + (totalValueH - totalLabelH),
+      font: 'headSemi',
+      size: 10.5,
+      lh: 1,
+    });
+    text(data.total, {
+      x: SUM_X,
+      y,
+      w: SUM_W,
+      font: 'headBold',
+      size: 15,
+      color: accent,
+      align: 'right',
+      lh: 1,
+      tnum: true,
+    });
+    y = stack(y, totalValueH);
 
     if (!data.tax) {
       // §19 UStG note is mandatory when no VAT is shown.
-      doc
-        .font('Helvetica')
-        .fontSize(8)
-        .fillColor(MUTED)
-        .text(
-          'Gemäß §19 UStG wird keine Umsatzsteuer berechnet (Kleinunternehmerregelung).',
-          PAGE_LEFT,
+      y += 4;
+      y = stack(
+        y,
+        text('Gemäß §19 UStG wird keine Umsatzsteuer berechnet (Kleinunternehmerregelung).', {
+          x: L,
           y,
-          { width: PAGE_RIGHT - PAGE_LEFT },
-        );
-      y = doc.y + 6;
+          w: CONTENT_W,
+          size: 8,
+          color: MUTED,
+        }),
+      );
     }
 
-    // Payment terms — transfer shows due date + bank ref; card/cash = paid.
-    y += 10;
-    const paymentText = paid
-      ? data.paymentMethod === 'card'
-        ? 'Der Rechnungsbetrag wurde per Kartenzahlung beglichen. Vielen Dank!'
-        : 'Der Rechnungsbetrag wurde in bar beglichen. Vielen Dank!'
-      : data.dueDate
-        ? `Bitte überweisen Sie den Gesamtbetrag bis zum ${data.dueDate} (Zahlungsziel ${data.paymentTermsDays} Tage).`
-        : `Bitte überweisen Sie den Gesamtbetrag innerhalb von ${data.paymentTermsDays} Tagen.`;
-    doc
-      .font(paid ? 'Helvetica-Bold' : 'Helvetica')
-      .fontSize(10)
-      .fillColor(paid ? accent : INK)
-      .text(paymentText, PAGE_LEFT, y, {
-        width: PAGE_RIGHT - PAGE_LEFT,
-      });
-    y = doc.y + 6;
-
+    // Payment terms, with the accent bar on the left.
+    const payText: Run[][] = paid
+      ? [
+          [
+            {
+              text:
+                data.paymentMethod === 'card'
+                  ? 'Der Rechnungsbetrag wurde per Kartenzahlung beglichen. Vielen Dank!'
+                  : 'Der Rechnungsbetrag wurde in bar beglichen. Vielen Dank!',
+            },
+          ],
+        ]
+      : [
+          data.dueDate
+            ? [
+                { text: 'Bitte überweisen Sie den Gesamtbetrag bis zum ' },
+                { text: data.dueDate, font: 'bodySemi' },
+                { text: ` (Zahlungsziel ${data.paymentTermsDays} Tage).` },
+              ]
+            : [
+                {
+                  text: `Bitte überweisen Sie den Gesamtbetrag innerhalb von ${data.paymentTermsDays} Tagen.`,
+                },
+              ],
+          [
+            { text: 'Bitte geben Sie bei der Überweisung die Rechnungsnummer ' },
+            { text: data.invoiceNumber, font: 'bodySemi' },
+            { text: ' an.' },
+          ],
+        ];
+    const PAY_X = L + 1.6 / MM + 3.4; // border-left 1.6 pt + padding-left 3.4 mm
+    const PAY_W = R - PAY_X;
+    y += 9; // CSS margin-top on .pay
+    const payTop = y;
+    payText.forEach((runs, i) => {
+      if (i > 0) y += 1.1; // CSS margin between paragraphs
+      y = stack(y, textRuns(runs, { x: PAY_X, y, w: PAY_W, size: 9.6 }));
+    });
     if (data.notes) {
-      doc
-        .font('Helvetica')
-        .fontSize(9)
-        .fillColor(MUTED)
-        .text(data.notes, PAGE_LEFT, y, {
-          width: PAGE_RIGHT - PAGE_LEFT,
-        });
-      y = doc.y;
+      y += 1.1;
+      y = stack(y, text(data.notes, { x: PAY_X, y, w: PAY_W, size: 8.8, color: MUTED }));
     }
-
-    // Payment reference (Verwendungszweck) — only relevant for a bank transfer.
-    if (!paid)
-      doc
-        .font('Helvetica')
-        .fontSize(9)
-        .fillColor(MUTED)
-        .text(
-          `Bitte geben Sie bei der Überweisung die Rechnungsnummer ${data.invoiceNumber} an.`,
-          PAGE_LEFT,
-          y,
-          {
-            width: PAGE_RIGHT - PAGE_LEFT,
-          },
-        );
-
-    // ── Footer: legal Pflichtangaben in three columns (Impressum-style) ──
-    const col1 = [
-      data.seller.legalForm ? `Rechtsform: ${data.seller.legalForm}` : null,
-      data.seller.managingDirectors ? `Geschäftsführer: ${data.seller.managingDirectors}` : null,
-      data.seller.chamber,
-    ].filter((x): x is string => Boolean(x));
-    const col2 = [
-      data.seller.taxNumber ? `Steuernummer: ${data.seller.taxNumber}` : null,
-      data.seller.vatId ? `USt-IdNr.: ${data.seller.vatId}` : null,
-      data.seller.businessId ? `Betriebsnummer: ${data.seller.businessId}` : null,
-    ].filter((x): x is string => Boolean(x));
-    // Bank name only (no address) — keeps the narrow footer column to one line;
-    // full bank/holder detail lives in the email's Bankverbindung card.
-    const col3 = [
-      data.bank?.bankName ? `Bank: ${data.bank.bankName}` : null,
-      data.bank?.iban ? `IBAN: ${formatIbanPdf(data.bank.iban)}` : null,
-      data.bank?.bic ? `BIC: ${data.bank.bic}` : null,
-    ].filter((x): x is string => Boolean(x));
-
-    const FOOTER_TOP = 738;
     doc
-      .moveTo(PAGE_LEFT, FOOTER_TOP)
-      .lineTo(PAGE_RIGHT, FOOTER_TOP)
-      .strokeColor(RULE)
-      .lineWidth(0.5)
-      .stroke();
-    const colY = FOOTER_TOP + 8;
-    const cols: Array<{ x: number; w: number; lines: string[] }> = [
-      { x: PAGE_LEFT, w: 165, lines: col1 },
-      { x: PAGE_LEFT + 170, w: 120, lines: col2 },
-      { x: PAGE_LEFT + 295, w: PAGE_RIGHT - (PAGE_LEFT + 295), lines: col3 },
-    ];
-    doc.font('Helvetica').fontSize(7.5).fillColor(MUTED);
-    for (const c of cols) {
-      let cy = colY;
-      for (const line of c.lines) {
-        doc.text(line, c.x, cy, { width: c.w, lineBreak: false });
-        cy = doc.y + 2;
+      .rect(mm(L), mm(payTop), 1.6, mm(y - payTop))
+      .fillColor(PAY_BAR)
+      .fill();
+
+    y += 6; // CSS margin-top on .thx
+    text('Vielen Dank für Ihren Auftrag.', {
+      x: L,
+      y,
+      w: CONTENT_W,
+      font: 'headMed',
+      size: 10,
+    });
+
+    drawFooter();
+
+    // "Seite n von m" — only meaningful once the invoice spills over one page.
+    if (pageNo > 1) {
+      const range = doc.bufferedPageRange();
+      for (let i = 0; i < range.count; i += 1) {
+        doc.switchToPage(range.start + i);
+        text(`Seite ${i + 1} von ${range.count}`, {
+          x: L,
+          y: FOOTER_TOP - 5,
+          w: CONTENT_W,
+          size: 7,
+          color: MUTED,
+          align: 'right',
+        });
       }
     }
 

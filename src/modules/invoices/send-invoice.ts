@@ -15,6 +15,7 @@ export interface InvoiceForEmail {
   recipientAddressLine2: string | null;
   recipientPostalCode: string | null;
   recipientCity: string | null;
+  subject: string | null;
   serviceDate: string | null;
   serviceDateEnd: string | null;
   sentAt: Date | null;
@@ -26,6 +27,7 @@ export interface InvoiceForEmail {
   totalCents: number;
   lineItems: Array<{
     label: string;
+    note?: string | null;
     quantity: number;
     unitPriceCents: number;
     isPackage?: boolean;
@@ -95,8 +97,9 @@ export function buildInvoicePdfData(
     invoiceDate: fmtDate(invoice.sentAt ?? now),
     dueDate: fmtDate(dueAt),
     paymentTermsDays: invoice.paymentTermsDays,
+    subject: invoice.subject,
     recipientName: invoice.recipientName,
-    recipientEmail: invoice.recipientEmail,
+    // Deliberately no recipient email in the address field — DIN lang window.
     recipientAddressLines,
     // Single date unless a genuinely different end date is set (never "X – X").
     serviceDateLabel: invoice.serviceDate
@@ -106,6 +109,7 @@ export function buildInvoicePdfData(
       : null,
     lineItems: invoice.lineItems.map((li) => ({
       label: li.label,
+      note: li.note ?? null,
       quantity: li.quantity.toLocaleString('de-DE'),
       unitPrice: formatEurFromCents(li.unitPriceCents),
       lineTotal: formatEurFromCents(Math.round(li.quantity * li.unitPriceCents)),
@@ -118,6 +122,13 @@ export function buildInvoicePdfData(
     notes: invoice.notes,
     paymentMethod: invoice.paymentMethod ?? 'transfer',
     accentColor: companyRow.primaryColor ?? '#bd5b3e',
+    // Only used when no raster wordmark is available — the official logos carry
+    // their claim already. "CLEANILO – Einfach. Schnell." → "Einfach. Schnell.".
+    claim: (
+      companyRow.emailSignature?.slogan ??
+      companyRow.emailSignature?.tagline ??
+      null
+    )?.replace(new RegExp(`^${companyRow.name}\\s*[–—-]\\s*`, 'i'), ''),
     seller: {
       name: companyRow.legalName ?? companyRow.name,
       addressLines,
@@ -127,7 +138,7 @@ export function buildInvoicePdfData(
       phone: companyRow.phone,
       mobile: companyRow.mobile,
       website: companyRow.websiteUrl ? companyRow.websiteUrl.replace(/^https?:\/\//i, '') : null,
-      taxNumber: companyRow.taxNumber,
+      // No Steuernummer on invoices — the USt-IdNr. is the only tax id shown.
       businessId: companyRow.businessId,
       legalForm: companyRow.legalForm,
       managingDirectors: companyRow.managingDirectors,
@@ -182,8 +193,10 @@ export async function sendInvoiceEmail(
       invoiceDateFormatted: pdfData.invoiceDate,
       dueDateFormatted: pdfData.dueDate,
       paymentTermsDays: pdfData.paymentTermsDays,
+      subject: pdfData.subject,
       lineItems: pdfData.lineItems.map((li) => ({
         label: li.label,
+        note: li.note,
         quantityLabel: li.quantity,
         unitPriceFormatted: li.unitPrice,
         lineTotalFormatted: li.lineTotal,

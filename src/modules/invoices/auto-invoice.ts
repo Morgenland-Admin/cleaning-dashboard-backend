@@ -156,6 +156,8 @@ export async function autoCreateInvoiceForPaidOrder(
           recipientPostalCode: order.addressPostalCode,
           recipientCity: order.addressCity,
           recipientCountry: order.addressCountry ?? 'DE',
+          // Betreff on the printed invoice — points the customer at their order.
+          subject: order.orderNumber ? `Auftrag ${order.orderNumber}` : null,
           serviceDate,
           currency: order.currency,
           lineItems,
