@@ -172,7 +172,16 @@ const ADDR_W = 85;
 const INFO_X = 125;
 const INFO_W = R - INFO_X; // 65
 const BODY_TOP = 100;
-const FOOTER_TOP = 264;
+/**
+ * Top of the legal footer. Deliberately NOT pushed to the DIN 5008 limit (272 mm):
+ * the footer is three lines tall, so at 264 mm its last line ended at 283 mm —
+ * inside the 10–15 mm strip most printers physically cannot print, and a print
+ * dialog that scales or offsets the page eats even more. Kabir's CL-1429 test
+ * print came out of the printer missing Geschäftsführer, Kammer, Betriebsnummer,
+ * IBAN and BIC for exactly that reason. At 252 mm the block ends around 271 mm,
+ * which survives any household printer. Do not move this back down.
+ */
+const FOOTER_TOP = 252;
 const FOLD_1 = 105;
 const FOLD_2 = 210;
 const PUNCH = 148.5;

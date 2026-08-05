@@ -1,19 +1,44 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, asc, desc, eq, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, lt, ne, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { conflict, notFound, parseIntId } from '../../lib/http-errors.js';
-import { computeLoyaltyTier } from '../../lib/loyalty.js';
+import { recomputeCustomerAggregates } from '../../lib/customer-stats.js';
 
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).max(500).optional(),
   tier: z.enum(['neukunde', 'stammkunde', 'premium']).optional(),
   email: z.string().email().optional(),
+  q: z.string().trim().min(1).max(200).optional(),
 });
+
+/** Largest value a Postgres int4 id can hold — bigger digit runs can't be an id. */
+const MAX_INT4 = 2147483647;
+
+/**
+ * Free-text list filter: matches id, email, name, company, customer number and
+ * phone. Runs in SQL rather than on the loaded page so searching for "#3734"
+ * finds that customer even when it sits thousands of rows deep.
+ */
+function searchCondition(customers: CustomersTable, q: string) {
+  // LIKE metacharacters are escaped so a literal "%" doesn't match everything.
+  const like = `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+  const parts = [
+    ilike(customers.email, like),
+    ilike(customers.name, like),
+    ilike(customers.companyName, like),
+    ilike(customers.customerNumber, like),
+    ilike(customers.phone, like),
+  ];
+  // "3734" and "#3734" both mean the id column.
+  const asId = /^#?(\d{1,10})$/.exec(q);
+  if (asId && Number(asId[1]) <= MAX_INT4) parts.push(eq(customers.id, Number(asId[1])));
+  return or(...parts);
+}
 
 const tagsSchema = z.array(z.string().trim().min(1).max(64)).max(50);
 
@@ -258,12 +283,16 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAccess('super_admin', 'admin', 'manager'));
 
   app.get('/', async (request) => {
-    const { limit, cursor, tier, email } = listQuerySchema.parse(request.query);
+    const { limit, cursor, tier, email, q } = listQuerySchema.parse(request.query);
     const { customers } = request.company!.tables;
     const decoded = cursor ? decodeCursor(cursor) : null;
     const conds = [];
     if (tier) conds.push(eq(customers.loyaltyTier, tier));
     if (email) conds.push(eq(customers.email, email));
+    if (q) {
+      const search = searchCondition(customers, q);
+      if (search) conds.push(search);
+    }
     if (decoded) {
       const cw = or(
         lt(customers.createdAt, sql`${decoded.createdAt}::timestamptz`),
@@ -417,6 +446,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       customers,
       customerAddresses,
       orders,
+      invoices,
       serviceInquiries,
       contactMessages,
       newsletterSubscribers,
@@ -426,45 +456,70 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!customer) throw notFound('Customer not found');
     const email = customer.email.toLowerCase();
 
-    const [addressRows, orderRows, inquiryRows, contactRows, newsletterRow] = await Promise.all([
-      listAddresses(customerAddresses, id),
-      db
-        .select()
-        .from(orders)
-        .where(or(eq(orders.customerId, id), sql`lower(${orders.customerEmail}) = ${email}`))
-        .orderBy(desc(orders.createdAt))
-        .limit(100),
-      db
-        .select()
-        .from(serviceInquiries)
-        .where(
-          or(eq(serviceInquiries.customerId, id), sql`lower(${serviceInquiries.email}) = ${email}`),
-        )
-        .orderBy(desc(serviceInquiries.createdAt))
-        .limit(100),
-      db
-        .select()
-        .from(contactMessages)
-        .where(
-          or(eq(contactMessages.customerId, id), sql`lower(${contactMessages.email}) = ${email}`),
-        )
-        .orderBy(desc(contactMessages.createdAt))
-        .limit(100),
-      db
-        .select()
-        .from(newsletterSubscribers)
-        .where(
-          or(
-            eq(newsletterSubscribers.customerId, id),
-            sql`lower(${newsletterSubscribers.email}) = ${email}`,
-          ),
-        )
-        .orderBy(desc(newsletterSubscribers.createdAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
-    ]);
+    const [addressRows, orderRows, invoiceRows, inquiryRows, contactRows, newsletterRow] =
+      await Promise.all([
+        listAddresses(customerAddresses, id),
+        db
+          .select()
+          .from(orders)
+          .where(or(eq(orders.customerId, id), sql`lower(${orders.customerEmail}) = ${email}`))
+          .orderBy(desc(orders.createdAt))
+          .limit(100),
+        db
+          .select()
+          .from(invoices)
+          .where(or(eq(invoices.customerId, id), sql`lower(${invoices.recipientEmail}) = ${email}`))
+          .orderBy(desc(invoices.createdAt))
+          .limit(100),
+        db
+          .select()
+          .from(serviceInquiries)
+          .where(
+            or(
+              eq(serviceInquiries.customerId, id),
+              sql`lower(${serviceInquiries.email}) = ${email}`,
+            ),
+          )
+          .orderBy(desc(serviceInquiries.createdAt))
+          .limit(100),
+        db
+          .select()
+          .from(contactMessages)
+          .where(
+            or(eq(contactMessages.customerId, id), sql`lower(${contactMessages.email}) = ${email}`),
+          )
+          .orderBy(desc(contactMessages.createdAt))
+          .limit(100),
+        db
+          .select()
+          .from(newsletterSubscribers)
+          .where(
+            or(
+              eq(newsletterSubscribers.customerId, id),
+              sql`lower(${newsletterSubscribers.email}) = ${email}`,
+            ),
+          )
+          .orderBy(desc(newsletterSubscribers.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+      ]);
 
     const paidOrders = orderRows.filter((o) => o.paidAt != null);
+    // Refunds come off the turnover, per order row.
+    const orderSpentCents = paidOrders.reduce(
+      (sum, o) => sum + Math.max(o.totalCents - o.refundedAmountCents, 0),
+      0,
+    );
+    // Drafts are not yet a claim on the customer; void ones never were.
+    const issuedInvoices = invoiceRows.filter((i) => i.status !== 'draft' && i.status !== 'void');
+    const openInvoices = issuedInvoices.filter(
+      (i) => i.status === 'sent' || i.status === 'overdue',
+    );
+    // Money actually received via invoices. An invoice tied to an order bills
+    // what that order already counts, so only standalone ones add turnover.
+    const paidInvoiceSpentCents = invoiceRows
+      .filter((i) => i.status === 'paid' && i.orderId == null)
+      .reduce((sum, i) => sum + i.totalCents, 0);
     const newsletterStatus = newsletterRow
       ? newsletterRow.unsubscribedAt
         ? 'unsubscribed'
@@ -476,7 +531,14 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     const stats = {
       orders: orderRows.length,
       paidOrders: paidOrders.length,
-      lifetimeSpentCents: paidOrders.reduce((sum, o) => sum + o.totalCents, 0),
+      lifetimeSpentCents: orderSpentCents + paidInvoiceSpentCents,
+      invoices: invoiceRows.length,
+      /** Issued (non-draft, non-void) invoices — what the customer was billed. */
+      issuedInvoices: issuedInvoices.length,
+      invoicedCents: issuedInvoices.reduce((sum, i) => sum + i.totalCents, 0),
+      openInvoices: openInvoices.length,
+      openInvoicedCents: openInvoices.reduce((sum, i) => sum + i.totalCents, 0),
+      overdueInvoices: openInvoices.filter((i) => i.status === 'overdue').length,
       inquiries: inquiryRows.length,
       openInquiries: inquiryRows.filter((i) => i.status === 'new' || i.status === 'in_review')
         .length,
@@ -488,6 +550,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       customer,
       addresses: addressRows,
       orders: orderRows,
+      invoices: invoiceRows,
       inquiries: inquiryRows,
       contacts: contactRows,
       newsletter: newsletterRow,
@@ -685,17 +748,16 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204).send();
   });
 
+  /**
+   * Rebuild the stored aggregates (orders, turnover, first/last order) from the
+   * live paid orders and paid invoices, then re-derive the loyalty tier. Reading
+   * the counters instead would keep any historic drift — e.g. a customer billed
+   * through hand-written invoices only, whose counters were never touched.
+   */
   app.post('/:id/recompute-tier', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const { customers } = request.company!.tables;
-    const [row] = await db.select().from(customers).where(eq(customers.id, id)).limit(1);
-    if (!row) throw notFound('Customer not found');
-    const tier = computeLoyaltyTier(row.totalOrders, row.totalSpentCents);
-    const [updated] = await db
-      .update(customers)
-      .set({ loyaltyTier: tier, updatedAt: new Date() })
-      .where(eq(customers.id, id))
-      .returning();
+    const updated = await recomputeCustomerAggregates(request.company!.tables, id);
+    if (!updated) throw notFound('Customer not found');
     return { customer: updated };
   });
 };

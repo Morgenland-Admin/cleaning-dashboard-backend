@@ -6,6 +6,8 @@ import { db } from '../../db/index.js';
 import { company } from '../../db/schema/shared.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
+import { linkCustomerByEmail } from '../../lib/customers.js';
+import { recomputeCustomerForInvoice } from '../../lib/customer-stats.js';
 import { sendDunningEmail } from '../../lib/dunning.js';
 import { fetchInvoiceLogo, renderInvoicePdf } from '../../lib/invoice-pdf.js';
 import {
@@ -356,16 +358,16 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const totalCents = subtotalCents + taxCents;
     // Payment term: explicit value wins; else the recipient customer's default; else 7.
     // The same lookup fills the B2B company / USt-IdNr. when the caller left them
-    // out, so an invoice to a business customer is never addressed person-only.
+    // out, so an invoice to a business customer is never addressed person-only,
+    // and links the invoice to that customer record.
     let paymentTermsDays = body.paymentTermsDays;
     let recipientCompany = body.recipientCompany;
     let recipientVatId = body.recipientVatId;
-    if (
-      body.recipientEmail &&
-      (paymentTermsDays == null || recipientCompany == null || recipientVatId == null)
-    ) {
+    let customerId: number | null = null;
+    if (body.recipientEmail) {
       const [cust] = await db
         .select({
+          id: customers.id,
           d: customers.defaultPaymentTermsDays,
           customerType: customers.customerType,
           companyName: customers.companyName,
@@ -379,8 +381,27 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         recipientCompany ??= cust.companyName;
         recipientVatId ??= cust.vatId;
       }
+      customerId = cust?.id ?? null;
+      // Recipient isn't a customer yet — create the record (partner invoices
+      // excluded: a partner is not a customer).
+      if (customerId == null && body.partnerId == null) {
+        customerId = await linkCustomerByEmail(db, customers, {
+          email: body.recipientEmail,
+          name: body.recipientName,
+        });
+      }
     }
     paymentTermsDays ??= 7;
+    // No email to go by (or an unknown one): inherit the order's customer.
+    if (customerId == null && body.orderId != null) {
+      const { orders } = request.company!.tables;
+      const [ord] = await db
+        .select({ customerId: orders.customerId })
+        .from(orders)
+        .where(eq(orders.id, body.orderId))
+        .limit(1);
+      customerId = ord?.customerId ?? null;
+    }
     const craftsman = resolveCraftsman(body, null, totalCents, body.taxRatePercent);
     const invoice = await db.transaction(async (tx) => {
       // Drafts carry no number — it's assigned from the gapless sequence at issue.
@@ -389,6 +410,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         .values({
           orderId: body.orderId,
           partnerId: body.partnerId,
+          customerId,
           customerType: body.customerType,
           recipientName: body.recipientName,
           recipientCompany,
@@ -428,7 +450,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
 
   app.patch('/:id', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const { invoices, invoiceStatusLog } = request.company!.tables;
+    const { invoices, invoiceStatusLog, customers } = request.company!.tables;
     const adminId = request.authUser!.id;
     const now = new Date();
 
@@ -449,6 +471,17 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
 
     const set: Record<string, unknown> = { ...body, updatedAt: now };
     if (body.status === 'paid') set.paidAt = now;
+    // Re-point the customer link when a draft's recipient is retyped, so the
+    // invoice follows the person it is actually billed to.
+    if (isDraft && 'recipientEmail' in body && current.partnerId == null) {
+      const draftBody = body as z.infer<typeof draftUpdateSchema>;
+      set.customerId = draftBody.recipientEmail
+        ? await linkCustomerByEmail(db, customers, {
+            email: draftBody.recipientEmail,
+            name: draftBody.recipientName ?? current.recipientName,
+          })
+        : null;
+    }
     if (isDraft && ('lineItems' in body || 'taxRatePercent' in body)) {
       const draftBody = body as z.infer<typeof draftUpdateSchema>;
       const lineItems = draftBody.lineItems ?? current.lineItems;
@@ -492,6 +525,11 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         changedByUserId: adminId,
         reason: 'Status geändert (PATCH)',
       });
+      // Turnover changed hands (paid) or was written off (void) — keep the
+      // customer's totals and loyalty tier in step.
+      if (body.status === 'paid' || body.status === 'void') {
+        await recomputeCustomerForInvoice(request.company!.tables, row, request.log);
+      }
     }
     return { invoice: row };
   });
@@ -635,6 +673,8 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       changedByUserId: request.authUser!.id,
       reason: 'Als bezahlt markiert',
     });
+    // The money is in — fold it into the customer's turnover / loyalty tier.
+    await recomputeCustomerForInvoice(request.company!.tables, row, request.log);
     return { invoice: row };
   });
 

@@ -540,6 +540,13 @@ function buildTenantTables(schemaName: string) {
       number: varchar('number', { length: 64 }),
       orderId: integer('order_id'),
       partnerId: integer('partner_id'),
+      /**
+       * Logical link to the billed customer (plain indexed integer, no
+       * cross-schema FK) — same convention as orders.customer_id. Lets the
+       * customer record show its invoices even when the invoice was written
+       * standalone, without an order.
+       */
+      customerId: integer('customer_id'),
       customerType: varchar('customer_type', { length: 8 }).notNull().default('b2c'),
       recipientName: text('recipient_name').notNull(),
       /** B2B: company line printed above the recipient name in the address field. */
@@ -607,6 +614,7 @@ function buildTenantTables(schemaName: string) {
     (table) => ({
       statusIdx: index('invoices_status_idx').on(table.status),
       dueIdx: index('invoices_due_idx').on(table.dueAt),
+      customerIdx: index('invoices_customer_id_idx').on(table.customerId),
       statusDueIdx: index('invoices_status_due_idx').on(table.status, table.dueAt),
       orderIdUnique: uniqueIndex('invoices_order_id_unique')
         .on(table.orderId)
@@ -1203,6 +1211,7 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
   "number" varchar(64),
   "order_id" integer,
   "partner_id" integer,
+  "customer_id" integer,
   "customer_type" varchar(8) DEFAULT 'b2c' NOT NULL,
   "recipient_name" text NOT NULL,
   "recipient_company" text,
@@ -1378,11 +1387,13 @@ ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "customer_id" integer;
 ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "customer_id" integer;
 ALTER TABLE ${q}."contact_messages" ADD COLUMN IF NOT EXISTS "customer_id" integer;
 ALTER TABLE ${q}."newsletter_subscribers" ADD COLUMN IF NOT EXISTS "customer_id" integer;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "customer_id" integer;
 -- Indexes AFTER the ALTERs above or the batch aborts on legacy schemas.
 CREATE INDEX IF NOT EXISTS "orders_customer_id_idx" ON ${q}."orders" ("customer_id");
 CREATE INDEX IF NOT EXISTS "service_inquiries_customer_id_idx" ON ${q}."service_inquiries" ("customer_id");
 CREATE INDEX IF NOT EXISTS "contact_messages_customer_id_idx" ON ${q}."contact_messages" ("customer_id");
 CREATE INDEX IF NOT EXISTS "newsletter_subscribers_customer_id_idx" ON ${q}."newsletter_subscribers" ("customer_id");
+CREATE INDEX IF NOT EXISTS "invoices_customer_id_idx" ON ${q}."invoices" ("customer_id");
 
 -- ── Voice-AI / callback geo-routing: service PLZ, call reason, human|ai split ──
 -- Self-healing for schemas predating these columns (idempotent).
@@ -1423,6 +1434,15 @@ INSERT INTO ${q}."customers" ("email", "name", "marketing_opt_in")
   WHERE "email" IS NOT NULL AND "email" <> ''
   GROUP BY lower("email")
   ON CONFLICT ("email") DO NOTHING;
+-- Invoice recipients too, so a hand-written invoice never leaves the person it
+-- was billed to outside the customer record. Partner invoices are excluded —
+-- a partner is not a customer.
+INSERT INTO ${q}."customers" ("email", "name")
+  SELECT lower("recipient_email"), max("recipient_name")
+  FROM ${q}."invoices"
+  WHERE "recipient_email" IS NOT NULL AND "recipient_email" <> '' AND "partner_id" IS NULL
+  GROUP BY lower("recipient_email")
+  ON CONFLICT ("email") DO NOTHING;
 
 -- Link source rows back to their customer (only fills NULLs — cheap on re-run).
 UPDATE ${q}."orders" o SET "customer_id" = c."id"
@@ -1437,6 +1457,15 @@ UPDATE ${q}."contact_messages" m SET "customer_id" = c."id"
 UPDATE ${q}."newsletter_subscribers" n SET "customer_id" = c."id"
   FROM ${q}."customers" c
   WHERE n."customer_id" IS NULL AND lower(n."email") = lower(c."email");
+-- Invoices: the order's customer wins (the recipient may have been retyped),
+-- otherwise fall back to the recipient email.
+UPDATE ${q}."invoices" i SET "customer_id" = o."customer_id"
+  FROM ${q}."orders" o
+  WHERE i."customer_id" IS NULL AND i."order_id" = o."id" AND o."customer_id" IS NOT NULL;
+UPDATE ${q}."invoices" i SET "customer_id" = c."id"
+  FROM ${q}."customers" c
+  WHERE i."customer_id" IS NULL AND i."partner_id" IS NULL
+    AND lower(i."recipient_email") = lower(c."email");
 
 -- Lift the flat address on each customer into customer_addresses as the default
 -- billing address. Only customers that have no address row yet — re-runs are

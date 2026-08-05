@@ -32,6 +32,8 @@ function isUniqueViolation(err: unknown): boolean {
 interface PaidOrderRow {
   id: number;
   orderNumber: string | null;
+  /** Set on orders created after the customer-360 link landed. */
+  customerId?: number | null;
   customerName: string;
   customerEmail: string;
   addressLine1: string | null;
@@ -135,6 +137,7 @@ export async function autoCreateInvoiceForPaidOrder(
   // invoice is addressed to the firm, not just the person who booked.
   const [cust] = await db
     .select({
+      id: customers.id,
       d: customers.defaultPaymentTermsDays,
       customerType: customers.customerType,
       companyName: customers.companyName,
@@ -156,6 +159,8 @@ export async function autoCreateInvoiceForPaidOrder(
         .insert(invoices)
         .values({
           orderId: order.id,
+          // Link to the customer record (the order path already created it).
+          customerId: cust?.id ?? order.customerId ?? null,
           customerType: isBusiness ? 'b2b' : 'b2c',
           recipientName: order.customerName,
           recipientCompany: isBusiness ? cust?.companyName : null,

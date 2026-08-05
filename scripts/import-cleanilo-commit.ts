@@ -199,6 +199,7 @@ async function writeOrderAndInvoice(
   await tx.insert(t.invoices).values({
     number: inv.invoiceNumber, // original, or "<orig>-N" for a de-duped collision
     orderId,
+    customerId,
     customerType: isB2B ? 'b2b' : 'b2c',
     recipientName: inv.name,
     recipientEmail: emails.invoiceRecipientEmail,
