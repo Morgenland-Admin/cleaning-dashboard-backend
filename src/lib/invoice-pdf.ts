@@ -24,7 +24,9 @@
  *   {{LEISTUNGSDATUM}}    serviceDateLabel   ← invoices.service_date [+ _end]
  *   {{FAELLIG_BIS}}       dueDate            ← invoices.due_at
  *   {{ZAHLUNGSZIEL_TAGE}} paymentTermsDays   ← invoices.payment_terms_days
+ *   {{KUNDE_FIRMA}}       recipientCompany   ← invoices.recipient_company (B2B)
  *   {{KUNDE_NAME}}        recipientName      ← invoices.recipient_name
+ *   {{KUNDE_USTID}}       recipientVatId     ← invoices.recipient_vat_id (B2B)
  *   {{KUNDE_STRASSE}}     recipientAddressLines[0] ← recipient_address_line1 [+2]
  *   {{KUNDE_PLZ_ORT}}     recipientAddressLines[1] ← recipient_postal_code + _city
  *   {{BETREFF}}           subject            ← invoices.subject
@@ -37,6 +39,10 @@
  *   {{UST_SATZ}}          taxRateLabel       ← invoices.tax_rate_percent
  *   {{UST_BETRAG}}        tax                ← invoices.tax_cents
  *   {{GESAMT}}            total              ← invoices.total_cents
+ *   {{HANDWERKERLEISTUNG}} craftsmanNote     ← invoices.craftsman_note (§35a EStG)
+ *   {{BEMERKUNG}}         notes              ← invoices.notes
+ *
+ * The closing thank-you line is fixed for all brands (`INVOICE_THANK_YOU`).
  *
  * The sender, legal footer and Bankverbindung are not placeholders — they are
  * read from the company row so every brand stays correct without editing here.
@@ -44,6 +50,8 @@
 import { readFileSync } from 'node:fs';
 
 import PDFDocument from 'pdfkit';
+
+import { INVOICE_THANK_YOU } from './invoice-text.js';
 
 export interface InvoicePdfData {
   brandName: string;
@@ -54,6 +62,10 @@ export interface InvoicePdfData {
   /** Betreff line under the "Rechnung Nr. …" headline ({{BETREFF}}). */
   subject?: string | null;
   recipientName: string;
+  /** B2B: company line printed above the recipient name in the address field. */
+  recipientCompany?: string | null;
+  /** B2B: USt-IdNr. of the recipient, printed in the information block. */
+  recipientVatId?: string | null;
   /** §14 UStG: recipient postal address lines (street, "PLZ Ort", country). */
   recipientAddressLines?: string[];
   /** §14 UStG: pre-formatted Leistungsdatum or "von – bis" Leistungszeitraum. */
@@ -72,6 +84,12 @@ export interface InvoicePdfData {
   tax: string | null;
   taxRateLabel: string | null;
   total: string;
+  /**
+   * §35a EStG block, printed above the closing line. Pre-composed and frozen on
+   * the invoice row (`craftsman_note`) so a reissue reproduces it verbatim.
+   */
+  craftsmanNote?: string | null;
+  /** Free-text remark for this one invoice, printed under the payment terms. */
   notes?: string | null;
   /** 'transfer' (default) shows bank + due date; 'card'/'cash' show "paid". */
   paymentMethod?: string | null;
@@ -520,9 +538,30 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     ay += 0.6; // CSS padding-bottom on the return line
     rule(L, ay, L + 80, 0.25, RULE);
     ay += 4.4; // CSS margin-top on the address block
+    // DIN 5008: company line first, then the person, then the street.
+    if (data.recipientCompany) {
+      ay = stack(
+        ay,
+        text(data.recipientCompany, {
+          x: L,
+          y: ay,
+          w: ADDR_W,
+          font: 'bodySemi',
+          size: 10.4,
+          lh: 1.5,
+        }),
+      );
+    }
     ay = stack(
       ay,
-      text(data.recipientName, { x: L, y: ay, w: ADDR_W, font: 'bodySemi', size: 10.4, lh: 1.5 }),
+      text(data.recipientName, {
+        x: L,
+        y: ay,
+        w: ADDR_W,
+        font: data.recipientCompany ? 'body' : 'bodySemi',
+        size: 10.4,
+        lh: 1.5,
+      }),
     );
     for (const line of data.recipientAddressLines ?? []) {
       ay = stack(ay, text(line, { x: L, y: ay, w: ADDR_W, size: 10.4, lh: 1.5 }));
@@ -555,6 +594,9 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
         data.serviceDateLabel,
         false,
       ]);
+    // B2B: the recipient's USt-IdNr. belongs on the invoice, not in the DIN
+    // address window — it rides along with the other invoice metadata.
+    if (data.recipientVatId) infoRows.push(['USt-IdNr. Kunde', data.recipientVatId, false]);
     if (data.dueDate && !paid) infoRows.push(['Fällig bis', data.dueDate, true]);
     for (const [label, value, due] of infoRows) {
       iy += 1.5; // CSS padding-top
@@ -815,22 +857,55 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     const PAY_X = L + 1.6 / MM + 3.4; // border-left 1.6 pt + padding-left 3.4 mm
     const PAY_W = R - PAY_X;
     y += 9; // CSS margin-top on .pay
+
+    // Closing group: payment terms → §35a block → remark → thank-you. Measured
+    // up front and moved to the next page as a whole, so the yellow bar, the
+    // deductible-labour sentence and the closing line never get torn apart.
+    const craftH = data.craftsmanNote
+      ? 6 + measure(data.craftsmanNote, { x: L, y, w: CONTENT_W, size: 9 })
+      : 0;
+    const notesH = data.notes ? 4 + measure(data.notes, { x: L, y, w: CONTENT_W, size: 8.8 }) : 0;
+    const thxH =
+      6 + measure(INVOICE_THANK_YOU, { x: L, y, w: CONTENT_W, font: 'headMed', size: 10 });
+    const payH = payText.reduce(
+      (acc, runs, i) =>
+        acc +
+        (i > 0 ? 1.1 : 0) +
+        // Run styling only changes the width marginally — close enough for pagination.
+        measure(runs.map((r) => r.text).join(''), { x: PAY_X, y, w: PAY_W, size: 9.6 }),
+      0,
+    );
+    ensure(payH + craftH + notesH + thxH, false);
+
     const payTop = y;
     payText.forEach((runs, i) => {
       if (i > 0) y += 1.1; // CSS margin between paragraphs
       y = stack(y, textRuns(runs, { x: PAY_X, y, w: PAY_W, size: 9.6 }));
     });
-    if (data.notes) {
-      y += 1.1;
-      y = stack(y, text(data.notes, { x: PAY_X, y, w: PAY_W, size: 8.8, color: MUTED }));
-    }
     doc
       .rect(mm(L), mm(payTop), 1.6, mm(y - payTop))
       .fillColor(PAY_BAR)
       .fill();
 
+    // §35a EStG: the labour share the customer may deduct. Printed verbatim as
+    // stored on the invoice, in body ink — the customer forwards it to their
+    // tax office, so it must not read as a footnote.
+    if (data.craftsmanNote) {
+      y += 6;
+      ensure(craftH - 6, false);
+      y = stack(y, text(data.craftsmanNote, { x: L, y, w: CONTENT_W, size: 9 }));
+    }
+
+    // Case-by-case remark for this one invoice.
+    if (data.notes) {
+      y += 4;
+      ensure(notesH - 4, false);
+      y = stack(y, text(data.notes, { x: L, y, w: CONTENT_W, size: 8.8, color: MUTED }));
+    }
+
     y += 6; // CSS margin-top on .thx
-    text('Vielen Dank für Ihren Auftrag.', {
+    ensure(thxH - 6, false);
+    text(INVOICE_THANK_YOU, {
       x: L,
       y,
       w: CONTENT_W,

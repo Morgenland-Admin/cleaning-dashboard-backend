@@ -394,8 +394,33 @@ function buildTenantTables(schemaName: string) {
     {
       id: serial('id').primaryKey(),
       email: text('email').notNull().unique(),
+      /** Display name — derived from first/last name, falling back to the company. */
       name: text('name'),
       phone: varchar('phone', { length: 32 }),
+      /** 'private' | 'business' — drives which detail fields the UI asks for. */
+      customerType: varchar('customer_type', { length: 8 }).notNull().default('private'),
+      /** 'herr' | 'frau' | 'divers' | 'firma' */
+      salutation: varchar('salutation', { length: 16 }),
+      firstName: text('first_name'),
+      lastName: text('last_name'),
+      dateOfBirth: date('date_of_birth'),
+      /** Correspondence language, ISO 639-1 ('de' | 'en'). */
+      language: varchar('language', { length: 5 }),
+      /** 'email' | 'phone' | 'whatsapp' | 'post' */
+      preferredChannel: varchar('preferred_channel', { length: 16 }),
+      companyName: text('company_name'),
+      /** USt-IdNr. of the customer (B2B, §14a UStG / reverse charge). */
+      vatId: varchar('vat_id', { length: 32 }),
+      /** Steuernummer of the customer — informational only, never printed. */
+      taxNumber: varchar('tax_number', { length: 32 }),
+      /** Operator-facing customer number (Kundennummer), unique per brand. */
+      customerNumber: varchar('customer_number', { length: 32 }),
+      /** Number in a legacy/external system (Odoo, old Excel, …). */
+      externalNumber: varchar('external_number', { length: 64 }),
+      jobPosition: text('job_position'),
+      department: text('department'),
+      website: text('website'),
+      /** Mirror of the default customer_addresses row (kept in sync by the API). */
       addressLine1: text('address_line1'),
       addressLine2: text('address_line2'),
       postalCode: varchar('postal_code', { length: 16 }),
@@ -416,6 +441,45 @@ function buildTenantTables(schemaName: string) {
     },
     (table) => ({
       tierIdx: index('customers_loyalty_tier_idx').on(table.loyaltyTier),
+      customerNumberUnique: uniqueIndex('customers_customer_number_unique')
+        .on(table.customerNumber)
+        .where(sql`${table.customerNumber} IS NOT NULL`),
+    }),
+  );
+
+  /**
+   * Addresses of a customer — an ERP contact can have many (invoice address,
+   * pickup/service address, shipping address). `customerId` is a logical link
+   * (plain indexed integer, no cross-schema FK), matching the customer_id
+   * convention on orders/inquiries. Exactly one row per customer carries
+   * `isDefault`; the API mirrors that row onto the customers.address_* columns
+   * so invoices, exports and emails keep reading a single flat address.
+   */
+  const customerAddresses = s.table(
+    'customer_addresses',
+    {
+      id: serial('id').primaryKey(),
+      customerId: integer('customer_id').notNull(),
+      /** 'billing' | 'service' | 'shipping' */
+      kind: varchar('kind', { length: 16 }).notNull().default('billing'),
+      isDefault: boolean('is_default').notNull().default(false),
+      /** Free label shown in the list, e.g. "Werkstatt Speicherstadt". */
+      label: text('label'),
+      /** Recipient on this address — may differ from the customer name. */
+      name: text('name'),
+      company: text('company'),
+      addressLine1: text('address_line1'),
+      addressLine2: text('address_line2'),
+      postalCode: varchar('postal_code', { length: 16 }),
+      city: text('city'),
+      country: varchar('country', { length: 2 }).default('DE'),
+      phone: varchar('phone', { length: 32 }),
+      notes: text('notes'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      customerIdx: index('customer_addresses_customer_id_idx').on(table.customerId),
     }),
   );
 
@@ -478,6 +542,10 @@ function buildTenantTables(schemaName: string) {
       partnerId: integer('partner_id'),
       customerType: varchar('customer_type', { length: 8 }).notNull().default('b2c'),
       recipientName: text('recipient_name').notNull(),
+      /** B2B: company line printed above the recipient name in the address field. */
+      recipientCompany: text('recipient_company'),
+      /** B2B: USt-IdNr. of the recipient, printed in the invoice info block. */
+      recipientVatId: varchar('recipient_vat_id', { length: 32 }),
       recipientEmail: text('recipient_email'),
       // §14 UStG: recipient postal address is mandatory on invoices > 250 EUR.
       recipientAddressLine1: text('recipient_address_line1'),
@@ -521,6 +589,18 @@ function buildTenantTables(schemaName: string) {
       lastDunningAt: timestamp('last_dunning_at', { withTimezone: true }),
       odooInvoiceId: text('odoo_invoice_id'),
       notes: text('notes'),
+      /** §35a EStG: invoice covers a Handwerkerleistung (labour share is deductible). */
+      craftsmanService: boolean('craftsman_service').notNull().default(false),
+      /** Gross (VAT-inclusive) labour share of the total, in cents. */
+      laborGrossCents: integer('labor_gross_cents'),
+      /** VAT contained in `laborGrossCents` — defaults to 19 %, operator-overridable. */
+      laborVatCents: integer('labor_vat_cents'),
+      /**
+       * The §35a sentence exactly as printed. Written whenever the labour figures
+       * change and frozen at issue, so a reissued PDF reproduces the wording the
+       * customer received even if the template text changes later.
+       */
+      craftsmanNote: text('craftsman_note'),
       createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
       updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     },
@@ -647,6 +727,7 @@ function buildTenantTables(schemaName: string) {
     orderItems,
     orderStatusLog,
     customers,
+    customerAddresses,
     reviews,
     subscriptions,
     invoices,
@@ -1022,6 +1103,21 @@ CREATE TABLE IF NOT EXISTS ${q}."customers" (
   "email" text NOT NULL,
   "name" text,
   "phone" varchar(32),
+  "customer_type" varchar(8) DEFAULT 'private' NOT NULL,
+  "salutation" varchar(16),
+  "first_name" text,
+  "last_name" text,
+  "date_of_birth" date,
+  "language" varchar(5),
+  "preferred_channel" varchar(16),
+  "company_name" text,
+  "vat_id" varchar(32),
+  "tax_number" varchar(32),
+  "customer_number" varchar(32),
+  "external_number" varchar(64),
+  "job_position" text,
+  "department" text,
+  "website" text,
   "address_line1" text,
   "address_line2" text,
   "postal_code" varchar(16),
@@ -1041,6 +1137,26 @@ CREATE TABLE IF NOT EXISTS ${q}."customers" (
   CONSTRAINT "${schemaName}_customers_email_unique" UNIQUE("email")
 );
 CREATE INDEX IF NOT EXISTS "customers_loyalty_tier_idx" ON ${q}."customers" ("loyalty_tier");
+
+CREATE TABLE IF NOT EXISTS ${q}."customer_addresses" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "customer_id" integer NOT NULL,
+  "kind" varchar(16) DEFAULT 'billing' NOT NULL,
+  "is_default" boolean DEFAULT false NOT NULL,
+  "label" text,
+  "name" text,
+  "company" text,
+  "address_line1" text,
+  "address_line2" text,
+  "postal_code" varchar(16),
+  "city" text,
+  "country" varchar(2) DEFAULT 'DE',
+  "phone" varchar(32),
+  "notes" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "customer_addresses_customer_id_idx" ON ${q}."customer_addresses" ("customer_id");
 
 CREATE TABLE IF NOT EXISTS ${q}."reviews" (
   "id" serial PRIMARY KEY NOT NULL,
@@ -1089,6 +1205,8 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
   "partner_id" integer,
   "customer_type" varchar(8) DEFAULT 'b2c' NOT NULL,
   "recipient_name" text NOT NULL,
+  "recipient_company" text,
+  "recipient_vat_id" varchar(32),
   "recipient_email" text,
   "recipient_address_line1" text,
   "recipient_address_line2" text,
@@ -1114,6 +1232,10 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
   "last_dunning_at" timestamp with time zone,
   "odoo_invoice_id" text,
   "notes" text,
+  "craftsman_service" boolean DEFAULT false NOT NULL,
+  "labor_gross_cents" integer,
+  "labor_vat_cents" integer,
+  "craftsman_note" text,
   "created_at" timestamp with time zone DEFAULT now() NOT NULL,
   "updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -1144,6 +1266,11 @@ ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "tax_rate_percent" integer 
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "payment_method" varchar(16) DEFAULT 'transfer' NOT NULL;
 -- Betreff line for the DIN 5008 invoice template.
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "subject" varchar(200);
+-- §35a EStG (Handwerkerleistung): labour share + the frozen sentence as printed.
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "craftsman_service" boolean DEFAULT false NOT NULL;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "labor_gross_cents" integer;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "labor_vat_cents" integer;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "craftsman_note" text;
 
 CREATE TABLE IF NOT EXISTS ${q}."invoice_status_log" (
   "id" serial PRIMARY KEY NOT NULL,
@@ -1224,6 +1351,29 @@ ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "tags" jsonb DEFAULT '[]':
 ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "internal_notes" text;
 ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "default_payment_terms_days" integer;
 
+-- ── ERP contact record: company / B2B billing + person details ──
+-- Self-healing for schemas predating these columns (idempotent).
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "customer_type" varchar(8) DEFAULT 'private' NOT NULL;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "salutation" varchar(16);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "first_name" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "last_name" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "date_of_birth" date;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "language" varchar(5);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "preferred_channel" varchar(16);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "company_name" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "vat_id" varchar(32);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "tax_number" varchar(32);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "customer_number" varchar(32);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "external_number" varchar(64);
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "job_position" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "department" text;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "website" text;
+-- Index AFTER the ALTER above or the batch aborts on legacy schemas.
+CREATE UNIQUE INDEX IF NOT EXISTS "customers_customer_number_unique" ON ${q}."customers" ("customer_number") WHERE "customer_number" IS NOT NULL;
+
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_company" text;
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "recipient_vat_id" varchar(32);
+
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "customer_id" integer;
 ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "customer_id" integer;
 ALTER TABLE ${q}."contact_messages" ADD COLUMN IF NOT EXISTS "customer_id" integer;
@@ -1287,5 +1437,16 @@ UPDATE ${q}."contact_messages" m SET "customer_id" = c."id"
 UPDATE ${q}."newsletter_subscribers" n SET "customer_id" = c."id"
   FROM ${q}."customers" c
   WHERE n."customer_id" IS NULL AND lower(n."email") = lower(c."email");
+
+-- Lift the flat address on each customer into customer_addresses as the default
+-- billing address. Only customers that have no address row yet — re-runs are
+-- no-ops and manual edits in the Addresses tab are never overwritten.
+INSERT INTO ${q}."customer_addresses"
+  ("customer_id", "kind", "is_default", "name", "company", "address_line1", "address_line2", "postal_code", "city", "country", "phone")
+  SELECT c."id", 'billing', true, c."name", c."company_name", c."address_line1", c."address_line2",
+         c."postal_code", c."city", coalesce(c."country", 'DE'), c."phone"
+  FROM ${q}."customers" c
+  WHERE (c."address_line1" IS NOT NULL AND c."address_line1" <> '')
+    AND NOT EXISTS (SELECT 1 FROM ${q}."customer_addresses" a WHERE a."customer_id" = c."id");
 `;
 }

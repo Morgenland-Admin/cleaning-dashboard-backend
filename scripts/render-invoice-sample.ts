@@ -18,6 +18,8 @@
  *     --long         30 line items → exercises pagination + "Seite n von m"
  *     --paid         paymentMethod 'card' → paid variant, no due date
  *     --no-tax       §19 UStG Kleinunternehmer variant
+ *     --handwerker   §35a EStG labour-share block above the closing line
+ *     --notes        free-text remark under the payment terms
  */
 import { writeFileSync } from 'node:fs';
 
@@ -86,8 +88,16 @@ const invoice: InvoiceForEmail = {
   subtotalCents,
   totalCents: subtotalCents + taxCents,
   lineItems,
-  notes: null,
+  notes: flag('--notes')
+    ? 'Die Randfixierung im Flur wurde nach Rücksprache nicht ausgeführt und ist nicht berechnet.'
+    : null,
   paymentMethod: paid ? 'card' : 'transfer',
+  // §35a: labour share of a real invoice is entered by the operator; 60 % of the
+  // gross here is a plausible stand-in for the test print.
+  craftsmanService: flag('--handwerker'),
+  laborGrossCents: Math.round((subtotalCents + taxCents) * 0.6),
+  laborVatCents: null,
+  craftsmanNote: null,
 };
 
 /**

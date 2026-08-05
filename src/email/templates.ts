@@ -4,6 +4,7 @@
  * a `brand` parameter for naming and accent color; system templates are
  * unbranded "Reinigungs-Portal" mail.
  */
+import { INVOICE_THANK_YOU } from '../lib/invoice-text.js';
 
 export interface BrandInfo {
   /** Human-readable brand name shown in the email header + signature. */
@@ -767,6 +768,8 @@ export function invoiceEmail(opts: {
   taxFormatted: string | null;
   taxRateLabel: string | null;
   totalFormatted: string;
+  /** §35a EStG block — mirrors the PDF, printed above the closing line. */
+  craftsmanNote?: string | null;
   notes?: string | null;
   seller: {
     name: string;
@@ -836,6 +839,11 @@ export function invoiceEmail(opts: {
       ? `Bitte überweisen Sie den Gesamtbetrag bis zum <strong>${escapeHtml(opts.dueDateFormatted)}</strong> (Zahlungsziel ${opts.paymentTermsDays} Tage)${toAccount}.`
       : `Bitte überweisen Sie den Gesamtbetrag innerhalb von <strong>${opts.paymentTermsDays} Tagen</strong>${toAccount}.`;
 
+  // §35a EStG: same wording as the attached PDF (frozen on the invoice row).
+  const craftsmanHtml = opts.craftsmanNote
+    ? `<p style="margin:16px 0 0;font-size:14px;">${escapeHtml(opts.craftsmanNote)}</p>`
+    : '';
+
   const notesHtml = opts.notes
     ? `<p style="margin:16px 0 0;font-size:13px;color:#6b5b48;">${nl2br(opts.notes)}</p>`
     : '';
@@ -903,7 +911,9 @@ export function invoiceEmail(opts: {
 
         <p style="margin:16px 0 0;font-size:14px;">${paymentLine}</p>
         ${bankHtml}
+        ${craftsmanHtml}
         ${notesHtml}
+        <p style="margin:16px 0 0;font-size:14px;">${escapeHtml(INVOICE_THANK_YOU)}</p>
 
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e2d3b6;">
           <tr>

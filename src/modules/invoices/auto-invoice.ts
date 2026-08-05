@@ -131,12 +131,20 @@ export async function autoCreateInvoiceForPaidOrder(
 
   // Inherit the customer's preferred payment term (e.g. a B2B firm on net-14),
   // falling back to the 7-day column default when they have none.
+  // The company / USt-IdNr. of a business customer rides along so the automatic
+  // invoice is addressed to the firm, not just the person who booked.
   const [cust] = await db
-    .select({ d: customers.defaultPaymentTermsDays })
+    .select({
+      d: customers.defaultPaymentTermsDays,
+      customerType: customers.customerType,
+      companyName: customers.companyName,
+      vatId: customers.vatId,
+    })
     .from(customers)
     .where(eq(customers.email, order.customerEmail.toLowerCase()))
     .limit(1);
   const paymentTermsDays = cust?.d ?? 7;
+  const isBusiness = cust?.customerType === 'business';
 
   // Draft carries no number — assigned from the gapless sequence at issue.
   // The partial unique index on order_id is the real idempotency guard: if a
@@ -148,8 +156,10 @@ export async function autoCreateInvoiceForPaidOrder(
         .insert(invoices)
         .values({
           orderId: order.id,
-          customerType: 'b2c',
+          customerType: isBusiness ? 'b2b' : 'b2c',
           recipientName: order.customerName,
+          recipientCompany: isBusiness ? cust?.companyName : null,
+          recipientVatId: isBusiness ? cust?.vatId : null,
           recipientEmail: order.customerEmail,
           recipientAddressLine1: order.addressLine1,
           recipientAddressLine2: order.addressLine2,

@@ -5,9 +5,15 @@ import { z } from 'zod';
 import { db } from '../../db/index.js';
 import { company } from '../../db/schema/shared.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
-import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
 import { sendDunningEmail } from '../../lib/dunning.js';
 import { fetchInvoiceLogo, renderInvoicePdf } from '../../lib/invoice-pdf.js';
+import {
+  CRAFTSMAN_DEFAULT_VAT_RATE,
+  craftsmanNoteText,
+  craftsmanVatFromGross,
+} from '../../lib/invoice-text.js';
+import { formatEurFromCents } from '../../lib/pricing.js';
 import { buildInvoicePdfData, invoicePdfFilename, sendInvoiceEmail } from './send-invoice.js';
 import { nextInvoiceNumber } from './number.js';
 
@@ -23,7 +29,25 @@ const lineItemSchema = z.object({
 
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 
+/**
+ * §35a EStG (Handwerkerleistung). The operator ticks the box and enters the
+ * gross labour share; the VAT inside it defaults to the invoice's rate and can
+ * be overridden. Both are money in cents, like every other amount here.
+ */
+const craftsmanFields = {
+  craftsmanService: z.boolean().optional(),
+  laborGrossCents: z.number().int().min(0).max(100_000_000).nullable().optional(),
+  /** Omit (or null) to derive it from the gross share. */
+  laborVatCents: z.number().int().min(0).max(100_000_000).nullable().optional(),
+  /** Hand-edited wording; omit to compose it, null to reset to the composed one. */
+  craftsmanNote: z.string().max(1000).nullable().optional(),
+};
+
 const recipientAddressFields = {
+  /** B2B: company line above the recipient name in the address field. */
+  recipientCompany: z.string().max(200).nullable().optional(),
+  /** B2B: USt-IdNr. of the recipient, shown in the invoice info block. */
+  recipientVatId: z.string().max(32).nullable().optional(),
   recipientAddressLine1: z.string().max(200).nullable().optional(),
   recipientAddressLine2: z.string().max(200).nullable().optional(),
   recipientPostalCode: z.string().max(16).nullable().optional(),
@@ -50,6 +74,7 @@ const createSchema = z.object({
   /** How the invoice is settled — drives the payment text + bank block. */
   paymentMethod: z.enum(['transfer', 'card', 'cash']).default('transfer'),
   notes: z.string().max(2000).optional(),
+  ...craftsmanFields,
 });
 
 const draftUpdateSchema = z.object({
@@ -64,6 +89,7 @@ const draftUpdateSchema = z.object({
   paymentTermsDays: z.number().int().min(0).max(120).optional(),
   paymentMethod: z.enum(['transfer', 'card', 'cash']).optional(),
   notes: z.string().max(2000).nullable().optional(),
+  ...craftsmanFields,
   status: z.enum(['void']).optional(),
   odooInvoiceId: z.string().max(255).nullable().optional(),
 });
@@ -96,6 +122,99 @@ const listQuerySchema = z.object({
 
 function computeTaxCents(subtotalCents: number, taxRatePercent: number): number {
   return Math.round((subtotalCents * taxRatePercent) / 100);
+}
+
+interface CraftsmanInput {
+  craftsmanService?: boolean | undefined;
+  laborGrossCents?: number | null | undefined;
+  laborVatCents?: number | null | undefined;
+  craftsmanNote?: string | null | undefined;
+}
+
+interface CraftsmanState {
+  craftsmanService: boolean;
+  laborGrossCents: number | null;
+  laborVatCents: number | null;
+  craftsmanNote: string | null;
+}
+
+/**
+ * Resolve the §35a EStG columns for a create/update, including the sentence
+ * that gets printed. The text is stored — not only rendered from a template —
+ * so a reissued PDF reproduces exactly what the customer received.
+ *
+ * The VAT share defaults to the portion contained in the gross labour amount at
+ * the invoice's own rate (19 % → 200,00 € contains 31,93 €) and is overridable,
+ * because a mixed invoice can carry a labour share taxed differently from the
+ * document as a whole. Throws a 400 when the box is ticked without a usable
+ * amount — a §35a block with a missing or impossible figure is worse than none.
+ *
+ * `craftsmanNote` may be sent to print a hand-edited wording (the dashboard
+ * always sends what it displayed, so the operator gets WYSIWYG). Omitted, the
+ * sentence is composed; sent as null, it resets to the composed one. A stored
+ * custom wording survives unrelated PATCHes but is regenerated when the amounts
+ * change, so the text can never quote a figure the invoice no longer carries.
+ */
+function resolveCraftsman(
+  body: CraftsmanInput,
+  current: CraftsmanState | null,
+  totalCents: number,
+  taxRatePercent: number,
+): {
+  craftsmanService: boolean;
+  laborGrossCents: number | null;
+  laborVatCents: number | null;
+  craftsmanNote: string | null;
+} {
+  const enabled = body.craftsmanService ?? current?.craftsmanService ?? false;
+  if (!enabled) {
+    return {
+      craftsmanService: false,
+      laborGrossCents: null,
+      laborVatCents: null,
+      craftsmanNote: null,
+    };
+  }
+
+  const gross = body.laborGrossCents ?? current?.laborGrossCents ?? null;
+  if (gross == null || gross <= 0) {
+    throw badRequest(
+      'Handwerkerleistung (§35a EStG): Bitte den Brutto-Arbeitskostenanteil angeben.',
+    );
+  }
+  if (gross > totalCents) {
+    throw badRequest(
+      `Handwerkerleistung (§35a EStG): Der Arbeitskostenanteil (${formatEurFromCents(gross)}) ` +
+        `darf den Rechnungsbetrag (${formatEurFromCents(totalCents)}) nicht übersteigen.`,
+    );
+  }
+
+  // Explicit override wins. Otherwise recompute whenever the gross share was
+  // part of this request, so an edited amount never keeps a stale VAT figure.
+  const autoVat = craftsmanVatFromGross(
+    gross,
+    taxRatePercent > 0 ? taxRatePercent : CRAFTSMAN_DEFAULT_VAT_RATE,
+  );
+  const vat =
+    body.laborVatCents ??
+    (body.laborGrossCents !== undefined ? autoVat : (current?.laborVatCents ?? autoVat));
+  if (vat > gross) {
+    throw badRequest(
+      'Handwerkerleistung (§35a EStG): Die enthaltene MwSt. kann nicht größer sein als der Arbeitskostenanteil.',
+    );
+  }
+
+  const custom = typeof body.craftsmanNote === 'string' ? body.craftsmanNote.trim() : '';
+  const amountsChanged = body.laborGrossCents !== undefined || body.laborVatCents !== undefined;
+  const keepStored =
+    body.craftsmanNote === undefined && !amountsChanged ? (current?.craftsmanNote ?? null) : null;
+
+  return {
+    craftsmanService: true,
+    laborGrossCents: gross,
+    laborVatCents: vat,
+    craftsmanNote: custom || keepStored || craftsmanNoteText(gross, vat),
+  };
 }
 
 /** §14 UStG mandatory recipient address fields, checked before a draft is issued. */
@@ -236,16 +355,33 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const taxCents = computeTaxCents(subtotalCents, body.taxRatePercent);
     const totalCents = subtotalCents + taxCents;
     // Payment term: explicit value wins; else the recipient customer's default; else 7.
+    // The same lookup fills the B2B company / USt-IdNr. when the caller left them
+    // out, so an invoice to a business customer is never addressed person-only.
     let paymentTermsDays = body.paymentTermsDays;
-    if (paymentTermsDays == null && body.recipientEmail) {
+    let recipientCompany = body.recipientCompany;
+    let recipientVatId = body.recipientVatId;
+    if (
+      body.recipientEmail &&
+      (paymentTermsDays == null || recipientCompany == null || recipientVatId == null)
+    ) {
       const [cust] = await db
-        .select({ d: customers.defaultPaymentTermsDays })
+        .select({
+          d: customers.defaultPaymentTermsDays,
+          customerType: customers.customerType,
+          companyName: customers.companyName,
+          vatId: customers.vatId,
+        })
         .from(customers)
         .where(eq(customers.email, body.recipientEmail.toLowerCase()))
         .limit(1);
-      if (cust?.d != null) paymentTermsDays = cust.d;
+      if (paymentTermsDays == null && cust?.d != null) paymentTermsDays = cust.d;
+      if (cust?.customerType === 'business') {
+        recipientCompany ??= cust.companyName;
+        recipientVatId ??= cust.vatId;
+      }
     }
     paymentTermsDays ??= 7;
+    const craftsman = resolveCraftsman(body, null, totalCents, body.taxRatePercent);
     const invoice = await db.transaction(async (tx) => {
       // Drafts carry no number — it's assigned from the gapless sequence at issue.
       const [row] = await tx
@@ -255,6 +391,8 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           partnerId: body.partnerId,
           customerType: body.customerType,
           recipientName: body.recipientName,
+          recipientCompany,
+          recipientVatId,
           recipientEmail: body.recipientEmail,
           recipientAddressLine1: body.recipientAddressLine1,
           recipientAddressLine2: body.recipientAddressLine2,
@@ -272,6 +410,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           paymentTermsDays,
           paymentMethod: body.paymentMethod,
           notes: body.notes,
+          ...craftsman,
           status: 'draft',
         })
         .returning();
@@ -322,6 +461,21 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       set.subtotalCents = subtotalCents;
       set.taxCents = taxCents;
       set.totalCents = subtotalCents + taxCents;
+    }
+    if (isDraft) {
+      // Recomputed on every draft write: line-item edits change the total the
+      // labour share is checked against, and the stored §35a sentence has to
+      // follow the amounts it quotes.
+      const draftBody = body as z.infer<typeof draftUpdateSchema>;
+      Object.assign(
+        set,
+        resolveCraftsman(
+          draftBody,
+          current,
+          (set.totalCents as number | undefined) ?? current.totalCents,
+          draftBody.taxRatePercent ?? current.taxRatePercent,
+        ),
+      );
     }
 
     const [row] = await db

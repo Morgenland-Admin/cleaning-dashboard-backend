@@ -1,8 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, desc, eq, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, lt, ne, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
+import type { TenantTables } from '../../db/schema/tenant.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { conflict, notFound, parseIntId } from '../../lib/http-errors.js';
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
@@ -16,37 +17,147 @@ const listQuerySchema = z.object({
 
 const tagsSchema = z.array(z.string().trim().min(1).max(64)).max(50);
 
-const updateSchema = z.object({
-  email: z.string().email().max(254).optional(),
-  name: z.string().max(200).nullable().optional(),
-  phone: z.string().max(32).nullable().optional(),
-  addressLine1: z.string().max(200).nullable().optional(),
-  addressLine2: z.string().max(200).nullable().optional(),
-  postalCode: z.string().max(16).nullable().optional(),
-  city: z.string().max(120).nullable().optional(),
-  country: z.string().length(2).nullable().optional(),
+/**
+ * Optional text field: trims, and treats an empty string as "cleared" (null) so
+ * the form can blank a field without sending an explicit null.
+ */
+const optText = (max: number) =>
+  z
+    .string()
+    .max(max)
+    .transform((s) => {
+      const trimmed = s.trim();
+      return trimmed === '' ? null : trimmed;
+    })
+    .nullable()
+    .optional();
+
+const optCountry = z
+  .string()
+  .max(2)
+  .transform((s) => {
+    const trimmed = s.trim().toUpperCase();
+    return trimmed === '' ? null : trimmed;
+  })
+  .nullable()
+  .optional()
+  .refine((v) => v == null || v.length === 2, {
+    message: 'country must be a 2-letter ISO code',
+  });
+
+const optDate = z
+  .string()
+  .max(10)
+  .transform((s) => {
+    const trimmed = s.trim();
+    return trimmed === '' ? null : trimmed;
+  })
+  .nullable()
+  .optional()
+  .refine((v) => v == null || /^\d{4}-\d{2}-\d{2}$/.test(v), {
+    message: 'date must be YYYY-MM-DD',
+  });
+
+/** Person, company and billing fields shared by create and update. */
+const profileShape = {
+  name: optText(200),
+  phone: optText(32),
+  customerType: z.enum(['private', 'business']).optional(),
+  salutation: z.enum(['herr', 'frau', 'divers', 'firma']).nullable().optional(),
+  firstName: optText(120),
+  lastName: optText(120),
+  dateOfBirth: optDate,
+  language: z.enum(['de', 'en']).nullable().optional(),
+  preferredChannel: z.enum(['email', 'phone', 'whatsapp', 'post']).nullable().optional(),
+  companyName: optText(200),
+  vatId: optText(32),
+  taxNumber: optText(32),
+  customerNumber: optText(32),
+  externalNumber: optText(64),
+  jobPosition: optText(120),
+  department: optText(120),
+  website: optText(300),
+  addressLine1: optText(200),
+  addressLine2: optText(200),
+  postalCode: optText(16),
+  city: optText(120),
+  country: optCountry,
   loyaltyTier: z.enum(['neukunde', 'stammkunde', 'premium']).optional(),
   tags: tagsSchema.optional(),
-  internalNotes: z.string().max(5000).nullable().optional(),
+  internalNotes: optText(5000),
   marketingOptIn: z.boolean().optional(),
   defaultPaymentTermsDays: z.number().int().min(0).max(120).nullable().optional(),
+} as const;
+
+const updateSchema = z.object({
+  email: z.string().email().max(254).optional(),
+  ...profileShape,
 });
 
 const createSchema = z.object({
   email: z.string().email().max(254),
-  name: z.string().trim().max(200).optional(),
-  phone: z.string().trim().max(32).optional(),
-  addressLine1: z.string().trim().max(200).optional(),
-  addressLine2: z.string().trim().max(200).optional(),
-  postalCode: z.string().trim().max(16).optional(),
-  city: z.string().trim().max(120).optional(),
-  country: z.string().trim().length(2).optional(),
+  ...profileShape,
   loyaltyTier: z.enum(['neukunde', 'stammkunde', 'premium']).default('neukunde'),
   tags: tagsSchema.default([]),
-  internalNotes: z.string().trim().max(5000).optional(),
   marketingOptIn: z.boolean().default(false),
-  defaultPaymentTermsDays: z.number().int().min(0).max(120).nullable().optional(),
 });
+
+const addressSchema = z.object({
+  kind: z.enum(['billing', 'service', 'shipping']).default('billing'),
+  isDefault: z.boolean().default(false),
+  label: optText(120),
+  name: optText(200),
+  company: optText(200),
+  addressLine1: optText(200),
+  addressLine2: optText(200),
+  postalCode: optText(16),
+  city: optText(120),
+  country: optCountry,
+  phone: optText(32),
+  notes: optText(2000),
+});
+
+const addressUpdateSchema = addressSchema.partial();
+
+/** Fields of a customer that are mirrored onto its default address row. */
+const ADDRESS_MIRROR_KEYS = [
+  'addressLine1',
+  'addressLine2',
+  'postalCode',
+  'city',
+  'country',
+] as const;
+
+/**
+ * Display name of a contact. An explicitly supplied name always wins; otherwise
+ * it is derived from the person fields, falling back to the company — so a
+ * business contact without a named person still shows up as the company.
+ */
+function deriveName(input: {
+  name?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  companyName?: string | null;
+}): string | null {
+  const explicit = input.name?.trim();
+  if (explicit) return explicit;
+  const person = [input.firstName, input.lastName]
+    .map((s) => s?.trim())
+    .filter(Boolean)
+    .join(' ');
+  return person || input.companyName?.trim() || null;
+}
+
+/** Drop keys the request did not send so a PATCH never nulls untouched columns. */
+function stripUndefined<T extends Record<string, unknown>>(obj: T): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+}
+
+/** True for a Postgres unique-violation on the customer_number index. */
+function isCustomerNumberClash(err: unknown): boolean {
+  const e = err as { code?: string; constraint?: string } | null;
+  return e?.code === '23505' && (e.constraint ?? '').includes('customer_number');
+}
 
 const importSchema = z.object({
   csv: z
@@ -56,6 +167,91 @@ const importSchema = z.object({
   dryRun: z.boolean().default(false),
   marketingOptIn: z.boolean().default(false),
 });
+
+/** Postal fields shared by a customer row and one of its address rows. */
+interface PostalFields {
+  addressLine1: string | null;
+  addressLine2: string | null;
+  postalCode: string | null;
+  city: string | null;
+  country: string | null;
+}
+
+type CustomerAddressesTable = TenantTables['customerAddresses'];
+type CustomersTable = TenantTables['customers'];
+
+/** Default address first, then oldest to newest. */
+function listAddresses(table: CustomerAddressesTable, customerId: number) {
+  return db
+    .select()
+    .from(table)
+    .where(eq(table.customerId, customerId))
+    .orderBy(desc(table.isDefault), asc(table.id));
+}
+
+/** Copy a default address onto the flat customers.address_* mirror columns. */
+async function mirrorAddressToCustomer(
+  customers: CustomersTable,
+  customerId: number,
+  addr: PostalFields,
+) {
+  await db
+    .update(customers)
+    .set({
+      addressLine1: addr.addressLine1,
+      addressLine2: addr.addressLine2,
+      postalCode: addr.postalCode,
+      city: addr.city,
+      country: addr.country ?? 'DE',
+      updatedAt: new Date(),
+    })
+    .where(eq(customers.id, customerId));
+}
+
+/**
+ * Push the address edited on the customer form into the default address row —
+ * updating it when one exists, otherwise creating it. Keeps the Addresses tab
+ * and the customer form from disagreeing about the primary address.
+ */
+async function upsertDefaultAddress(
+  table: CustomerAddressesTable,
+  customer: PostalFields & {
+    id: number;
+    name: string | null;
+    companyName: string | null;
+    phone: string | null;
+  },
+) {
+  const postal = {
+    addressLine1: customer.addressLine1,
+    addressLine2: customer.addressLine2,
+    postalCode: customer.postalCode,
+    city: customer.city,
+    country: customer.country ?? 'DE',
+  };
+  const [current] = await db
+    .select({ id: table.id })
+    .from(table)
+    .where(and(eq(table.customerId, customer.id), eq(table.isDefault, true)))
+    .limit(1);
+  if (current) {
+    await db
+      .update(table)
+      .set({ ...postal, updatedAt: new Date() })
+      .where(eq(table.id, current.id));
+    return;
+  }
+  if (!postal.addressLine1 && !postal.postalCode && !postal.city) return;
+  await db.insert(table).values({
+    ...postal,
+    customerId: customer.id,
+    kind: 'billing',
+    isDefault: true,
+    name: customer.name,
+    company: customer.companyName,
+    phone: customer.phone,
+  });
+}
 
 export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
@@ -96,29 +292,44 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/', async (request, reply) => {
     const body = createSchema.parse(request.body);
-    const { customers } = request.company!.tables;
-    const [row] = await db
-      .insert(customers)
-      .values({
-        email: body.email.toLowerCase(),
-        name: body.name ?? null,
-        phone: body.phone ?? null,
-        addressLine1: body.addressLine1 ?? null,
-        addressLine2: body.addressLine2 ?? null,
-        postalCode: body.postalCode ?? null,
-        city: body.city ?? null,
-        country: body.country ?? null,
-        loyaltyTier: body.loyaltyTier,
-        tags: body.tags,
-        internalNotes: body.internalNotes ?? null,
-        marketingOptIn: body.marketingOptIn,
-        defaultPaymentTermsDays: body.defaultPaymentTermsDays ?? null,
-      })
-      .onConflictDoNothing({ target: customers.email })
-      .returning();
+    const { customers, customerAddresses } = request.company!.tables;
+    const { email, ...profile } = body;
+
+    let row;
+    try {
+      [row] = await db
+        .insert(customers)
+        .values({
+          ...stripUndefined(profile),
+          email: email.toLowerCase(),
+          name: deriveName(body),
+        })
+        .onConflictDoNothing({ target: customers.email })
+        .returning();
+    } catch (err) {
+      if (isCustomerNumberClash(err)) throw conflict('This customer number is already in use');
+      throw err;
+    }
     if (!row) {
       reply.code(409).send({ error: 'A customer with this email already exists' });
       return;
+    }
+    // A street on the form means the operator entered an address — keep it as the
+    // customer's default address row so the Addresses tab is never empty.
+    if (row.addressLine1) {
+      await db.insert(customerAddresses).values({
+        customerId: row.id,
+        kind: 'billing',
+        isDefault: true,
+        name: row.name,
+        company: row.companyName,
+        addressLine1: row.addressLine1,
+        addressLine2: row.addressLine2,
+        postalCode: row.postalCode,
+        city: row.city,
+        country: row.country ?? 'DE',
+        phone: row.phone,
+      });
     }
     reply.code(201).send({ customer: row });
   });
@@ -202,14 +413,21 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
   // predates the backfill). Lists are capped — this is a profile, not an export.
   app.get('/:id/overview', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const { customers, orders, serviceInquiries, contactMessages, newsletterSubscribers } =
-      request.company!.tables;
+    const {
+      customers,
+      customerAddresses,
+      orders,
+      serviceInquiries,
+      contactMessages,
+      newsletterSubscribers,
+    } = request.company!.tables;
 
     const [customer] = await db.select().from(customers).where(eq(customers.id, id)).limit(1);
     if (!customer) throw notFound('Customer not found');
     const email = customer.email.toLowerCase();
 
-    const [orderRows, inquiryRows, contactRows, newsletterRow] = await Promise.all([
+    const [addressRows, orderRows, inquiryRows, contactRows, newsletterRow] = await Promise.all([
+      listAddresses(customerAddresses, id),
       db
         .select()
         .from(orders)
@@ -268,6 +486,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     return {
       customer,
+      addresses: addressRows,
       orders: orderRows,
       inquiries: inquiryRows,
       contacts: contactRows,
@@ -279,8 +498,12 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.patch('/:id', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const body = updateSchema.parse(request.body);
-    const { customers } = request.company!.tables;
-    const patch: Record<string, unknown> = { ...body, updatedAt: new Date() };
+    const { customers, customerAddresses } = request.company!.tables;
+
+    const [existing] = await db.select().from(customers).where(eq(customers.id, id)).limit(1);
+    if (!existing) throw notFound('Customer not found');
+
+    const patch: Record<string, unknown> = { ...stripUndefined(body), updatedAt: new Date() };
     if (body.email !== undefined) {
       const email = body.email.trim().toLowerCase();
       const [clash] = await db
@@ -291,15 +514,174 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       if (clash) throw conflict('A customer with this email already exists');
       patch.email = email;
     }
-    const [row] = await db.update(customers).set(patch).where(eq(customers.id, id)).returning();
+    // Recompute the display name whenever a name part changes, so the lists and
+    // invoices never drift from the person/company fields.
+    if (
+      body.name !== undefined ||
+      body.firstName !== undefined ||
+      body.lastName !== undefined ||
+      body.companyName !== undefined
+    ) {
+      patch.name =
+        deriveName({
+          name: body.name ?? null,
+          firstName: body.firstName !== undefined ? body.firstName : existing.firstName,
+          lastName: body.lastName !== undefined ? body.lastName : existing.lastName,
+          companyName: body.companyName !== undefined ? body.companyName : existing.companyName,
+        }) ?? existing.name;
+    }
+
+    let row;
+    try {
+      [row] = await db.update(customers).set(patch).where(eq(customers.id, id)).returning();
+    } catch (err) {
+      if (isCustomerNumberClash(err)) throw conflict('This customer number is already in use');
+      throw err;
+    }
     if (!row) throw notFound('Customer not found');
+
+    if (ADDRESS_MIRROR_KEYS.some((key) => body[key] !== undefined)) {
+      await upsertDefaultAddress(customerAddresses, row);
+    }
     return { customer: row };
   });
 
   app.delete('/:id', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
-    const { customers } = request.company!.tables;
+    const { customers, customerAddresses } = request.company!.tables;
+    await db.delete(customerAddresses).where(eq(customerAddresses.customerId, id));
     await db.delete(customers).where(eq(customers.id, id));
+    reply.code(204).send();
+  });
+
+  // --- Addresses -------------------------------------------------------------
+  // An ERP contact keeps several addresses (invoice, pickup/service, shipping).
+  // One is the default; it is mirrored onto the flat customers.address_* columns
+  // that invoices, exports and emails read.
+
+  app.get('/:id/addresses', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { customers, customerAddresses } = request.company!.tables;
+    const [customer] = await db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(eq(customers.id, id))
+      .limit(1);
+    if (!customer) throw notFound('Customer not found');
+    return { addresses: await listAddresses(customerAddresses, id) };
+  });
+
+  app.post('/:id/addresses', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const body = addressSchema.parse(request.body);
+    const { customers, customerAddresses } = request.company!.tables;
+    const [customer] = await db.select().from(customers).where(eq(customers.id, id)).limit(1);
+    if (!customer) throw notFound('Customer not found');
+
+    const existing = await listAddresses(customerAddresses, id);
+    // The very first address is always the default — otherwise nothing would be.
+    const makeDefault = body.isDefault || existing.length === 0;
+
+    const [row] = await db.transaction(async (tx) => {
+      if (makeDefault) {
+        await tx
+          .update(customerAddresses)
+          .set({ isDefault: false, updatedAt: new Date() })
+          .where(eq(customerAddresses.customerId, id));
+      }
+      return tx
+        .insert(customerAddresses)
+        .values({ ...stripUndefined(body), customerId: id, isDefault: makeDefault })
+        .returning();
+    });
+    if (makeDefault && row) await mirrorAddressToCustomer(customers, id, row);
+    reply.code(201).send({ address: row });
+  });
+
+  app.patch('/:id/addresses/:addressId', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const addressId = parseIntId((request.params as { addressId: string }).addressId);
+    const body = addressUpdateSchema.parse(request.body);
+    const { customers, customerAddresses } = request.company!.tables;
+
+    const [current] = await db
+      .select()
+      .from(customerAddresses)
+      .where(and(eq(customerAddresses.id, addressId), eq(customerAddresses.customerId, id)))
+      .limit(1);
+    if (!current) throw notFound('Address not found');
+
+    const makeDefault = body.isDefault === true || current.isDefault;
+    const [row] = await db.transaction(async (tx) => {
+      if (body.isDefault === true && !current.isDefault) {
+        await tx
+          .update(customerAddresses)
+          .set({ isDefault: false, updatedAt: new Date() })
+          .where(eq(customerAddresses.customerId, id));
+      }
+      return (
+        tx
+          .update(customerAddresses)
+          // The default flag is only ever cleared by promoting another address.
+          .set({ ...stripUndefined(body), isDefault: makeDefault, updatedAt: new Date() })
+          .where(eq(customerAddresses.id, addressId))
+          .returning()
+      );
+    });
+    if (makeDefault && row) await mirrorAddressToCustomer(customers, id, row);
+    return { address: row };
+  });
+
+  app.post('/:id/addresses/:addressId/default', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const addressId = parseIntId((request.params as { addressId: string }).addressId);
+    const { customers, customerAddresses } = request.company!.tables;
+
+    const [current] = await db
+      .select()
+      .from(customerAddresses)
+      .where(and(eq(customerAddresses.id, addressId), eq(customerAddresses.customerId, id)))
+      .limit(1);
+    if (!current) throw notFound('Address not found');
+
+    await db.transaction(async (tx) => {
+      await tx
+        .update(customerAddresses)
+        .set({ isDefault: false, updatedAt: new Date() })
+        .where(eq(customerAddresses.customerId, id));
+      await tx
+        .update(customerAddresses)
+        .set({ isDefault: true, updatedAt: new Date() })
+        .where(eq(customerAddresses.id, addressId));
+    });
+    await mirrorAddressToCustomer(customers, id, current);
+    return { addresses: await listAddresses(customerAddresses, id) };
+  });
+
+  app.delete('/:id/addresses/:addressId', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const addressId = parseIntId((request.params as { addressId: string }).addressId);
+    const { customers, customerAddresses } = request.company!.tables;
+
+    const [current] = await db
+      .select()
+      .from(customerAddresses)
+      .where(and(eq(customerAddresses.id, addressId), eq(customerAddresses.customerId, id)))
+      .limit(1);
+    if (!current) throw notFound('Address not found');
+
+    await db.delete(customerAddresses).where(eq(customerAddresses.id, addressId));
+    if (current.isDefault) {
+      // Promote the oldest remaining address so a default always exists.
+      const [next] = await listAddresses(customerAddresses, id);
+      if (next) {
+        await db
+          .update(customerAddresses)
+          .set({ isDefault: true, updatedAt: new Date() })
+          .where(eq(customerAddresses.id, next.id));
+        await mirrorAddressToCustomer(customers, id, next);
+      }
+    }
     reply.code(204).send();
   });
 

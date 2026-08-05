@@ -1,4 +1,9 @@
 import type { company } from '../../db/schema/shared.js';
+import {
+  CRAFTSMAN_DEFAULT_VAT_RATE,
+  craftsmanNoteText,
+  craftsmanVatFromGross,
+} from '../../lib/invoice-text.js';
 import { formatEurFromCents } from '../../lib/pricing.js';
 import { fetchInvoiceLogo, renderInvoicePdf, type InvoicePdfData } from '../../lib/invoice-pdf.js';
 import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
@@ -10,6 +15,8 @@ export interface InvoiceForEmail {
   id: number;
   number: string | null;
   recipientName: string;
+  recipientCompany?: string | null;
+  recipientVatId?: string | null;
   recipientEmail: string | null;
   recipientAddressLine1: string | null;
   recipientAddressLine2: string | null;
@@ -34,6 +41,12 @@ export interface InvoiceForEmail {
   }>;
   notes: string | null;
   paymentMethod?: string | null;
+  /** §35a EStG: invoice covers a Handwerkerleistung. */
+  craftsmanService?: boolean | null;
+  laborGrossCents?: number | null;
+  laborVatCents?: number | null;
+  /** The §35a sentence as stored — falls back to composing it from the amounts. */
+  craftsmanNote?: string | null;
 }
 
 interface MinimalLogger {
@@ -99,6 +112,9 @@ export function buildInvoicePdfData(
     paymentTermsDays: invoice.paymentTermsDays,
     subject: invoice.subject,
     recipientName: invoice.recipientName,
+    // DIN 5008: the company line sits above the person in the address field.
+    recipientCompany: invoice.recipientCompany ?? null,
+    recipientVatId: invoice.recipientVatId ?? null,
     // Deliberately no recipient email in the address field — DIN lang window.
     recipientAddressLines,
     // Single date unless a genuinely different end date is set (never "X – X").
@@ -119,6 +135,19 @@ export function buildInvoicePdfData(
     tax: invoice.taxCents > 0 ? formatEurFromCents(invoice.taxCents) : null,
     taxRateLabel: taxRate > 0 ? `${taxRate} %` : null,
     total: formatEurFromCents(invoice.totalCents),
+    // Stored wording wins (GoBD: reissue must reproduce what was sent); the
+    // fallback only covers rows written before the sentence was persisted.
+    craftsmanNote: invoice.craftsmanService
+      ? (invoice.craftsmanNote ??
+        craftsmanNoteText(
+          invoice.laborGrossCents ?? 0,
+          invoice.laborVatCents ??
+            craftsmanVatFromGross(
+              invoice.laborGrossCents ?? 0,
+              invoice.taxRatePercent > 0 ? invoice.taxRatePercent : CRAFTSMAN_DEFAULT_VAT_RATE,
+            ),
+        ))
+      : null,
     notes: invoice.notes,
     paymentMethod: invoice.paymentMethod ?? 'transfer',
     accentColor: companyRow.primaryColor ?? '#bd5b3e',
@@ -205,6 +234,7 @@ export async function sendInvoiceEmail(
       taxFormatted: pdfData.tax,
       taxRateLabel: pdfData.taxRateLabel,
       totalFormatted: pdfData.total,
+      craftsmanNote: pdfData.craftsmanNote,
       notes: pdfData.notes,
       seller: pdfData.seller,
       bank: pdfData.bank,
