@@ -289,114 +289,103 @@ function bankTransferBlock(opts: {
 }
 
 /**
- * Shared branded sign-off for operator-sent / conversational mail (contact
- * reply, quote, order message). When the brand carries a rich `signature`
- * config it renders the full formal sign-off (closing, signatory, support
- * hours, contacts, HQ, tagline, secondary drop-off, review CTA). Otherwise it
- * falls back to a compact "<brand> + contact details" block. The operator's
- * own username is never shown — a configured signatory (e.g. "M. Amiri") is
- * used instead.
+ * Sign-off for a brand that has no `email_signature` configured yet, derived
+ * from its own public company fields. Exists so a newly created company still
+ * signs as itself — the dashboard operator's login name must never end up in
+ * customer-facing mail.
  */
-function signatureBlock(brand: BrandInfo, signedBy?: string | null): string {
-  const accent = brand.primaryColor ?? '#bd5b3e';
-  const sig = brand.signature;
-
-  if (sig) {
-    const parts: string[] = [];
-    parts.push(
-      `<div style="font-size:14px;color:#2d2419;">${escapeHtml(sig.signOff ?? 'Mit freundlichen Grüßen')}</div>`,
-    );
-    parts.push(
-      `<div style="margin-top:2px;font-size:15px;font-weight:700;color:#2d2419;">${escapeHtml(
-        sig.signatory ?? brand.name,
-      )}</div>`,
-    );
-
-    // Support hours + contact channels + HQ, one muted block.
-    const contact: string[] = [];
-    if (sig.supportLabel)
-      contact.push(
-        `<div style="font-weight:600;color:#2d2419;">${escapeHtml(sig.supportLabel)}</div>`,
-      );
-    for (const h of sig.supportHours ?? []) contact.push(`<div>${escapeHtml(h)}</div>`);
-    const chan: string[] = [];
-    if (sig.phone) chan.push(`Tel.: ${escapeHtml(sig.phone)}`);
-    if (sig.whatsapp) chan.push(`WhatsApp: ${escapeHtml(sig.whatsapp)}`);
-    if (sig.web) {
-      const href = sig.webUrl
-        ? sig.webUrl
-        : /@/.test(sig.web)
-          ? `mailto:${sig.web}`
-          : `https://${sig.web.replace(/^https?:\/\//i, '')}`;
-      chan.push(
-        `Web: <a href="${escapeHtml(href)}" style="color:${accent};text-decoration:none;">${escapeHtml(sig.web)}</a>`,
-      );
-    }
-    for (const c of chan) contact.push(`<div>${c}</div>`);
-    if (sig.hq) contact.push(`<div style="margin-top:8px;">${escapeHtml(sig.hq)}</div>`);
-    if (contact.length)
-      parts.push(
-        `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.7;">${contact.join('')}</div>`,
-      );
-
-    if (sig.tagline)
-      parts.push(
-        `<div style="margin-top:14px;font-size:13px;font-style:italic;color:${accent};">${escapeHtml(sig.tagline)}</div>`,
-      );
-    if (sig.slogan)
-      parts.push(
-        `<div style="margin-top:6px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#93826a;">${escapeHtml(sig.slogan)}</div>`,
-      );
-
-    const loc = sig.secondaryLocation;
-    if (loc && (loc.name || loc.lines?.length)) {
-      const locLines: string[] = [
-        `<div style="font-weight:600;color:#2d2419;">Weitere Annahmestelle</div>`,
-      ];
-      if (loc.name) locLines.push(`<div>${escapeHtml(loc.name)}</div>`);
-      for (const l of loc.lines ?? []) locLines.push(`<div>${escapeHtml(l)}</div>`);
-      if (loc.phone) locLines.push(`<div>Tel.: ${escapeHtml(loc.phone)}</div>`);
-      parts.push(
-        `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.6;">${locLines.join('')}</div>`,
-      );
-    }
-
-    if (sig.reviewUrl)
-      parts.push(
-        `<div style="margin-top:16px;"><a href="${escapeHtml(sig.reviewUrl)}" style="display:inline-block;font-size:13px;font-weight:600;color:${accent};text-decoration:none;">👉 ${escapeHtml(
-          sig.reviewLabel ?? 'Jetzt Bewertung abgeben',
-        )}</a></div>`,
-      );
-
-    return `<div style="margin:24px 0 0;padding-top:16px;border-top:1px solid #e2d3b6;">${parts.join('')}</div>`;
-  }
-
-  // Fallback: compact brand sign-off from the plain company fields.
-  const nameLine = signedBy
-    ? `${escapeHtml(signedBy)} · <span style="color:#6b5b48;">${escapeHtml(brand.name)}</span>`
-    : escapeHtml(brand.name);
-
-  const contactBits: string[] = [];
-  if (brand.phone) contactBits.push(`Tel. ${escapeHtml(brand.phone)}`);
-  if (brand.email) {
-    contactBits.push(
-      `<a href="mailto:${escapeHtml(brand.email)}" style="color:#6b5b48;text-decoration:none;">${escapeHtml(brand.email)}</a>`,
-    );
-  }
-  const contactLine = contactBits.length
-    ? `<div style="margin-top:3px;font-size:12px;color:#6b5b48;">${contactBits.join(' · ')}</div>`
-    : '';
-
+function derivedSignature(brand: BrandInfo): EmailSignature {
   const site = brand.websiteUrl || (brand.domain ? `https://${brand.domain}` : null);
-  const websiteLine = site
-    ? `<div style="margin-top:2px;font-size:12px;"><a href="${escapeHtml(site)}" style="color:${accent};text-decoration:none;">${escapeHtml(displayHost(site))}</a></div>`
-    : '';
+  const address = brand.addressLines?.length ? brand.addressLines.join(', ') : null;
+  return {
+    signOff: 'Mit freundlichen Grüßen',
+    signatory: `Ihr Team von ${brand.name}`,
+    phone: brand.phone ?? null,
+    web: site ? displayHost(site) : (brand.email ?? null),
+    webUrl: site,
+    hq: address ? `Zentrale: ${address}` : null,
+  };
+}
 
-  return `<div style="margin:24px 0 0;padding-top:14px;border-top:1px solid #e2d3b6;">
-    <div style="font-size:13px;font-weight:600;color:#2d2419;">${nameLine}</div>
-    ${contactLine}
-    ${websiteLine}
-  </div>`;
+/**
+ * Shared branded sign-off for operator-sent / conversational mail (contact
+ * reply, quote, order message). Renders the brand's configured `signature`
+ * (closing, signatory, support hours, contacts, HQ, tagline, secondary
+ * drop-off, review CTA); a brand without one gets the same block derived from
+ * its company fields. The operator who hit send is never named — the mail
+ * speaks for the brand, signed by its configured signatory (e.g. "M. Amiri").
+ */
+function signatureBlock(brand: BrandInfo): string {
+  const accent = brand.primaryColor ?? '#bd5b3e';
+  const sig = brand.signature ?? derivedSignature(brand);
+
+  const parts: string[] = [];
+  parts.push(
+    `<div style="font-size:14px;color:#2d2419;">${escapeHtml(sig.signOff ?? 'Mit freundlichen Grüßen')}</div>`,
+  );
+  parts.push(
+    `<div style="margin-top:2px;font-size:15px;font-weight:700;color:#2d2419;">${escapeHtml(
+      sig.signatory ?? brand.name,
+    )}</div>`,
+  );
+
+  // Support hours + contact channels + HQ, one muted block.
+  const contact: string[] = [];
+  if (sig.supportLabel)
+    contact.push(
+      `<div style="font-weight:600;color:#2d2419;">${escapeHtml(sig.supportLabel)}</div>`,
+    );
+  for (const h of sig.supportHours ?? []) contact.push(`<div>${escapeHtml(h)}</div>`);
+  const chan: string[] = [];
+  if (sig.phone) chan.push(`Tel.: ${escapeHtml(sig.phone)}`);
+  if (sig.whatsapp) chan.push(`WhatsApp: ${escapeHtml(sig.whatsapp)}`);
+  if (sig.web) {
+    const href = sig.webUrl
+      ? sig.webUrl
+      : /@/.test(sig.web)
+        ? `mailto:${sig.web}`
+        : `https://${sig.web.replace(/^https?:\/\//i, '')}`;
+    chan.push(
+      `Web: <a href="${escapeHtml(href)}" style="color:${accent};text-decoration:none;">${escapeHtml(sig.web)}</a>`,
+    );
+  }
+  for (const c of chan) contact.push(`<div>${c}</div>`);
+  if (sig.hq) contact.push(`<div style="margin-top:8px;">${escapeHtml(sig.hq)}</div>`);
+  if (contact.length)
+    parts.push(
+      `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.7;">${contact.join('')}</div>`,
+    );
+
+  if (sig.tagline)
+    parts.push(
+      `<div style="margin-top:14px;font-size:13px;font-style:italic;color:${accent};">${escapeHtml(sig.tagline)}</div>`,
+    );
+  if (sig.slogan)
+    parts.push(
+      `<div style="margin-top:6px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#93826a;">${escapeHtml(sig.slogan)}</div>`,
+    );
+
+  const loc = sig.secondaryLocation;
+  if (loc && (loc.name || loc.lines?.length)) {
+    const locLines: string[] = [
+      `<div style="font-weight:600;color:#2d2419;">Weitere Annahmestelle</div>`,
+    ];
+    if (loc.name) locLines.push(`<div>${escapeHtml(loc.name)}</div>`);
+    for (const l of loc.lines ?? []) locLines.push(`<div>${escapeHtml(l)}</div>`);
+    if (loc.phone) locLines.push(`<div>Tel.: ${escapeHtml(loc.phone)}</div>`);
+    parts.push(
+      `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.6;">${locLines.join('')}</div>`,
+    );
+  }
+
+  if (sig.reviewUrl)
+    parts.push(
+      `<div style="margin-top:16px;"><a href="${escapeHtml(sig.reviewUrl)}" style="display:inline-block;font-size:13px;font-weight:600;color:${accent};text-decoration:none;">👉 ${escapeHtml(
+        sig.reviewLabel ?? 'Jetzt Bewertung abgeben',
+      )}</a></div>`,
+    );
+
+  return `<div style="margin:24px 0 0;padding-top:16px;border-top:1px solid #e2d3b6;">${parts.join('')}</div>`;
 }
 
 export interface RenderedEmail {
@@ -600,13 +589,12 @@ export function inquiryQuoteEmail(opts: {
   quoteBody: string;
   /** Amount as already-formatted EUR string ("980,00 €"). */
   quotedAmount?: string | null;
-  signedBy?: string | null;
 }): RenderedEmail {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
   const amountLine = opts.quotedAmount
     ? `<p style="margin:8px 0 0;font-size:18px;font-weight:700;color:${accent};">${escapeHtml(opts.quotedAmount)}</p>`
     : '';
-  const signature = signatureBlock(opts.brand, opts.signedBy);
+  const signature = signatureBlock(opts.brand);
   return {
     subject: `Ihr Angebot von ${opts.brand.name}`,
     html: layout({
@@ -632,13 +620,11 @@ export function contactReplyEmail(opts: {
   originalMessage?: string | null;
   originalSubject?: string | null;
   brand: BrandInfo;
-  /** Admin name appended as a signature line. */
-  signedBy?: string | null;
 }): RenderedEmail {
   const subjectLine = opts.originalSubject
     ? `Re: ${opts.originalSubject}`
     : `Antwort von ${opts.brand.name}`;
-  const signature = signatureBlock(opts.brand, opts.signedBy);
+  const signature = signatureBlock(opts.brand);
 
   const quoted = opts.originalMessage
     ? `<div style="margin-top:28px;padding-top:16px;border-top:1px solid #e2d3b6;">
@@ -1301,12 +1287,10 @@ export function orderMessageEmail(opts: {
   orderNumber: string;
   /** Body the operator typed — plain text; newlines preserved as <br>. */
   messageBody: string;
-  /** Operator name appended as a signature line. */
-  signedBy?: string | null;
   /** Optional order-tracker link surfaced as a button. */
   trackerUrl?: string | null;
 }): RenderedEmail {
-  const signature = signatureBlock(opts.brand, opts.signedBy);
+  const signature = signatureBlock(opts.brand);
   const trackerButton = opts.trackerUrl
     ? button(opts.trackerUrl, 'Auftrag ansehen', opts.brand.primaryColor)
     : '';

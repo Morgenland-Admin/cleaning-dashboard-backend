@@ -2765,6 +2765,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       .from(user)
       .where(eq(user.id, adminId))
       .limit(1);
+    // Internal audit trail only — the mail itself signs as the brand.
     const sentByName = adminRow?.name ?? null;
 
     const [companyRow] = await db
@@ -2788,7 +2789,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         customerName: row.customerName,
         orderNumber: orderNumberOf(row),
         messageBody: body,
-        signedBy: sentByName,
         trackerUrl,
       }),
     });

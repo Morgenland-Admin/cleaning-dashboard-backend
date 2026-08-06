@@ -520,7 +520,8 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .from(user)
       .where(eq(user.id, adminId))
       .limit(1);
-    const signedBy = adminRow?.name ?? null;
+    // Internal audit trail only — the mail itself signs as the brand.
+    const sentByName = adminRow?.name ?? null;
 
     const [companyRow] = await db
       .select()
@@ -542,7 +543,6 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
         brand: brandInfoFromCompany(companyRow),
         quoteBody: parsed.body,
         quotedAmount: amountFormatted,
-        signedBy,
       });
       const result = await sendEmail({
         to: inquiry.email,
@@ -562,7 +562,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
         status: emailStatus,
         emailMessageId: result.id ?? null,
         sentByUserId: adminId,
-        sentByName: signedBy,
+        sentByName,
       });
     }
 

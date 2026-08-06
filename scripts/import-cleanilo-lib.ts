@@ -70,13 +70,27 @@ export interface ImportPlan {
   skipped: ParsedInvoice[];
   /** Collisions renumbered with a "-N" suffix (original → final). */
   renumbered: Array<{ from: string; to: string; name: string }>;
+  /** CRM name matches rejected as ambiguous — placeholder used instead. */
+  ambiguousMatches: Array<{ invoiceNumber: string; candidates: string[] }>;
+  /** B2B segments rejected because the CRM candidates contradicted each other
+   * and the recipient name is not a company/institution — treated as B2C. */
+  disputedB2B: Array<{ invoiceNumber: string; name: string; b2b: string[]; b2c: string[] }>;
 }
 
 export const CLEANILO_SLUG = 'cleanilo';
 export const IMPORT_SOURCE = 'import_cleanilo_2021_26';
 const PLACEHOLDER_DOMAIN = 'import.cleanilo.local';
 
-const B2B_SUFFIX_RE = /\b(gmbh|ag|ug|kg|ohg|gbr|mbh|e\.?\s?v\.?|se|kgaa|ltd|inc)\b/i;
+const B2B_SUFFIX_RE = /\b(gmbh|ggmbh|ag|ug|kg|ohg|gbr|mbh|e\.?\s?v\.?|se|kgaa|ltd|inc)\b/i;
+/** Institutions that are plainly not private households but carry no commercial
+ * legal form: public-law bodies, schools, day-care, clubs, foundations. */
+const B2B_INSTITUTION_RE =
+  /(k\.?\s?d\.?\s?[öÖ]\.?\s?r\.?|\bschule\b|\bschool\b|\bkita\b|\bkindergarten\b|\bverein\b|\bstiftung\b)/i;
+
+/** True when the invoice's own recipient name identifies a company or institution. */
+export function isBusinessName(name: string): boolean {
+  return B2B_SUFFIX_RE.test(name) || B2B_INSTITUTION_RE.test(name);
+}
 const NAME_TITLE_RE = /\b(familie|fam\.?|frau|herr|hr\.?|fa\.?|firma|herrn)\b/gi;
 
 export function eur(cents: number): string {
@@ -176,7 +190,7 @@ export function parseInvoices(jsonPath: string): ParsedInvoice[] {
       plz,
       city,
       country: 'DE',
-      isB2B: B2B_SUFFIX_RE.test(name),
+      isB2B: isBusinessName(name),
       verifiedEmail: null,
     };
   });
@@ -219,22 +233,72 @@ export function parseReconciliation(csvPath: string): CsvMatch[] {
   return out;
 }
 
-/** Attach verified emails + B2B flags from the reconciliation onto invoices. */
-export function applyMatches(invoices: ParsedInvoice[], matches: CsvMatch[]): void {
-  const verifiedByInvoice = new Map<string, string>();
-  const b2bByInvoice = new Set<string>();
+/**
+ * Attach verified emails + B2B flags from the reconciliation onto invoices.
+ *
+ * A name_exact + SICHER row only yields a real address when it is the *only*
+ * such candidate for that invoice. Where the CRM offers several equally-rated
+ * name matches (a bare surname like "Schmidt" can hit many people), the name
+ * alone does not identify the customer and this file carries no address to
+ * corroborate it — so the invoice keeps a placeholder rather than risking a
+ * stranger's address on a customer record. Rejections are reported.
+ *
+ * The segment column is treated the same way (Kabir, 08/2026). The CRM rows are
+ * *candidates*, and a weak one (shared first name, shared email token) usually
+ * belongs to somebody else — so a single "B2B" among contradicting candidates
+ * says nothing about the invoice's recipient. B2B from the CRM is therefore
+ * accepted only when no candidate for that invoice says B2C. A name that
+ * identifies a company or institution on its own (`isBusinessName`) is decided
+ * at parse time and never depends on the CRM at all. Rejections are reported.
+ */
+export function applyMatches(
+  invoices: ParsedInvoice[],
+  matches: CsvMatch[],
+): {
+  ambiguous: Array<{ invoiceNumber: string; candidates: string[] }>;
+  disputedB2B: Array<{ invoiceNumber: string; name: string; b2b: string[]; b2c: string[] }>;
+} {
+  const candidatesByInvoice = new Map<string, Set<string>>();
+  const b2bByInvoice = new Map<string, string[]>();
+  const b2cByInvoice = new Map<string, string[]>();
   for (const m of matches) {
-    if (/B2B/i.test(m.segment)) b2bByInvoice.add(m.invoiceNumber);
-    // Only the unambiguous name_exact + SICHER matches get a real address.
+    // Rows with neither marker are unmatched/shifted CSV lines — they carry no
+    // verdict and must not count as a contradiction.
+    const label = `${m.crmName || '(kein Name)'} <${m.crmEmail || '-'}> [${m.matchType}/${m.status}]`;
+    const bucket = /B2B/i.test(m.segment)
+      ? b2bByInvoice
+      : /B2C/i.test(m.segment)
+        ? b2cByInvoice
+        : null;
+    if (bucket) bucket.set(m.invoiceNumber, [...(bucket.get(m.invoiceNumber) ?? []), label]);
     if (m.matchType === 'name_exact' && m.status.toUpperCase() === 'SICHER' && m.crmEmail) {
-      verifiedByInvoice.set(m.invoiceNumber, m.crmEmail);
+      const set = candidatesByInvoice.get(m.invoiceNumber) ?? new Set<string>();
+      set.add(m.crmEmail);
+      candidatesByInvoice.set(m.invoiceNumber, set);
     }
   }
+  const ambiguous: Array<{ invoiceNumber: string; candidates: string[] }> = [];
+  const disputedB2B: Array<{
+    invoiceNumber: string;
+    name: string;
+    b2b: string[];
+    b2c: string[];
+  }> = [];
   for (const inv of invoices) {
-    const email = verifiedByInvoice.get(inv.invoiceNumber);
-    if (email) inv.verifiedEmail = email;
-    if (b2bByInvoice.has(inv.invoiceNumber)) inv.isB2B = true;
+    const candidates = candidatesByInvoice.get(inv.invoiceNumber);
+    if (candidates) {
+      if (candidates.size === 1) inv.verifiedEmail = [...candidates][0]!;
+      else ambiguous.push({ invoiceNumber: inv.invoiceNumber, candidates: [...candidates] });
+    }
+    const b2b = b2bByInvoice.get(inv.invoiceNumber);
+    if (!b2b) continue;
+    const b2c = b2cByInvoice.get(inv.invoiceNumber);
+    if (!b2c) inv.isB2B = true;
+    // Contradicted: the name alone decides, and it already did at parse time.
+    else if (!inv.isB2B)
+      disputedB2B.push({ invoiceNumber: inv.invoiceNumber, name: inv.name, b2b, b2c });
   }
+  return { ambiguous, disputedB2B };
 }
 
 /**
@@ -354,11 +418,14 @@ export function renumberCollisions(
 export function makePlan(jsonPath: string, csvPath: string): ImportPlan {
   const all = parseInvoices(jsonPath);
   // Match against the CRM by the original scanned number (the CSV uses those)…
-  applyMatches(all, parseReconciliation(csvPath));
+  const { ambiguous: ambiguousMatches, disputedB2B } = applyMatches(
+    all,
+    parseReconciliation(csvPath),
+  );
   // …then drop empty rows and make the reused numbers unique.
   const skipped = all.filter(isEmptyInvoice);
   const invoices = all.filter((i) => !isEmptyInvoice(i));
   const renumbered = renumberCollisions(invoices);
   const { customers, merges } = buildPlan(invoices);
-  return { invoices, customers, merges, skipped, renumbered };
+  return { invoices, customers, merges, skipped, renumbered, ambiguousMatches, disputedB2B };
 }

@@ -310,6 +310,7 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!adminRow) {
       request.log.warn({ adminId }, 'Admin user row missing during contact reply');
     }
+    // Internal audit trail only — the mail itself signs as the brand.
     const sentByName = adminRow?.name ?? null;
 
     const [companyRow] = await db
@@ -331,7 +332,6 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
           originalMessage: msg.message,
           originalSubject: msg.subject,
           brand: brandInfoFromCompany(companyRow),
-          signedBy: sentByName,
         }),
       });
       emailMessageId = result.id ?? (result.skipped ? 'skipped' : null);

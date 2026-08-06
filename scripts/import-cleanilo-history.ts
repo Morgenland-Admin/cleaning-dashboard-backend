@@ -20,7 +20,7 @@ import { eur, makePlan, type ImportPlan } from './import-cleanilo-lib.ts';
 type LoyaltyTier = 'neukunde' | 'stammkunde' | 'premium';
 
 function printReport(plan: ImportPlan): void {
-  const { invoices, customers, merges, skipped, renumbered } = plan;
+  const { invoices, customers, merges, skipped, renumbered, ambiguousMatches, disputedB2B } = plan;
   const grossTotal = invoices.reduce((s, i) => s + i.grossCents, 0);
   const skippedTotal = skipped.reduce((s, i) => s + i.grossCents, 0);
   const originalTotal = grossTotal + skippedTotal;
@@ -51,7 +51,19 @@ function printReport(plan: ImportPlan): void {
   L(`  Customers after merge         ${customers.length}`);
   L(`    with verified email         ${verifiedCount}`);
   L(`    with placeholder email      ${customers.length - verifiedCount}  (no-marketing)`);
+  L(
+    `  Ambiguous CRM matches         ${ambiguousMatches.length}  (several equally-rated name hits → placeholder, name alone does not verify)`,
+  );
+  for (const a of ambiguousMatches)
+    L(`    ${a.invoiceNumber}: ${a.candidates.length} candidate addresses — none accepted`);
   L(`  B2B customers (tag: b2b)      ${b2bCount}`);
+  L(
+    `  Disputed B2B segments         ${disputedB2B.length}  (CRM candidates contradict each other and the name is no company → B2C)`,
+  );
+  for (const d of disputedB2B)
+    L(
+      `    ${d.invoiceNumber} "${d.name}": ${d.b2b.length}× B2B vs ${d.b2c.length}× B2C — rejected`,
+    );
   L(
     `  Duplicate groups merged       ${merges.length}  (${variantMerges.length} across spelling variants)`,
   );

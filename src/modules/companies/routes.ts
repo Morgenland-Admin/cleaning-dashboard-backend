@@ -58,6 +58,9 @@ const companyPublicColumns = {
   bankAddress: company.bankAddress,
   logoUrl: company.logoUrl,
   primaryColor: company.primaryColor,
+  // Read-only here (seed-owned brand content, no PATCH field): the dashboard
+  // uses it to show the operator the sign-off their mail will actually carry.
+  emailSignature: company.emailSignature,
   senderEmail: company.senderEmail,
   senderName: company.senderName,
   storefrontOrigin: company.storefrontOrigin,

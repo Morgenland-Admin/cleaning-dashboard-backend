@@ -154,7 +154,10 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
       supportLabel: 'Supportzeiten',
       supportHours: ['Mo. – Fr.: 09:00 – 17:00 Uhr', 'Sa.: 11:00 – 17:00 Uhr'],
       phone: '+49 40 432 189 19',
-      web: 'info@hamburg-teppichreinigung.de',
+      // The line is labelled "Web:" — it must carry the site, not the mailbox
+      // (the contact address is already in the legal footer of every mail).
+      web: 'www.hamburg-teppichreinigung.de',
+      webUrl: 'https://hamburg-teppichreinigung.de',
       hq: 'Zentrale: Brook 9, 20457 Hamburg',
       tagline: 'Frische Teppiche, frisches Zuhause!',
       secondaryLocation: {
@@ -193,6 +196,17 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
     primaryColor: '#0f766e', // deep teal
     invoiceNumberPrefix: 'TR',
     invoiceNumberStart: 1426, // TODO(Kabir): confirm TRL's real starting number before first issue
+    emailSignature: {
+      signOff: 'Mit freundlichen Grüßen',
+      signatory: 'M. Amiri',
+      supportLabel: 'Supportzeiten',
+      supportHours: ['Mo. – Fr.: 09:00 – 17:00 Uhr', 'Sa.: 11:00 – 17:00 Uhr'],
+      // TODO(Kabir): TRL has no own phone number yet — add it here once the
+      // bundesweite Rufnummer is live, otherwise the sign-off stays web-only.
+      web: 'www.teppichreinigen-lassen.de',
+      webUrl: 'https://www.teppichreinigen-lassen.de',
+      hq: 'Zentrale: Brook 9, 20457 Hamburg',
+    },
     legal: {
       // Same GbR bank account, bare GbR name (no brand prefix) on TRL invoices.
       legalName: 'M. Kabir Madjidian & M. Amiri GbR',
