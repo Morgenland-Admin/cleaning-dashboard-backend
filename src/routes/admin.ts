@@ -23,6 +23,7 @@ import customersAdminRoutes from '../modules/customers/routes.js';
 import priceAdjustmentsAdminRoutes from '../modules/price-adjustments/routes.js';
 import { seoAdminRoutes } from '../modules/seo/routes.js';
 import { aiAdminRoutes } from '../modules/ai/routes.js';
+import searchRoutes from '../modules/search/routes.js';
 
 const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
@@ -52,6 +53,7 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
   await app.register(priceAdjustmentsAdminRoutes, { prefix: '/price-adjustments' });
   await app.register(seoAdminRoutes, { prefix: '/seo-pages' });
   await app.register(aiAdminRoutes, { prefix: '/ai' });
+  await app.register(searchRoutes, { prefix: '/search' });
 };
 
 export default adminRoutes;

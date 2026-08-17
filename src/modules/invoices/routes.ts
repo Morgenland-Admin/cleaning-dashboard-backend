@@ -45,6 +45,18 @@ const craftsmanFields = {
   craftsmanNote: z.string().max(1000).nullable().optional(),
 };
 
+/**
+ * Paketrechnung. The positions only describe the scope of work — no per-line
+ * Einzelpreis/Betrag is printed — and the agreed net package price is entered
+ * once, landing in `subtotal_cents`. `packageNetCents` is mandatory whenever the
+ * mode is switched on (0 is allowed so an undecided draft can still be parked;
+ * issuing a 0,00 € invoice is refused further down).
+ */
+const packageFields = {
+  packageMode: z.boolean().optional(),
+  packageNetCents: z.number().int().min(0).max(100_000_000).optional(),
+};
+
 const recipientAddressFields = {
   /** B2B: company line above the recipient name in the address field. */
   recipientCompany: z.string().max(200).nullable().optional(),
@@ -69,6 +81,7 @@ const createSchema = z.object({
   serviceDate: dateStr.nullable().optional(),
   serviceDateEnd: dateStr.nullable().optional(),
   lineItems: z.array(lineItemSchema).min(1).max(100),
+  ...packageFields,
   /** VAT rate; taxCents is computed server-side. */
   taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).default(19),
   /** Omit to inherit the recipient customer's default term (falls back to 7). */
@@ -87,6 +100,7 @@ const draftUpdateSchema = z.object({
   serviceDate: dateStr.nullable().optional(),
   serviceDateEnd: dateStr.nullable().optional(),
   lineItems: z.array(lineItemSchema).min(1).max(100).optional(),
+  ...packageFields,
   taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).optional(),
   paymentTermsDays: z.number().int().min(0).max(120).optional(),
   paymentMethod: z.enum(['transfer', 'card', 'cash']).optional(),
@@ -124,6 +138,47 @@ const listQuerySchema = z.object({
 
 function computeTaxCents(subtotalCents: number, taxRatePercent: number): number {
   return Math.round((subtotalCents * taxRatePercent) / 100);
+}
+
+/**
+ * The three money columns. A normal invoice sums its positions; a Paketrechnung
+ * ignores the line prices entirely and takes the single agreed net package price
+ * as the subtotal, because its positions are pure scope-of-work text.
+ */
+function computeMoney(
+  lineItems: Array<{ quantity: number; unitPriceCents: number }>,
+  taxRatePercent: number,
+  packageMode: boolean,
+  packageNetCents: number,
+): { subtotalCents: number; taxCents: number; totalCents: number } {
+  const subtotalCents = packageMode
+    ? packageNetCents
+    : lineItems.reduce((a, l) => a + Math.round(l.quantity * l.unitPriceCents), 0);
+  const taxCents = computeTaxCents(subtotalCents, taxRatePercent);
+  return { subtotalCents, taxCents, totalCents: subtotalCents + taxCents };
+}
+
+/**
+ * Strip prices off the positions of a Paketrechnung before they are stored, so
+ * no later render (PDF, email, dashboard) can surface a figure the document
+ * deliberately doesn't show.
+ */
+function normalizeLineItems<T extends { unitPriceCents: number }>(
+  lineItems: T[],
+  packageMode: boolean,
+): T[] {
+  return packageMode ? lineItems.map((l) => ({ ...l, unitPriceCents: 0 })) : lineItems;
+}
+
+/**
+ * Guard against freezing a document that bills nothing — the failure mode a
+ * package invoice makes easy, since its positions carry no prices to notice are
+ * missing. Credit notes (negative totals) stay allowed.
+ */
+function zeroTotalError(totalCents: number): string | null {
+  return totalCents === 0
+    ? 'Der Rechnungsbetrag ist 0,00 €. Bitte tragen Sie den Preis ein, bevor die Rechnung ausgestellt wird.'
+    : null;
 }
 
 interface CraftsmanInput {
@@ -234,7 +289,9 @@ function missingIssueFields(current: {
 
 export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  app.addHook('preHandler', app.requireAccess('super_admin', 'admin', 'manager'));
+  // Writes (issue, send, credit) need manager+; reads stay open to any member,
+  // so a `viewer` can answer "was this paid?" without being able to change it.
+  app.addHook('preHandler', app.requireWriteAccess);
 
   /**
    * Shared draft → issued transition (GoBD): assigns the gapless per-brand
@@ -350,12 +407,17 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const body = createSchema.parse(request.body);
     const { invoices, invoiceStatusLog, customers } = request.company!.tables;
     const adminId = request.authUser!.id;
-    const subtotalCents = body.lineItems.reduce(
-      (a, l) => a + Math.round(l.quantity * l.unitPriceCents),
-      0,
+    const packageMode = body.packageMode ?? false;
+    if (packageMode && body.packageNetCents == null) {
+      throw badRequest('Paketrechnung: Bitte den Paketpreis (netto) angeben.');
+    }
+    const lineItems = normalizeLineItems(body.lineItems, packageMode);
+    const { subtotalCents, taxCents, totalCents } = computeMoney(
+      lineItems,
+      body.taxRatePercent,
+      packageMode,
+      body.packageNetCents ?? 0,
     );
-    const taxCents = computeTaxCents(subtotalCents, body.taxRatePercent);
-    const totalCents = subtotalCents + taxCents;
     // Payment term: explicit value wins; else the recipient customer's default; else 7.
     // The same lookup fills the B2B company / USt-IdNr. when the caller left them
     // out, so an invoice to a business customer is never addressed person-only,
@@ -424,7 +486,8 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           subject: body.subject ?? null,
           serviceDate: body.serviceDate ?? null,
           serviceDateEnd: body.serviceDateEnd ?? null,
-          lineItems: body.lineItems,
+          lineItems,
+          packageMode,
           subtotalCents,
           taxRatePercent: body.taxRatePercent,
           taxCents,
@@ -470,6 +533,8 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const set: Record<string, unknown> = { ...body, updatedAt: now };
+    // Input-only field — it feeds subtotalCents below and is not a column.
+    delete set.packageNetCents;
     if (body.status === 'paid') set.paidAt = now;
     // Re-point the customer link when a draft's recipient is retyped, so the
     // invoice follows the person it is actually billed to.
@@ -482,18 +547,25 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           })
         : null;
     }
-    if (isDraft && ('lineItems' in body || 'taxRatePercent' in body)) {
+    if (
+      isDraft &&
+      ('lineItems' in body ||
+        'taxRatePercent' in body ||
+        'packageMode' in body ||
+        'packageNetCents' in body)
+    ) {
       const draftBody = body as z.infer<typeof draftUpdateSchema>;
-      const lineItems = draftBody.lineItems ?? current.lineItems;
+      const packageMode = draftBody.packageMode ?? current.packageMode;
+      const lineItems = normalizeLineItems(draftBody.lineItems ?? current.lineItems, packageMode);
       const taxRatePercent = draftBody.taxRatePercent ?? current.taxRatePercent;
-      const subtotalCents = lineItems.reduce(
-        (a, l) => a + Math.round(l.quantity * l.unitPriceCents),
-        0,
-      );
-      const taxCents = computeTaxCents(subtotalCents, taxRatePercent);
-      set.subtotalCents = subtotalCents;
-      set.taxCents = taxCents;
-      set.totalCents = subtotalCents + taxCents;
+      // A PATCH that only reorders positions must not drop the package price —
+      // it already lives in subtotalCents. Leaving package mode resets it to the
+      // (now zero) line sum, so the operator has to price the positions again.
+      const packageNetCents =
+        draftBody.packageNetCents ?? (current.packageMode ? current.subtotalCents : 0);
+      set.lineItems = lineItems;
+      set.packageMode = packageMode;
+      Object.assign(set, computeMoney(lineItems, taxRatePercent, packageMode, packageNetCents));
     }
     if (isDraft) {
       // Recomputed on every draft write: line-item edits change the total the
@@ -558,6 +630,11 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
           error: `Pflichtangaben fehlen (§14 UStG): ${missing.join(', ')}`,
           missing,
         });
+        return;
+      }
+      const zeroTotal = zeroTotalError(current.totalCents);
+      if (zeroTotal) {
+        reply.code(400).send({ error: zeroTotal });
         return;
       }
       // dueAt is set once at first issue; re-sends never move it. The gapless
@@ -628,6 +705,11 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         error: `Pflichtangaben fehlen (§14 UStG): ${missing.join(', ')}`,
         missing,
       });
+      return;
+    }
+    const zeroTotal = zeroTotalError(current.totalCents);
+    if (zeroTotal) {
+      reply.code(400).send({ error: zeroTotal });
       return;
     }
     const issued = await issueDraftTx(

@@ -3,6 +3,7 @@ import { and, desc, eq, gte, lt, or, sql } from 'drizzle-orm';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { z } from 'zod';
 import { env } from '../../config/env.js';
+import { accessLevelOf, redactListForViewer } from '../../lib/access.js';
 import { db } from '../../db/index.js';
 import { company } from '../../db/schema/shared.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
@@ -339,6 +340,8 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
 export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
+  // Deleting subscribers and bulk-importing consent records — manager+.
+  app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
     const { limit, cursor } = listQuerySchema.parse(request.query);
@@ -366,7 +369,11 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
-    return { subscribers: page, nextCursor };
+    // Subscriber rows carry the IP/user-agent captured at signup.
+    return {
+      subscribers: redactListForViewer(page, accessLevelOf(request)),
+      nextCursor,
+    };
   });
 
   app.delete('/:id', async (request, reply) => {

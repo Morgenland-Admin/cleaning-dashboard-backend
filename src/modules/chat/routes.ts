@@ -116,93 +116,99 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  app.post('/conversations/:partnerUserId/messages', async (request, reply) => {
-    const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
-    const body = sendBodySchema.parse(request.body);
-    const adminId = request.authUser!.id;
-    const slug = request.company!.slug;
-    const { chatConversations, chatMessages, partners } = request.company!.tables;
+  // Sending to a partner workshop is a real outbound action — manager+.
+  // Read/typing receipts stay open so a `viewer` can follow a thread.
+  app.post(
+    '/conversations/:partnerUserId/messages',
+    { preHandler: app.requireAccess('super_admin', 'admin', 'manager') },
+    async (request, reply) => {
+      const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
+      const body = sendBodySchema.parse(request.body);
+      const adminId = request.authUser!.id;
+      const slug = request.company!.slug;
+      const { chatConversations, chatMessages, partners } = request.company!.tables;
 
-    const [partnerRow] = await db
-      .select({ userId: partners.userId })
-      .from(partners)
-      .where(eq(partners.userId, partnerUserId))
-      .limit(1);
-    if (!partnerRow) {
-      reply.code(404).send({ error: 'Partner not found in this brand' });
-      return;
-    }
-
-    const result = await db.transaction(async (tx) => {
-      let [conv] = await tx
-        .select()
-        .from(chatConversations)
-        .where(eq(chatConversations.partnerUserId, partnerUserId))
+      const [partnerRow] = await db
+        .select({ userId: partners.userId })
+        .from(partners)
+        .where(eq(partners.userId, partnerUserId))
         .limit(1);
-      if (!conv) {
-        [conv] = await tx.insert(chatConversations).values({ partnerUserId }).returning();
+      if (!partnerRow) {
+        reply.code(404).send({ error: 'Partner not found in this brand' });
+        return;
       }
 
-      const preview = body.body
-        ? body.body.slice(0, 200)
-        : body.attachments && body.attachments.length > 0
-          ? `📎 ${body.attachments[0]!.name}`
-          : '';
+      const result = await db.transaction(async (tx) => {
+        let [conv] = await tx
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.partnerUserId, partnerUserId))
+          .limit(1);
+        if (!conv) {
+          [conv] = await tx.insert(chatConversations).values({ partnerUserId }).returning();
+        }
 
-      const now = new Date();
-      const [inserted] = await tx
-        .insert(chatMessages)
-        .values({
-          conversationId: conv!.id,
-          senderUserId: adminId,
-          senderRole: 'admin',
-          body: body.body ?? null,
-          attachments: body.attachments ?? [],
-          deliveredAt: now,
-        })
-        .returning();
+        const preview = body.body
+          ? body.body.slice(0, 200)
+          : body.attachments && body.attachments.length > 0
+            ? `📎 ${body.attachments[0]!.name}`
+            : '';
 
-      await tx
-        .update(chatConversations)
-        .set({
-          lastMessageAt: now,
-          lastMessagePreview: preview,
-          unreadForPartner: sql`${chatConversations.unreadForPartner} + 1`,
-          updatedAt: now,
-        })
-        .where(eq(chatConversations.id, conv!.id));
+        const now = new Date();
+        const [inserted] = await tx
+          .insert(chatMessages)
+          .values({
+            conversationId: conv!.id,
+            senderUserId: adminId,
+            senderRole: 'admin',
+            body: body.body ?? null,
+            attachments: body.attachments ?? [],
+            deliveredAt: now,
+          })
+          .returning();
 
-      return { conversation: conv!, message: inserted! };
-    });
+        await tx
+          .update(chatConversations)
+          .set({
+            lastMessageAt: now,
+            lastMessagePreview: preview,
+            unreadForPartner: sql`${chatConversations.unreadForPartner} + 1`,
+            updatedAt: now,
+          })
+          .where(eq(chatConversations.id, conv!.id));
 
-    const payload = rowToPayload(result.message);
-    broadcast(
-      roomKey(slug, partnerUserId),
-      {
-        type: 'message',
-        conversationId: result.conversation.id,
-        message: payload,
-      },
-      adminId,
-    );
-
-    // PWA push for the partner — the WS broadcast only reaches open tabs.
-    try {
-      const { sendPushToUser } = await import('../../lib/push.js');
-      await sendPushToUser(partnerUserId, {
-        title: `${request.company!.name} · Neue Nachricht`,
-        body: body.body ? body.body.slice(0, 120) : '📎 Anhang erhalten',
-        url: '/chat',
-        tag: `chat:${result.conversation.id}`,
-        brandSlug: slug,
+        return { conversation: conv!, message: inserted! };
       });
-    } catch (err) {
-      request.log.warn({ err, partnerUserId }, 'chat push dispatch failed');
-    }
 
-    reply.code(201);
-    return { message: payload };
-  });
+      const payload = rowToPayload(result.message);
+      broadcast(
+        roomKey(slug, partnerUserId),
+        {
+          type: 'message',
+          conversationId: result.conversation.id,
+          message: payload,
+        },
+        adminId,
+      );
+
+      // PWA push for the partner — the WS broadcast only reaches open tabs.
+      try {
+        const { sendPushToUser } = await import('../../lib/push.js');
+        await sendPushToUser(partnerUserId, {
+          title: `${request.company!.name} · Neue Nachricht`,
+          body: body.body ? body.body.slice(0, 120) : '📎 Anhang erhalten',
+          url: '/chat',
+          tag: `chat:${result.conversation.id}`,
+          brandSlug: slug,
+        });
+      } catch (err) {
+        request.log.warn({ err, partnerUserId }, 'chat push dispatch failed');
+      }
+
+      reply.code(201);
+      return { message: payload };
+    },
+  );
 
   app.post('/conversations/:partnerUserId/read', async (request, reply) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;

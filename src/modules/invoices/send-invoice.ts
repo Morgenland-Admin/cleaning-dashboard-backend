@@ -39,6 +39,8 @@ export interface InvoiceForEmail {
     unitPriceCents: number;
     isPackage?: boolean;
   }>;
+  /** Paketrechnung: positions without per-line prices (see invoices.package_mode). */
+  packageMode?: boolean | null;
   notes: string | null;
   paymentMethod?: string | null;
   /** §35a EStG: invoice covers a Handwerkerleistung. */
@@ -131,6 +133,7 @@ export function buildInvoicePdfData(
       lineTotal: formatEurFromCents(Math.round(li.quantity * li.unitPriceCents)),
       isPackage: li.isPackage ?? false,
     })),
+    packageMode: invoice.packageMode === true,
     subtotal: formatEurFromCents(invoice.subtotalCents),
     tax: invoice.taxCents > 0 ? formatEurFromCents(invoice.taxCents) : null,
     taxRateLabel: taxRate > 0 ? `${taxRate} %` : null,
@@ -230,6 +233,7 @@ export async function sendInvoiceEmail(
         unitPriceFormatted: li.unitPrice,
         lineTotalFormatted: li.lineTotal,
       })),
+      packageMode: pdfData.packageMode,
       subtotalFormatted: pdfData.subtotal,
       taxFormatted: pdfData.tax,
       taxRateLabel: pdfData.taxRateLabel,

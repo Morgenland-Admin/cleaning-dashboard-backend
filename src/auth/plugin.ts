@@ -99,22 +99,34 @@ const authPlugin: FastifyPluginAsync = async (app: FastifyInstance) => {
       },
   );
 
-  app.decorate(
-    'requireAccess',
+  const requireAccessLevels =
     (...levels: AccessLevel[]) =>
-      async (request: FastifyRequest, reply: FastifyReply) => {
-        const session = await app.getSession(request);
-        const u = session?.user as { accessLevel?: string } | undefined;
-        if (!session?.user || !u) {
-          reply.code(401).send({ error: 'Unauthorized' });
-          return;
-        }
-        if (!u.accessLevel || !levels.includes(u.accessLevel as AccessLevel)) {
-          reply.code(403).send({ error: 'Insufficient access level' });
-          return;
-        }
-      },
-  );
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const session = await app.getSession(request);
+      const u = session?.user as { accessLevel?: string } | undefined;
+      if (!session?.user || !u) {
+        reply.code(401).send({ error: 'Unauthorized' });
+        return;
+      }
+      if (!u.accessLevel || !levels.includes(u.accessLevel as AccessLevel)) {
+        reply.code(403).send({ error: 'Insufficient access level' });
+        return;
+      }
+    };
+
+  app.decorate('requireAccess', requireAccessLevels);
+
+  // Reads stay open to every member of the brand (including `viewer`); anything
+  // that mutates state, moves money or leaves the building as customer mail
+  // needs manager+. Registered as a plugin-level preHandler so a route added
+  // later is gated by default instead of being open until someone remembers.
+  const requireManager = requireAccessLevels('super_admin', 'admin', 'manager');
+  app.decorate('requireWriteAccess', async (request: FastifyRequest, reply: FastifyReply) => {
+    if (request.method === 'GET' || request.method === 'HEAD' || request.method === 'OPTIONS') {
+      return;
+    }
+    await requireManager(request, reply);
+  });
 };
 
 export default fp(authPlugin, { name: 'auth-plugin' });

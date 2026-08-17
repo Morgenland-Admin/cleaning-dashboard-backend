@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, asc, desc, eq, inArray, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, ne, or, sql } from 'drizzle-orm';
+import type { PgColumn } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
@@ -295,6 +296,19 @@ function setJsonLdImage(schema: JsonLd | null, imageUrl: string): JsonLd {
 
 const PUBLIC_STATUSES = ['live', 'protected'] as const;
 
+/**
+ * Overlay rows: the page already exists as a fixed storefront route (e.g. HTR's
+ * /leistungen/<slug>) and the seo_pages row only supplies its patchable text.
+ * They must never be published under /seo/<path> as a second URL — the
+ * storefront owns the canonical URL and lists it in its own sitemap.
+ */
+const OVERLAY_CATEGORY = 'leistung';
+
+/** SQL predicate: everything except overlay rows (NULL category included). */
+function notOverlay(seoPages: { category: PgColumn }) {
+  return or(isNull(seoPages.category), ne(seoPages.category, OVERLAY_CATEGORY))!;
+}
+
 function escapeXml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -314,7 +328,9 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
   app.get('/', async (request) => {
     const { type } = publicListQuerySchema.parse(request.query);
     const { seoPages } = request.company!.tables;
-    const conds = [inArray(seoPages.status, [...PUBLIC_STATUSES])];
+    // Overlay rows are deliberately absent: they are not standalone /seo/ URLs,
+    // so they must not be prerendered or listed in a sitemap.
+    const conds = [inArray(seoPages.status, [...PUBLIC_STATUSES]), notOverlay(seoPages)];
     if (type) conds.push(eq(seoPages.type, type));
 
     if (type) {
@@ -359,7 +375,7 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
     const rows = await db
       .select({ path: seoPages.path, type: seoPages.type, updatedAt: seoPages.updatedAt })
       .from(seoPages)
-      .where(inArray(seoPages.status, [...PUBLIC_STATUSES]))
+      .where(and(inArray(seoPages.status, [...PUBLIC_STATUSES]), notOverlay(seoPages)))
       .orderBy(asc(seoPages.path))
       .limit(SITEMAP_MAX + 1);
     if (rows.length > SITEMAP_MAX) {

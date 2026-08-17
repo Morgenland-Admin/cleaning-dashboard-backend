@@ -3,6 +3,7 @@ import { and, asc, desc, eq, isNotNull, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { env } from '../../config/env.js';
+import { accessLevelOf, redactForViewer } from '../../lib/access.js';
 import { db } from '../../db/index.js';
 import { company, user } from '../../db/schema/shared.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
@@ -392,15 +393,7 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
   );
 };
 
-const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
-
-function redactPii<T extends { ipAddress?: unknown; userAgent?: unknown; internalNotes?: unknown }>(
-  row: T,
-  accessLevel: string | undefined,
-): T {
-  if (accessLevel && PRIVILEGED_LEVELS.has(accessLevel)) return row;
-  return { ...row, ipAddress: null, userAgent: null, internalNotes: null };
-}
+const redactPii = redactForViewer;
 
 /** Attach the customer-facing inquiry number derived from id + creation year. */
 function withNumber<T extends { id: number; createdAt: Date }>(row: T) {
@@ -410,6 +403,8 @@ function withNumber<T extends { id: number; createdAt: Date }>(row: T) {
 export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
+  // Quotes go out as priced customer mail — manager+ for writes.
+  app.addHook('preHandler', app.requireWriteAccess);
 
   const listQuerySchema = z.object({
     limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -441,7 +436,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
-    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    const accessLevel = accessLevelOf(request);
     return {
       inquiries: page.map((r) => withNumber(redactPii(r, accessLevel))),
       nextCursor,
@@ -456,7 +451,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .from(serviceInquiries)
       .where(eq(serviceInquiries.id, id))
       .limit(1);
-    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    const accessLevel = accessLevelOf(request);
     return { inquiry: row ? withNumber(redactPii(row, accessLevel)) : null };
   });
 
@@ -767,7 +762,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
 
     const [row] = await db.update(si).set(patch).where(eq(si.id, id)).returning();
     if (!row) throw notFound('Inquiry not found');
-    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    const accessLevel = accessLevelOf(request);
     reply.code(200);
     return { ok: true, inquiry: withNumber(redactPii(row, accessLevel)) };
   });

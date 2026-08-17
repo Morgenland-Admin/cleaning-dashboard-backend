@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { desc, eq } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { z } from 'zod';
+import { accessLevelOf, PARTNER_PAYOUT_FIELDS, redactListForViewer } from '../../lib/access.js';
 import { db } from '../../db/index.js';
 import { company, membership, user } from '../../db/schema/shared.js';
 import { conflict, notFound, parseIntId } from '../../lib/http-errors.js';
@@ -158,11 +159,16 @@ export const partnersSelfRoutes: FastifyPluginAsync = async (app) => {
 export const partnersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
+  // Approving, suspending and creating partner accounts are all privileged.
+  app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
     const { partners } = request.company!.tables;
     const rows = await db.select().from(partners).orderBy(desc(partners.createdAt)).limit(200);
-    return { partners: rows };
+    // Internal notes plus payout banking — a brand viewer needs neither.
+    return {
+      partners: redactListForViewer(rows, accessLevelOf(request), PARTNER_PAYOUT_FIELDS),
+    };
   });
 
   const createPartnerSchema = z.object({

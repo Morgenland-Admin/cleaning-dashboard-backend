@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { and, asc, desc, eq, ilike, lt, ne, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
+import { accessLevelOf, redactForViewer, redactListForViewer } from '../../lib/access.js';
 import { db } from '../../db/index.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
@@ -280,7 +281,10 @@ async function upsertDefaultAddress(
 
 export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  app.addHook('preHandler', app.requireAccess('super_admin', 'admin', 'manager'));
+  // Writes need manager+; reads stay open to any member of the brand. A `viewer`
+  // already reads the orders these customers belong to — blocking the customer
+  // record itself just left that role with dangling references.
+  app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
     const { limit, cursor, tier, email, q } = listQuerySchema.parse(request.query);
@@ -316,7 +320,8 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
-    return { customers: page, nextCursor };
+    // A viewer keeps the operational record but not staff commentary.
+    return { customers: redactListForViewer(page, accessLevelOf(request)), nextCursor };
   });
 
   app.post('/', async (request, reply) => {
@@ -434,7 +439,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     const { customers } = request.company!.tables;
     const [row] = await db.select().from(customers).where(eq(customers.id, id)).limit(1);
     if (!row) throw notFound('Customer not found');
-    return { customer: row };
+    return { customer: redactForViewer(row, accessLevelOf(request)) };
   });
 
   // Customer 360: profile + everything linked to this customer (by customer_id,
@@ -546,14 +551,18 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       newsletterStatus,
     };
 
+    // Customer 360 pulls rows from five tables that all carry staff notes and
+    // submission forensics. Redact each collection, not just the profile —
+    // otherwise this endpoint becomes the way around the per-module rules.
+    const level = accessLevelOf(request);
     return {
-      customer,
-      addresses: addressRows,
-      orders: orderRows,
-      invoices: invoiceRows,
-      inquiries: inquiryRows,
-      contacts: contactRows,
-      newsletter: newsletterRow,
+      customer: redactForViewer(customer, level),
+      addresses: redactListForViewer(addressRows, level),
+      orders: redactListForViewer(orderRows, level),
+      invoices: redactListForViewer(invoiceRows, level),
+      inquiries: redactListForViewer(inquiryRows, level),
+      contacts: redactListForViewer(contactRows, level),
+      newsletter: newsletterRow ? redactForViewer(newsletterRow, level) : newsletterRow,
       stats,
     };
   });

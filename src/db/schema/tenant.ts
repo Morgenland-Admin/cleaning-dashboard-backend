@@ -586,6 +586,14 @@ function buildTenantTables(schemaName: string) {
         >()
         .notNull()
         .default([]),
+      /**
+       * Paketrechnung: the positions only describe the scope of work (label +
+       * note + Menge) and carry no per-line price — the agreed package price is
+       * `subtotal_cents`, entered once, and only the Netto/USt/Gesamt block shows
+       * money. Line `unit_price_cents` is forced to 0 on write in this mode, so
+       * nothing downstream can print a stale figure.
+       */
+      packageMode: boolean('package_mode').notNull().default(false),
       paymentTermsDays: integer('payment_terms_days').notNull().default(7),
       /** How the invoice is settled: 'transfer' (default) | 'card' | 'cash'. */
       paymentMethod: varchar('payment_method', { length: 16 }).notNull().default('transfer'),
@@ -1232,6 +1240,7 @@ CREATE TABLE IF NOT EXISTS ${q}."invoices" (
   "tax_cents" integer DEFAULT 0 NOT NULL,
   "total_cents" integer DEFAULT 0 NOT NULL,
   "line_items" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "package_mode" boolean DEFAULT false NOT NULL,
   "payment_terms_days" integer DEFAULT 7 NOT NULL,
   "payment_method" varchar(16) DEFAULT 'transfer' NOT NULL,
   "due_at" timestamp with time zone,
@@ -1280,6 +1289,8 @@ ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "craftsman_service" boolean
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "labor_gross_cents" integer;
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "labor_vat_cents" integer;
 ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "craftsman_note" text;
+-- Paketrechnung: positions without per-line prices, package price in subtotal_cents.
+ALTER TABLE ${q}."invoices" ADD COLUMN IF NOT EXISTS "package_mode" boolean DEFAULT false NOT NULL;
 
 CREATE TABLE IF NOT EXISTS ${q}."invoice_status_log" (
   "id" serial PRIMARY KEY NOT NULL,

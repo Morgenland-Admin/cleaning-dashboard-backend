@@ -750,6 +750,11 @@ export function invoiceEmail(opts: {
     unitPriceFormatted: string;
     lineTotalFormatted: string;
   }>;
+  /**
+   * Paketrechnung: mirror the PDF and drop the Einzelpreis/Betrag columns — the
+   * positions are scope of work, the price is the totals block.
+   */
+  packageMode?: boolean;
   subtotalFormatted: string;
   taxFormatted: string | null;
   taxRateLabel: string | null;
@@ -772,6 +777,10 @@ export function invoiceEmail(opts: {
 }): RenderedEmail {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
   const paid = opts.paymentMethod === 'card' || opts.paymentMethod === 'cash';
+  const pkg = opts.packageMode === true;
+  // Totals span every column left of the amount — 4-column table normally, 2 in
+  // package mode.
+  const sumSpan = pkg ? 1 : 3;
   const itemRowsHtml = opts.lineItems
     .map(
       (l) => `<tr>
@@ -780,9 +789,13 @@ export function invoiceEmail(opts: {
             ? `<br /><span style="font-size:12px;color:#6b5b48;">${escapeHtml(l.note)}</span>`
             : ''
         }</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:center;white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:${pkg ? 'right' : 'center'};white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>${
+          pkg
+            ? ''
+            : `
         <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:right;white-space:nowrap;">${escapeHtml(l.unitPriceFormatted)}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.lineTotalFormatted)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.lineTotalFormatted)}</td>`
+        }
       </tr>`,
     )
     .join('');
@@ -790,19 +803,19 @@ export function invoiceEmail(opts: {
   const totalsHtml =
     opts.taxFormatted && opts.taxRateLabel
       ? `<tr>
-            <td colspan="3" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">Zwischensumme (netto)</td>
+            <td colspan="${sumSpan}" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">Zwischensumme (netto)</td>
             <td style="padding:8px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(opts.subtotalFormatted)}</td>
           </tr>
           <tr>
-            <td colspan="3" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">zzgl. USt. (${escapeHtml(opts.taxRateLabel)})</td>
+            <td colspan="${sumSpan}" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">zzgl. USt. (${escapeHtml(opts.taxRateLabel)})</td>
             <td style="padding:8px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(opts.taxFormatted)}</td>
           </tr>
           <tr>
-            <td colspan="3" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
+            <td colspan="${sumSpan}" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
             <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>`
       : `<tr>
-            <td colspan="3" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
+            <td colspan="${sumSpan}" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
             <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>`;
 
@@ -884,9 +897,13 @@ export function invoiceEmail(opts: {
           <thead>
             <tr style="background:#f4ebdc;">
               <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Bezeichnung</th>
-              <th align="center" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Menge</th>
+              <th align="${pkg ? 'right' : 'center'}" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Menge</th>${
+                pkg
+                  ? ''
+                  : `
               <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Einzelpreis</th>
-              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Betrag</th>
+              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Betrag</th>`
+              }
             </tr>
           </thead>
           <tbody>
@@ -1307,6 +1324,36 @@ export function orderMessageEmail(opts: {
         ${trackerButton}
       `,
       footerNote: `Nachricht zu Ihrem Auftrag ${opts.orderNumber} bei ${opts.brand.domain}. Sie können direkt auf diese Mail antworten.`,
+    }),
+  };
+}
+
+/**
+ * Single-use Calendly link so the customer picks their own pickup/on-site time.
+ * Sent under the order's own brand; only the booking page behind the link is
+ * CLEANILO-hosted (one shared scheduling calendar across the brands), which is
+ * why the copy stays neutral about who runs the page.
+ */
+export function pickupSchedulingLinkEmail(opts: {
+  brand: BrandInfo;
+  customerName: string;
+  orderNumber: string;
+  bookingUrl: string;
+}): RenderedEmail {
+  return {
+    subject: `Termin auswählen · ${opts.orderNumber}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: 'Wählen Sie Ihren Wunschtermin online aus.',
+      contentHtml: `
+        <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
+        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Termin auswählen</p>
+        <p style="margin:0 0 16px;font-size:16px;font-weight:600;">${escapeHtml(opts.brand.name)} — ${escapeHtml(opts.orderNumber)}</p>
+        <p style="margin:0 0 16px;font-size:14px;">für Ihren Auftrag fehlt noch der Termin. Über den folgenden Link sehen Sie unsere freien Zeiten und wählen den Termin, der Ihnen am besten passt:</p>
+        ${button(opts.bookingUrl, 'Termin auswählen', opts.brand.primaryColor)}
+        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">Der Link ist für eine Buchung gültig. Nach der Auswahl erhalten Sie eine Bestätigung mit Kalendereintrag. Falls Sie den Termin später ändern möchten, nutzen Sie die Links in dieser Bestätigung oder antworten Sie einfach auf diese E-Mail.</p>
+      `,
+      footerNote: `Terminauswahl zu Ihrem Auftrag bei ${opts.brand.domain}.`,
     }),
   };
 }

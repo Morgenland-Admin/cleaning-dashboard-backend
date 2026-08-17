@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync } from 'fastify';
 import { and, count, desc, eq, gte, like } from 'drizzle-orm';
 import { z } from 'zod';
 
@@ -30,13 +30,7 @@ const updateSchema = z.object({
 export const cityStatusAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
   // Reads stay open to any member; mutations need manager+.
-  const requireManager = app.requireAccess('super_admin', 'admin', 'manager') as (
-    request: FastifyRequest,
-    reply: FastifyReply,
-  ) => Promise<void>;
-  app.addHook('preHandler', async (request, reply) => {
-    if (request.method !== 'GET') await requireManager(request, reply);
-  });
+  app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
     const { cityStatus } = request.company!.tables;

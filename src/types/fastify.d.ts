@@ -16,6 +16,12 @@ declare module 'fastify' {
     requireAccess(
       ...levels: Array<'super_admin' | 'admin' | 'manager' | 'viewer' | 'none'>
     ): preHandlerHookHandler;
+    /**
+     * Gate for a whole route group: GET/HEAD/OPTIONS pass through, every other
+     * method requires manager+. Use it as a plugin-level `preHandler` so new
+     * write routes are covered without a per-route opt-in.
+     */
+    requireWriteAccess: preHandlerHookHandler;
     resolveCompanyPublic: preHandlerHookHandler;
     requireCompany: preHandlerHookHandler;
     /** Force-refresh the dynamic CORS origin set (from company.storefrontOrigin). */

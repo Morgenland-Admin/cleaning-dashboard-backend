@@ -100,6 +100,27 @@ const envSchema = z.object({
   // Shared secret the voice-AI / n8n intake endpoint must present in the
   // X-Intake-Token header. When unset, the intake endpoint is disabled (503).
   INQUIRY_INTAKE_TOKEN: optionalString,
+
+  // ── Calendly (pickup / on-site appointments) ──
+  // One CLEANILO Calendly account for all brands — the single deliberate
+  // brand-sharing exception. Calendly syncs the booking to the CLEANILO Google
+  // Calendar itself, which is why we don't talk to the Google API at all.
+  // Personal Access Token from the CLEANILO Calendly account (paid plan required
+  // for the Scheduling API). Unset ⇒ appointment confirmation behaves exactly as
+  // before, no booking attempted.
+  CALENDLY_API_TOKEN: optionalString,
+  // Event-type URI of the CLEANILO "Besichtigung / Ausführung" event, e.g.
+  // https://api.calendly.com/event_types/<uuid>. Needed for booking; read it with
+  // `node --import tsx scripts/calendly-setup.ts event-types`.
+  CALENDLY_PICKUP_EVENT_TYPE_URI: optionalString,
+  // Signing key of the webhook subscription. Unset ⇒ the webhook accepts nothing
+  // (503), because an unverified booking webhook is untrusted input.
+  CALENDLY_WEBHOOK_SIGNING_KEY: optionalString,
+  // Zone the invitee is booked in. Our slots are Europe/Berlin wall clock.
+  CALENDLY_TIMEZONE: z.string().default('Europe/Berlin'),
+  // Test seam: point the client at a local Calendly stub so the booking flow can
+  // be exercised without writing to the real calendar. Rejected in production.
+  CALENDLY_API_BASE: optionalUrl,
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -137,6 +158,20 @@ if (parsed.data.NODE_ENV === 'production') {
     errors.push(
       'PayPal is half-configured: set PAYPAL_CLIENT_ID, PAYPAL_SECRET and PAYPAL_WEBHOOK_ID together, or none.',
     );
+  }
+  // A token without an event type books nothing — fail loudly rather than have
+  // pickup confirmations silently skip the calendar.
+  if (parsed.data.CALENDLY_API_TOKEN && !parsed.data.CALENDLY_PICKUP_EVENT_TYPE_URI) {
+    errors.push(
+      'CALENDLY_PICKUP_EVENT_TYPE_URI is required when CALENDLY_API_TOKEN is set (otherwise no pickup can be booked).',
+    );
+  }
+  // The stub seam must never be live: it would silently swallow real bookings.
+  if (
+    parsed.data.CALENDLY_API_BASE &&
+    parsed.data.CALENDLY_API_BASE !== 'https://api.calendly.com'
+  ) {
+    errors.push('CALENDLY_API_BASE must be unset in production (test seam only).');
   }
   if (errors.length > 0) {
     console.error('Production environment misconfigured:\n  ' + errors.join('\n  '));

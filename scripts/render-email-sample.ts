@@ -18,7 +18,12 @@ import { join } from 'node:path';
 
 import { LEGACY_BOOTSTRAP } from '../src/db/bootstrap-companies.ts';
 import { brandInfoFromCompany } from '../src/email/service.ts';
-import { contactReplyEmail, inquiryQuoteEmail, orderMessageEmail } from '../src/email/templates.ts';
+import {
+  contactReplyEmail,
+  inquiryQuoteEmail,
+  orderMessageEmail,
+  pickupSchedulingLinkEmail,
+} from '../src/email/templates.ts';
 import type { company as companyTable } from '../src/db/schema/shared.ts';
 
 type CompanyFull = typeof companyTable.$inferSelect;
@@ -115,6 +120,13 @@ for (const { row, source } of await loadCompanies()) {
         'vielen Dank für Ihre Nachricht. Eine Grundreinigung dauert bei uns 3–5 Werktage.\n\nGern reservieren wir einen Termin für Sie.',
       originalMessage: 'Wie lange dauert eine Grundreinigung?',
       originalSubject: 'Frage zur Reinigungsdauer',
+    }),
+    'pickup-scheduling-link': pickupSchedulingLinkEmail({
+      brand,
+      customerName: RECIPIENT,
+      orderNumber: `${row.invoiceNumberPrefix ?? 'XX'}-1001`,
+      // Booking page is CLEANILO for every brand; the mail stays per-brand.
+      bookingUrl: 'https://calendly.com/cleanilo/besichtigung/beispiel',
     }),
     'inquiry-quote': inquiryQuoteEmail({
       brand,

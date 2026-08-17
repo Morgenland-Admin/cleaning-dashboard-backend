@@ -80,6 +80,12 @@ export interface InvoicePdfData {
     /** Package/section header line — rendered bold to group the items below it. */
     isPackage?: boolean;
   }>;
+  /**
+   * Paketrechnung: print the positions as scope-of-work only — Bezeichnung +
+   * Menge, no Einzelpreis/Betrag columns. The money appears once, in the
+   * Netto/USt/Gesamt block, exactly as in a package quote.
+   */
+  packageMode?: boolean;
   subtotal: string;
   tax: string | null;
   taxRateLabel: string | null;
@@ -193,6 +199,10 @@ const COL_DESC = { x: L, w: 92 }; // 95 mm cell, 3 mm gutter before "Menge"
 const COL_QTY = { x: 120, w: 16 };
 const COL_UNIT = { x: 136, w: 26 };
 const COL_AMT = { x: 162, w: 28 };
+// Paketrechnung: no money columns, so the description takes the freed width and
+// "Menge" moves out to the right edge instead of floating mid-page.
+const PKG_COL_DESC = { x: L, w: 131 };
+const PKG_COL_QTY = { x: R - 28, w: 28 };
 
 // ── Embedded fonts (OFL, vendored in src/assets/fonts) ────────────────────
 const FONT_DIR = new URL('../assets/fonts/', import.meta.url);
@@ -655,22 +665,31 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       if (y + need > BODY_BOTTOM) nextPage(repeatTableHead);
     };
 
+    // A Paketrechnung prices the scope as a whole — the per-position columns are
+    // dropped entirely rather than filled with 0,00 €.
+    const pkg = data.packageMode === true;
+    const colDesc = pkg ? PKG_COL_DESC : COL_DESC;
+    const colQty = pkg ? PKG_COL_QTY : COL_QTY;
+
     function drawTableHead(top: number): number {
       const h = text('Bezeichnung', {
-        x: COL_DESC.x,
+        x: colDesc.x,
         y: top,
-        w: COL_DESC.w,
+        w: colDesc.w,
         font: 'headSemi',
         size: 7.4,
         color: MUTED,
         tracking: 0.1,
         upper: true,
       });
-      for (const [label, col] of [
-        ['Menge', COL_QTY],
-        ['Einzelpreis', COL_UNIT],
-        ['Betrag', COL_AMT],
-      ] as Array<[string, { x: number; w: number }]>) {
+      const heads: Array<[string, { x: number; w: number }]> = pkg
+        ? [['Menge', colQty]]
+        : [
+            ['Menge', COL_QTY],
+            ['Einzelpreis', COL_UNIT],
+            ['Betrag', COL_AMT],
+          ];
+      for (const [label, col] of heads) {
         text(label, {
           x: col.x,
           y: top,
@@ -710,14 +729,14 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       // Template weight for a position title is 600; package headers go to 700.
       const titleFont: FontKey = item.isPackage ? 'bodyBold' : 'bodySemi';
       const titleH = measure(item.label, {
-        x: COL_DESC.x,
+        x: colDesc.x,
         y,
-        w: COL_DESC.w,
+        w: colDesc.w,
         font: titleFont,
         size: 9.6,
       });
       const noteH = item.note
-        ? measure(item.note, { x: COL_DESC.x, y, w: COL_DESC.w, size: 8.8 })
+        ? measure(item.note, { x: colDesc.x, y, w: colDesc.w, size: 8.8 })
         : 0;
       const rowH = 3.2 + Math.max(titleH + noteH, 4) + 3.2;
       ensure(rowH);
@@ -726,20 +745,23 @@ export function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
       dy = stack(
         dy,
         text(item.label, {
-          x: COL_DESC.x,
+          x: colDesc.x,
           y: dy,
-          w: COL_DESC.w,
+          w: colDesc.w,
           font: titleFont,
           size: 9.6,
         }),
       );
       if (item.note)
-        text(item.note, { x: COL_DESC.x, y: dy, w: COL_DESC.w, size: 8.8, color: MUTED });
-      for (const [value, col, bold] of [
-        [item.quantity, COL_QTY, false],
-        [item.unitPrice, COL_UNIT, false],
-        [item.lineTotal, COL_AMT, item.isPackage ?? false],
-      ] as Array<[string, { x: number; w: number }, boolean]>) {
+        text(item.note, { x: colDesc.x, y: dy, w: colDesc.w, size: 8.8, color: MUTED });
+      const cells: Array<[string, { x: number; w: number }, boolean]> = pkg
+        ? [[item.quantity, colQty, false]]
+        : [
+            [item.quantity, COL_QTY, false],
+            [item.unitPrice, COL_UNIT, false],
+            [item.lineTotal, COL_AMT, item.isPackage ?? false],
+          ];
+      for (const [value, col, bold] of cells) {
         text(value, {
           x: col.x,
           y: ty,

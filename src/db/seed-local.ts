@@ -132,6 +132,116 @@ async function ensureMemberships(userId: string, memberships: Record<string, Rol
   }
 }
 
+/**
+ * Partner workshops for a brand.
+ *
+ * Each row needs a real `user` behind it: the partner portal signs in as that
+ * user, and the admin chat list joins `user` on `partners.user_id`. Without these
+ * the Partner-Werkstätten page and the chat page both render an empty state, so
+ * neither could be exercised locally.
+ *
+ * One `active` and one `pending` partner per brand, which is what the status
+ * tabs and the approve/suspend actions need to be meaningful.
+ */
+const PARTNER_SEEDS = [
+  {
+    slugSuffix: 'werkstatt-nord',
+    companyName: 'Teppichwerkstatt Nord GmbH',
+    firstName: 'Jonas',
+    lastName: 'Brandt',
+    city: 'Hamburg',
+    postalCode: '20457',
+    status: 'active' as const,
+    services: ['teppichreinigung', 'teppichreparatur'],
+    serviceAreas: ['20', '21', '22'],
+    internalNotes: 'Zuverlässig, nimmt auch Kurzfristiges. Abholung Di/Do.',
+  },
+  {
+    slugSuffix: 'polster-sued',
+    companyName: 'Polsterpflege Süd',
+    firstName: 'Miriam',
+    lastName: 'Keller',
+    city: 'Harburg',
+    postalCode: '21073',
+    status: 'pending' as const,
+    services: ['polsterreinigung'],
+    serviceAreas: ['21'],
+    internalNotes: 'Unterlagen noch unvollständig — Gewerbeanmeldung fehlt.',
+  },
+];
+
+async function seedBrandPartners(slug: string, schemaName: string) {
+  const t = getTenantTables(schemaName);
+  const [{ n } = { n: 0 }] = await db.select({ n: sql<number>`count(*)::int` }).from(t.partners);
+  if (Number(n) > 0) return; // already seeded
+
+  for (const seed of PARTNER_SEEDS) {
+    const email = `${seed.slugSuffix}@partner.example.com`;
+    const userId = await ensurePartnerUser({
+      email,
+      firstName: seed.firstName,
+      lastName: seed.lastName,
+    });
+    // Partners are members of the brand they serve, with the partner audience.
+    await db
+      .insert(membership)
+      .values({ userId, companySlug: slug, role: 'viewer', acceptedAt: new Date() })
+      .onConflictDoNothing();
+    await db.insert(t.partners).values({
+      userId,
+      companyName: seed.companyName,
+      legalName: seed.companyName,
+      contactEmail: email,
+      contactPhone: '+4940123456',
+      city: seed.city,
+      postalCode: seed.postalCode,
+      country: 'DE',
+      addressLine1: 'Musterweg 1',
+      services: seed.services,
+      serviceAreas: seed.serviceAreas,
+      commissionRate: '12.00',
+      // Present so the viewer-redaction of payout data is visible locally.
+      iban: 'DE02120300000000202051',
+      bic: 'BYLADEM1001',
+      status: seed.status,
+      approvedAt: seed.status === 'active' ? new Date() : null,
+      internalNotes: seed.internalNotes,
+    });
+  }
+}
+
+/** A partner-audience user. Same credential flow as the admin seeds. */
+async function ensurePartnerUser(u: {
+  email: string;
+  firstName: string;
+  lastName: string;
+}): Promise<string> {
+  const [existing] = await db.select().from(user).where(eq(user.email, u.email)).limit(1);
+  if (existing) return existing.id;
+  const id = nanoid();
+  const hashed = await auth.$context.then((ctx) => ctx.password.hash(DEFAULT_PW));
+  await db.insert(user).values({
+    id,
+    name: `${u.firstName} ${u.lastName}`.trim(),
+    email: u.email,
+    firstName: u.firstName,
+    lastName: u.lastName,
+    audience: 'partner',
+    accessLevel: 'viewer',
+    emailVerified: true,
+    isActive: true,
+  });
+  await db.insert(account).values({
+    id: nanoid(),
+    userId: id,
+    providerId: 'credential',
+    accountId: id,
+    password: hashed,
+  });
+  await db.insert(userSettings).values({ userId: id }).onConflictDoNothing();
+  return id;
+}
+
 async function seedBrandSamples(schemaName: string, name: string) {
   const t = getTenantTables(schemaName);
   const [{ n } = { n: 0 }] = await db
@@ -259,14 +369,16 @@ async function main() {
   }
   console.info('→ Local seed: per-brand demo data…');
   const companies = await db
-    .select({ schemaName: company.schemaName, name: company.name })
+    .select({ slug: company.slug, schemaName: company.schemaName, name: company.name })
     .from(company);
   for (const c of companies) {
     await seedBrandSamples(c.schemaName, c.name);
     await seedBrandTestFlows(c.schemaName);
+    await seedBrandPartners(c.slug, c.schemaName);
     console.info(`   ✓ ${c.name}`);
   }
   console.info(`\nDone. Login: admin@reinigungs-portal.com / ${DEFAULT_PW}`);
+  console.info(`Partner portal: werkstatt-nord@partner.example.com / ${DEFAULT_PW}`);
 }
 
 main()

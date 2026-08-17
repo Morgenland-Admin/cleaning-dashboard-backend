@@ -53,9 +53,18 @@ export function sanitizeHtml(input: string): string {
     },
     allowedSchemes: ['http', 'https', 'mailto', 'tel'],
     allowedSchemesByTag: { img: ['http', 'https'] },
-    // Force safe rel on any link that opens a new tab.
+    // Force a safe rel on links that leave the site. Site-relative links (the
+    // internal linking SEO pages exist for) keep their equity — a blanket
+    // nofollow here would silently defeat it.
     transformTags: {
-      a: sanitize.simpleTransform('a', { rel: 'noopener noreferrer nofollow' }),
+      a: (tagName, attribs) => {
+        const href = attribs.href ?? '';
+        const isInternal = href === '' || href.startsWith('/') || href.startsWith('#');
+        return {
+          tagName,
+          attribs: isInternal ? attribs : { ...attribs, rel: 'noopener noreferrer nofollow' },
+        };
+      },
     },
   });
 }

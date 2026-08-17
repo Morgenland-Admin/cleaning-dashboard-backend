@@ -248,10 +248,13 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
 
-  // Bounded: this hits a paid API. Admin-gated, so the cap is generous.
+  // Bounded: this hits a paid API. Manager+ — a `viewer` cannot send the
+  // resulting text anywhere, so there is no reason to let them spend on it.
+  const requireWrite = app.requireAccess('super_admin', 'admin', 'manager');
+
   app.post(
     '/assist',
-    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    { preHandler: requireWrite, config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (request, reply) => {
       if (!isAiConfigured()) {
         reply.code(503);
@@ -362,7 +365,7 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
   // Extract offer line items from the inquiry request + drafted offer text.
   app.post(
     '/extract-offer-items',
-    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    { preHandler: requireWrite, config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (request, reply) => {
       if (!isAiConfigured()) {
         reply.code(503);

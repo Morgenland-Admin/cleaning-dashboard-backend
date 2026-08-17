@@ -16,7 +16,9 @@ import {
   orderMessageEmail,
   orderStatusUpdateEmail,
   paymentRequestEmail,
+  pickupSchedulingLinkEmail,
 } from '../../email/templates.js';
+import { accessLevelOf, isPrivileged, redactForViewer } from '../../lib/access.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
 import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
@@ -49,6 +51,20 @@ import {
   type CheckoutInput,
 } from './pricing-input.js';
 import { evaluateCancellation, type CancellationDecision } from './cancellation.js';
+import {
+  bookConfirmedSlot,
+  createBookingLink,
+  readCalendlyMeta,
+  utcToBerlinSlot,
+  type CalendlyPickupMeta,
+} from './calendly-pickup.js';
+import {
+  calendlyBookingConfigured,
+  cancelPickupAppointment,
+  parseTrackingKey,
+  verifyCalendlyWebhook,
+  type CalendlyWebhookPayload,
+} from '../../lib/calendly.js';
 
 const KIND_LABEL: Record<string, string> = {
   teppichreinigung: 'Teppichreinigung',
@@ -89,6 +105,43 @@ function formatSlotDe(slot: string): string {
   const [y, m, day] = (d ?? '').split('-');
   if (!y || !m || !day) return slot;
   return `${day}.${m}.${y}${t ? ` · ${t} Uhr` : ''}`;
+}
+
+/**
+ * Service address for the Calendly booking — it answers the event type's
+ * address question and is what the crew navigates to. Deliberately just the
+ * address: the calendar is an internal ops view, no order value on it.
+ */
+function calendarAddressText(row: {
+  addressLine1: string | null;
+  addressLine2: string | null;
+  addressPostalCode: string | null;
+  addressCity: string | null;
+  pickupLabel: string | null;
+}): string | null {
+  const street = [row.addressLine1, row.addressLine2].filter(Boolean).join(', ');
+  const city = [row.addressPostalCode, row.addressCity].filter(Boolean).join(' ');
+  const address = [street, city].filter(Boolean).join(', ');
+  return address || row.pickupLabel || null;
+}
+
+/**
+ * One-line "what is this job" for the event type's free-text question, so the
+ * crew sees the service on the calendar entry without opening the dashboard.
+ */
+function calendarServiceSummary(row: {
+  kind: string;
+  orderNumber?: string | null;
+  id: number;
+  createdAt?: Date | null;
+  customerNotes: string | null;
+}): string {
+  return [
+    `${KIND_LABEL[row.kind] ?? row.kind} · Auftrag ${orderNumberOf(row)}`,
+    row.customerNotes?.trim() || null,
+  ]
+    .filter(Boolean)
+    .join(' — ');
 }
 
 interface NotifyCustomerArgs {
@@ -828,7 +881,139 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
 
     reply.code(200).send({ received: true });
   });
+
+  // Calendly invitee.created / invitee.canceled. Only matters for bookings we did
+  // not make ourselves: the customer self-booking via a scheduling link, or a
+  // reschedule/cancel done inside Calendly. Our own /invitees bookings are already
+  // recorded synchronously, and land here as a harmless confirmation.
+  app.post('/calendly', async (request, reply) => {
+    if (!env.CALENDLY_WEBHOOK_SIGNING_KEY) {
+      reply.code(503).send({ error: 'Calendly webhook not configured' });
+      return;
+    }
+    const raw = Buffer.isBuffer(request.body)
+      ? request.body.toString('utf8')
+      : typeof request.body === 'string'
+        ? request.body
+        : JSON.stringify(request.body ?? {});
+
+    const sig = request.headers['calendly-webhook-signature'];
+    if (!verifyCalendlyWebhook(typeof sig === 'string' ? sig : undefined, raw)) {
+      request.log.warn('Calendly webhook signature verification failed');
+      reply.code(400).send({ error: 'Invalid signature' });
+      return;
+    }
+
+    let event: CalendlyWebhookPayload;
+    try {
+      event = JSON.parse(raw) as CalendlyWebhookPayload;
+    } catch {
+      reply.code(400).send({ error: 'Invalid JSON' });
+      return;
+    }
+
+    try {
+      await handleCalendlyEvent(app, event);
+    } catch (err) {
+      request.log.error({ err, eventType: event.event }, 'Calendly webhook handler failed');
+      captureException(err, { eventType: event.event });
+      reply.code(500).send({ error: 'Webhook handler failed' });
+      return;
+    }
+
+    reply.code(200).send({ received: true });
+  });
 };
+
+/**
+ * Route an invitee event back onto its order. Correlation runs through
+ * `tracking.utm_content` (`order:<companySlug>:<orderId>`), which we set on both
+ * the direct booking and the single-use scheduling link — the Calendly account is
+ * shared across brands, so the payload alone cannot say which tenant it belongs to.
+ */
+async function handleCalendlyEvent(
+  app: FastifyInstance,
+  event: CalendlyWebhookPayload,
+): Promise<void> {
+  const kind = event.event;
+  if (kind !== 'invitee.created' && kind !== 'invitee.canceled') return;
+
+  const payload = event.payload ?? {};
+  const ref = parseTrackingKey(payload.tracking?.utm_content);
+  if (!ref) {
+    app.log.info({ eventType: kind }, 'calendly webhook without an order tracking key — ignored');
+    return;
+  }
+
+  const { getTenantTables } = await import('../../db/schema/tenant.js');
+  const { loadCompany } = await import('../../lib/company-loader.js');
+  const companyRow = await loadCompany(ref.companySlug);
+  if (!companyRow) {
+    app.log.warn({ ...ref }, 'calendly webhook for an unknown company — ignored');
+    return;
+  }
+  const tables = getTenantTables(companyRow.schemaName);
+  const [order] = await db
+    .select()
+    .from(tables.orders)
+    .where(eq(tables.orders.id, ref.orderId))
+    .limit(1);
+  if (!order) {
+    app.log.warn({ ...ref }, 'calendly webhook for an unknown order — ignored');
+    return;
+  }
+
+  const meta = order.metadata ?? {};
+  const existing = readCalendlyMeta(meta);
+  const now = new Date().toISOString();
+
+  if (kind === 'invitee.canceled') {
+    // Don't resurrect state for an event we already replaced with a newer one.
+    if (existing?.inviteeUri && payload.uri && existing.inviteeUri !== payload.uri) return;
+    const next: CalendlyPickupMeta = {
+      ...(existing ?? { source: 'webhook', updatedAt: now }),
+      status: 'cancelled',
+      source: 'webhook',
+      updatedAt: now,
+    };
+    const rest = { ...meta };
+    delete rest.confirmedSlot;
+    await db
+      .update(tables.orders)
+      .set({ metadata: { ...rest, calendly: next }, updatedAt: new Date() })
+      .where(eq(tables.orders.id, ref.orderId));
+    app.log.info({ ...ref }, 'calendly: pickup cancelled by invitee');
+    return;
+  }
+
+  const startTime = payload.scheduled_event?.start_time ?? null;
+  const slot = startTime ? utcToBerlinSlot(startTime) : null;
+  const next: CalendlyPickupMeta = {
+    status: 'booked',
+    slot,
+    startTime,
+    eventUri: payload.scheduled_event?.uri ?? null,
+    inviteeUri: payload.uri ?? null,
+    cancelUrl: payload.cancel_url ?? null,
+    rescheduleUrl: payload.reschedule_url ?? null,
+    bookingUrl: existing?.bookingUrl ?? null,
+    source: 'webhook',
+    error: null,
+    updatedAt: now,
+  };
+
+  await db
+    .update(tables.orders)
+    .set({
+      // The customer's pick is the appointment — mirror it into the fields the
+      // panel and the 24h cancellation rule read.
+      ...(slot ? { preferredDate: slot.slice(0, 10) } : {}),
+      metadata: { ...meta, ...(slot ? { confirmedSlot: slot } : {}), calendly: next },
+      updatedAt: new Date(),
+    })
+    .where(eq(tables.orders.id, ref.orderId));
+  app.log.info({ ...ref, slot }, 'calendly: pickup booked by invitee');
+}
 
 interface PayPalWebhookEvent {
   id?: string;
@@ -1688,6 +1873,42 @@ async function markOrderCancelled(
       reason,
     });
   });
+  await releaseCalendlyPickup({ orders: tables.orders, order, reason, log: app.log });
+}
+
+/**
+ * Cancel the Calendly event held for an order and record that in metadata.
+ * Best-effort: a Calendly outage must never fail the cancellation it follows.
+ * Returns the new metadata so callers can answer with an up-to-date order.
+ */
+async function releaseCalendlyPickup(args: {
+  orders: TenantTables['orders'];
+  order: { id: number; metadata: Record<string, unknown> | null };
+  reason: string;
+  log: { warn: (obj: object, msg?: string) => void };
+}): Promise<Record<string, unknown> | null> {
+  const existing = readCalendlyMeta(args.order.metadata);
+  if (!existing || existing.status !== 'booked' || !existing.eventUri) return null;
+  const result = await cancelPickupAppointment(existing.eventUri, args.reason);
+  if (!result.ok) {
+    args.log.warn(
+      { orderId: args.order.id, eventUri: existing.eventUri, error: result.error },
+      'calendly: could not cancel pickup event for cancelled order',
+    );
+    return null;
+  }
+  const next: CalendlyPickupMeta = {
+    ...existing,
+    status: 'cancelled',
+    source: 'dashboard',
+    updatedAt: new Date().toISOString(),
+  };
+  const metadata = { ...(args.order.metadata ?? {}), calendly: next };
+  await db
+    .update(args.orders)
+    .set({ metadata, updatedAt: new Date() })
+    .where(eq(args.orders.id, args.order.id));
+  return metadata;
 }
 
 async function markOrderRefundedByPaymentIntent(
@@ -1894,39 +2115,15 @@ const updateInternalNotesSchema = z.object({
   internalNotes: z.string().trim().max(4000).nullable(),
 });
 
-const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
-
-/** Viewers don't see IP/UA, internal notes, or payment-processor IDs. */
-function redactOrderPii<
-  T extends {
-    ipAddress?: unknown;
-    userAgent?: unknown;
-    internalNotes?: unknown;
-    stripeSessionId?: unknown;
-    stripePaymentIntentId?: unknown;
-    paypalOrderId?: unknown;
-    paypalCaptureId?: unknown;
-  },
->(row: T, accessLevel: string | undefined): T {
-  if (accessLevel && PRIVILEGED_LEVELS.has(accessLevel)) return row;
-  return {
-    ...row,
-    ipAddress: null,
-    userAgent: null,
-    internalNotes: null,
-    stripeSessionId: null,
-    stripePaymentIntentId: null,
-    paypalOrderId: null,
-    paypalCaptureId: null,
-  };
-}
-
-function accessLevelOf(request: { authUser: unknown }): string | undefined {
-  return (request.authUser as { accessLevel?: string } | null)?.accessLevel;
-}
+// The viewer read model lives in lib/access.ts — it used to be private to this
+// module, which meant every other module returning the same columns leaked them.
+const redactOrderPii = redactForViewer;
 
 export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
+  // Every mutation here moves an order, money, or customer mail — manager+.
+  // Reads stay open so a `viewer` can still work the list.
+  app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
     const { limit, cursor, status } = listQuerySchema.parse(request.query);
@@ -2014,7 +2211,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/', async (request, reply) => {
     const callerLevel = accessLevelOf(request);
-    if (!callerLevel || !PRIVILEGED_LEVELS.has(callerLevel)) {
+    if (!isPrivileged(callerLevel)) {
       reply.code(403).send({ error: 'Nur Manager/Admin dürfen Aufträge anlegen.' });
       return;
     }
@@ -2138,7 +2335,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     // Advancing an order's status is an operational write — viewers are read-only.
     const callerLevel = accessLevelOf(request);
-    if (!callerLevel || !PRIVILEGED_LEVELS.has(callerLevel)) {
+    if (!isPrivileged(callerLevel)) {
       reply.code(403).send({ error: 'Nur Manager/Admin dürfen den Auftragsstatus ändern.' });
       return;
     }
@@ -2158,7 +2355,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     if (toStatus === 'refunded') {
       const lvl = accessLevelOf(request);
-      if (!lvl || !PRIVILEGED_LEVELS.has(lvl)) {
+      if (!isPrivileged(lvl)) {
         reply.code(403).send({ error: 'Nur Manager/Admin dürfen Rückerstattungen ausführen.' });
         return;
       }
@@ -2483,7 +2680,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     if (refundCents > 0) {
       const lvl = accessLevelOf(request);
-      if (!lvl || !PRIVILEGED_LEVELS.has(lvl)) {
+      if (!isPrivileged(lvl)) {
         reply.code(403).send({ error: 'Nur Manager/Admin dürfen Rückerstattungen ausführen.' });
         return;
       }
@@ -2564,6 +2761,16 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       });
       return;
     }
+
+    // Free the slot in the CLEANILO calendar — otherwise a cancelled order keeps
+    // blocking Calendly availability and the crew sees a job that isn't happening.
+    const releasedMetadata = await releaseCalendlyPickup({
+      orders,
+      order: updated,
+      reason: `Auftrag ${orderNumberOf(updated)} storniert`,
+      log: request.log,
+    });
+    if (releasedMetadata) updated.metadata = releasedMetadata;
 
     // Expire the open session so the customer can't pay after cancellation.
     if (row.status === 'payment_pending' && row.stripeSessionId && stripeConfigured) {
@@ -2662,7 +2869,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const meta = row.metadata ?? {};
-    const [updated] = await db
+    const [confirmed] = await db
       .update(orders)
       .set({
         preferredDate: slot.slice(0, 10),
@@ -2671,9 +2878,37 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       })
       .where(eq(orders.id, id))
       .returning();
-    if (!updated) {
+    if (!confirmed) {
       reply.code(404).send({ error: 'Order not found' });
       return;
+    }
+    let updated = confirmed;
+
+    // Push the confirmed pickup onto the CLEANILO Calendly calendar (brand
+    // exception — one calendar for all brands). The order stays authoritative:
+    // a Calendly failure is reported back, never rolled back.
+    const booking = await bookConfirmedSlot({
+      companySlug,
+      orderId: id,
+      slot,
+      customerName: row.customerName,
+      customerEmail: row.customerEmail,
+      customerPhone: row.customerPhone,
+      addressText: calendarAddressText(row),
+      serviceSummary: calendarServiceSummary(row),
+      existing: readCalendlyMeta(row.metadata),
+      log: request.log,
+    });
+    if (booking.meta) {
+      const [withCalendly] = await db
+        .update(orders)
+        .set({
+          metadata: { ...(updated.metadata ?? {}), calendly: booking.meta },
+          updatedAt: new Date(),
+        })
+        .where(eq(orders.id, id))
+        .returning();
+      if (withCalendly) updated = withCalendly;
     }
 
     try {
@@ -2702,7 +2937,109 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       request.log.error({ err, orderId: id }, 'appointment confirmation email failed');
     }
 
-    return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
+    return {
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
+      // Surfaced as a warning in the panel — the operator needs to know when the
+      // slot did not make it onto the CLEANILO calendar.
+      calendly: {
+        configured: calendlyBookingConfigured,
+        booked: booking.ok && !booking.skipped,
+        slotUnavailable: booking.slotUnavailable ?? false,
+        error: booking.error ?? null,
+      },
+    };
+  });
+
+  // Fallback route: hand the customer a single-use CLEANILO scheduling link and
+  // let them pick the time. Calendly writes the event to the CLEANILO Google
+  // Calendar and the invitee.created webhook writes the slot back onto the order.
+  app.post('/:id/pickup-booking-link', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { send } = z.object({ send: z.boolean().default(true) }).parse(request.body ?? {});
+    const { orders } = request.company!.tables;
+    const companySlug = request.company!.slug;
+
+    if (!calendlyBookingConfigured) {
+      reply.code(503).send({ error: 'Calendly ist auf diesem Server nicht konfiguriert.' });
+      return;
+    }
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+
+    const link = await createBookingLink({ companySlug, orderId: id });
+    if (!link.ok || !link.bookingUrl || !link.meta) {
+      request.log.error({ orderId: id, error: link.error }, 'calendly: scheduling link failed');
+      reply.code(502).send({ error: 'Calendly-Buchungslink konnte nicht erstellt werden.' });
+      return;
+    }
+
+    // Persist before sending: the link is single-use, so losing it to a failed
+    // send would burn it. Stored first, the panel can always show/copy it.
+    const [updated] = await db
+      .update(orders)
+      .set({
+        metadata: { ...(row.metadata ?? {}), calendly: link.meta },
+        updatedAt: new Date(),
+      })
+      .where(eq(orders.id, id))
+      .returning();
+    const orderPayload = {
+      ...(updated ?? row),
+      orderNumber: orderNumberOf(updated ?? row),
+    };
+
+    let emailed = false;
+    if (send) {
+      const [companyRow] = await db
+        .select()
+        .from(company)
+        .where(eq(company.slug, companySlug))
+        .limit(1);
+      if (!companyRow) {
+        reply.code(500).send({ error: 'Company not found' });
+        return;
+      }
+      const result = await sendEmail({
+        to: row.customerEmail,
+        from: brandSender(companyRow),
+        apiKey: companyRow.resendApiKey ?? undefined,
+        replyTo: companyRow.email ?? undefined,
+        // Under the order's OWN brand — the CLEANILO exception covers the Calendly
+        // booking page and calendar, not our customer mail.
+        email: pickupSchedulingLinkEmail({
+          brand: brandInfoFromCompany(companyRow),
+          customerName: row.customerName,
+          orderNumber: orderNumberOf(row),
+          bookingUrl: link.bookingUrl,
+        }),
+      });
+      if (!result.ok) {
+        request.log.error(
+          { orderId: id, error: result.error },
+          'calendly: scheduling link email failed',
+        );
+        // The link exists and is stored — hand it back so it can be sent by hand.
+        reply.code(502).send({
+          error:
+            'Buchungslink wurde erstellt, aber die E-Mail konnte nicht gesendet werden. Der Link steht im Auftrag und kann manuell verschickt werden.',
+          bookingUrl: link.bookingUrl,
+          order: orderPayload,
+        });
+        return;
+      }
+      emailed = !result.skipped;
+    }
+
+    reply.code(201);
+    return {
+      order: orderPayload,
+      bookingUrl: link.bookingUrl,
+      emailed,
+    };
   });
 
   // Operator proposes up to 3 pickup/appointment times directly from the panel

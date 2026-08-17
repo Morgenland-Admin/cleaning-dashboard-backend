@@ -16,6 +16,7 @@
  *     --no-db        read the identity from the boot seed instead of the DB
  *     --no-logo      skip the raster wordmark → exercises the drawn fallback
  *     --long         30 line items → exercises pagination + "Seite n von m"
+ *     --paket        Paketrechnung: positions without prices, one package price
  *     --paid         paymentMethod 'card' → paid variant, no due date
  *     --no-tax       §19 UStG Kleinunternehmer variant
  *     --handwerker   §35a EStG labour-share block above the closing line
@@ -41,30 +42,85 @@ const slug = opt('--slug') ?? 'cleanilo';
 const out = opt('--out') ?? 'invoice-sample.pdf';
 const paid = flag('--paid');
 const noTax = flag('--no-tax');
+const paket = flag('--paket');
 
-const lineItems: InvoiceForEmail['lineItems'] = flag('--long')
-  ? Array.from({ length: 30 }, (_, i) => ({
-      label: `Teppichreinigung Position ${i + 1} – Handwäsche mit Spezialshampoo`,
-      note: i % 3 === 0 ? 'Premiumreinigung' : null,
-      quantity: 1,
-      unitPriceCents: 8800,
-    }))
-  : [
-      {
-        label: 'Teppichbodenreinigung – Obere Etage',
-        note: 'Premiumreinigung',
-        quantity: 1,
-        unitPriceCents: 135_000,
-      },
-      {
-        label: 'Teppichbodenreinigung – Untere Etage',
-        note: 'Premiumreinigung',
-        quantity: 1,
-        unitPriceCents: 130_000,
-      },
-    ];
+/**
+ * Paketrechnung fixture: the positions describe the scope of work only, so they
+ * carry no price (`unitPriceCents: 0`) and the agreed net package price is the
+ * subtotal. Mirrors the multi-trade renovation invoices this mode exists for.
+ */
+const PACKAGE_NET_CENTS = 1_250_000;
+const packageLineItems: InvoiceForEmail['lineItems'] = [
+  {
+    label:
+      'Rückbau- und Vorbereitungsarbeiten in EG, OG, Zwischenräumen und Dachgeschoss gemäß Angebot',
+    note: null,
+    quantity: 1,
+    unitPriceCents: 0,
+  },
+  {
+    label: 'Erdgeschoss: Aufnahme und fachgerechte Entsorgung des vorhandenen Teppichbodens',
+    note: null,
+    quantity: 1,
+    unitPriceCents: 0,
+  },
+  {
+    label: 'Kellertreppe: Instandsetzungsarbeiten an Wänden und Stufen',
+    note: null,
+    quantity: 1,
+    unitPriceCents: 0,
+  },
+  {
+    label:
+      'Obergeschoss: Reinigung des vorhandenen Teppichbodens sowie Ergänzung/Instandsetzung eines beschädigten Teilbereichs',
+    note: null,
+    quantity: 1,
+    unitPriceCents: 0,
+  },
+  {
+    label:
+      'Zwischenräume/Abstellbereiche: Rückbau und Entsorgung undichter Dämm- und Abdichtungsbestandteile; Einbau neuer Dämmwolle und neuer Dampfbremse',
+    note: null,
+    quantity: 1,
+    unitPriceCents: 0,
+  },
+  {
+    label:
+      'Dachgeschoss: vollständige Entfernung des Teppichbodens, umfassende Grundreinigung der Flächen, leichte Instandsetzung erkennbarer undichter Stellen',
+    note: null,
+    quantity: 1,
+    unitPriceCents: 0,
+  },
+];
 
-const subtotalCents = lineItems.reduce((a, l) => a + Math.round(l.quantity * l.unitPriceCents), 0);
+const lineItems: InvoiceForEmail['lineItems'] = paket
+  ? packageLineItems
+  : flag('--long')
+    ? Array.from({ length: 30 }, (_, i) => ({
+        label: `Teppichreinigung Position ${i + 1} – Handwäsche mit Spezialshampoo`,
+        note: i % 3 === 0 ? 'Premiumreinigung' : null,
+        quantity: 1,
+        unitPriceCents: 8800,
+      }))
+    : [
+        {
+          label: 'Teppichbodenreinigung – Obere Etage',
+          note: 'Premiumreinigung',
+          quantity: 1,
+          unitPriceCents: 135_000,
+        },
+        {
+          label: 'Teppichbodenreinigung – Untere Etage',
+          note: 'Premiumreinigung',
+          quantity: 1,
+          unitPriceCents: 130_000,
+        },
+      ];
+
+// Package mode takes its subtotal from the one agreed price, not from the lines.
+const subtotalCents = paket
+  ? PACKAGE_NET_CENTS
+  : lineItems.reduce((a, l) => a + Math.round(l.quantity * l.unitPriceCents), 0);
 const taxCents = noTax ? 0 : Math.round((subtotalCents * 19) / 100);
 
 // Neutral placeholder recipient — never a real customer.
@@ -77,7 +133,9 @@ const invoice: InvoiceForEmail = {
   recipientAddressLine2: null,
   recipientPostalCode: '20457',
   recipientCity: 'Hamburg',
-  subject: 'Teppichbodenreinigung – Premiumreinigung',
+  subject: paket
+    ? 'Sanierungs- und Reinigungsarbeiten – Pauschalpaket'
+    : 'Teppichbodenreinigung – Premiumreinigung',
   serviceDate: '2026-08-03',
   serviceDateEnd: null,
   sentAt: new Date('2026-08-03T09:00:00Z'),
@@ -88,6 +146,7 @@ const invoice: InvoiceForEmail = {
   subtotalCents,
   totalCents: subtotalCents + taxCents,
   lineItems,
+  packageMode: paket,
   notes: flag('--notes')
     ? 'Die Randfixierung im Flur wurde nach Rücksprache nicht ausgeführt und ist nicht berechnet.'
     : null,

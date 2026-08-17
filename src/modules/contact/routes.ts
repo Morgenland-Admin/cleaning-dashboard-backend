@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { and, asc, desc, eq, lt, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { accessLevelOf, redactForViewer } from '../../lib/access.js';
 import { db } from '../../db/index.js';
 import { company, user } from '../../db/schema/shared.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
@@ -208,19 +209,13 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
   );
 };
 
-const PRIVILEGED_LEVELS = new Set(['manager', 'admin', 'super_admin']);
-
-function redactPii<T extends { ipAddress?: unknown; userAgent?: unknown }>(
-  row: T,
-  accessLevel: string | undefined,
-): T {
-  if (accessLevel && PRIVILEGED_LEVELS.has(accessLevel)) return row;
-  return { ...row, ipAddress: null, userAgent: null };
-}
+const redactPii = redactForViewer;
 
 export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
+  // Replies leave the building as customer mail — manager+ for writes.
+  app.addHook('preHandler', app.requireWriteAccess);
 
   const listQuerySchema = z.object({
     limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -252,7 +247,7 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
-    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    const accessLevel = accessLevelOf(request);
     return {
       messages: page.map((r) => redactPii(r, accessLevel)),
       nextCursor,
@@ -273,7 +268,7 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       .from(contactReplies)
       .where(eq(contactReplies.contactMessageId, id))
       .orderBy(asc(contactReplies.createdAt));
-    const accessLevel = (request.authUser as { accessLevel?: string } | null)?.accessLevel;
+    const accessLevel = accessLevelOf(request);
     return { message: redactPii(row, accessLevel), replies };
   });
 
