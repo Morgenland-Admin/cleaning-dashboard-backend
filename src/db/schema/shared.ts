@@ -146,6 +146,10 @@ export const company = pgTable('company', {
   resendApiKey: text('resend_api_key'),
   keyPrefix: varchar('key_prefix', { length: 64 }),
   storefrontOrigin: text('storefront_origin'),
+  // Whether a paid order's automatic invoice issues + emails itself right away.
+  // Off = it stays a draft, so an operator can add positions agreed after the
+  // booking (a repair, say) and finalise once. See modules/invoices/from-order.ts.
+  autoIssueInvoices: boolean('auto_issue_invoices').notNull().default(true),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),

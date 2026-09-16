@@ -23,6 +23,7 @@ import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
 import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
 import { computeCommission, parseCommissionRate } from '../../lib/commission.js';
+import { createInvoiceDraftForOrder } from '../invoices/from-order.js';
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
 import { captureException } from '../../lib/observability.js';
 import { fireN8nWebhook } from '../../lib/n8n.js';
@@ -2318,12 +2319,67 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       .from(orderStatusLog)
       .where(eq(orderStatusLog.orderId, id))
       .orderBy(desc(orderStatusLog.createdAt));
+    // The order's invoice, if one exists. Summary only — the full record lives
+    // at /admin/invoices/:id — but enough for the pane to decide between
+    // "create", "open the draft" and "issued, here is the number".
+    const { invoices } = request.company!.tables;
+    const [invoiceRow] = await db
+      .select({
+        id: invoices.id,
+        number: invoices.number,
+        status: invoices.status,
+        totalCents: invoices.totalCents,
+        currency: invoices.currency,
+        issuedAt: invoices.sentAt,
+        dueAt: invoices.dueAt,
+      })
+      .from(invoices)
+      .where(eq(invoices.orderId, id))
+      .limit(1);
+
     return {
       order: redactOrderPii({ ...row, orderNumber: orderNumberOf(row) }, accessLevelOf(request)),
       items,
       statusLog: log,
       allowedNextStatuses: allowedNextStatuses(row.status as OrderStatus),
+      invoice: invoiceRow ?? null,
     };
+  });
+
+  /**
+   * Create the draft invoice for this order by hand.
+   *
+   * Deliberately never issues, whatever the brand's `auto_issue_invoices` says:
+   * the whole point of the button is to get an editable draft carrying the
+   * order's positions, so work agreed after the booking (a repair, say) can be
+   * added and the customer still gets one invoice. Finalising is a separate,
+   * explicit step on the invoice itself.
+   *
+   * Idempotent — an order already carrying an invoice returns that one with
+   * `created: false` rather than a second document.
+   */
+  app.post('/:id/invoice', async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const adminId = request.authUser!.id;
+    const { orders } = request.company!.tables;
+
+    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
+    if (!row) {
+      reply.code(404).send({ error: 'Order not found' });
+      return;
+    }
+
+    const result = await createInvoiceDraftForOrder(
+      request.company!.tables,
+      { ...row, orderNumber: orderNumberOf(row) },
+      { reason: 'Manuell aus Auftrag erstellt', changedByUserId: adminId },
+    );
+
+    if (!result.invoice) {
+      reply.code(500).send({ error: 'Invoice could not be created' });
+      return;
+    }
+    return { invoice: result.invoice, created: result.created };
   });
 
   app.post('/:id/transition', async (request, reply) => {

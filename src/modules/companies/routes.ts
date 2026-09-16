@@ -64,6 +64,7 @@ const companyPublicColumns = {
   senderEmail: company.senderEmail,
   senderName: company.senderName,
   storefrontOrigin: company.storefrontOrigin,
+  autoIssueInvoices: company.autoIssueInvoices,
   isActive: company.isActive,
 } as const;
 
@@ -181,6 +182,9 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     senderEmail: z.string().email().nullable().optional(),
     senderName: z.string().max(200).nullable().optional(),
     storefrontOrigin: z.string().url().nullable().optional(),
+    // Off = a paid order's automatic invoice stops at the draft, so positions
+    // agreed after the booking can still be added before it is finalised.
+    autoIssueInvoices: z.boolean().optional(),
     isActive: z.boolean().optional(),
   });
   app.patch('/:slug', { preHandler: app.requireAudience('admin') }, async (request, reply) => {

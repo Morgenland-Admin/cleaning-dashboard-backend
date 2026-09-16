@@ -57,6 +57,13 @@
       "when": 1789000200000,
       "tag": "0007_add_ai_prompts",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789000300000,
+      "tag": "0008_add_company_auto_issue_invoices",
+      "breakpoints": true
     }
   ]
 }
