@@ -90,6 +90,11 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
         connection.close(4403, 'Not a member of this brand');
         return;
       }
+      // Partner chat is outside the blog/SEO scope (see seoMayAccess).
+      if (accessLevel === 'seo') {
+        connection.close(4403, 'Insufficient access level');
+        return;
+      }
     }
 
     const leave = join(roomKey(q.slug, q.partnerUserId), {

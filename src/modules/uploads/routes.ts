@@ -101,11 +101,12 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
 
   // Presign a publicly-readable image upload (e.g. a blog featured image). Returns
   // a stable public URL the caller stores in the article's schemaJsonld.image.
+  // `seo` is let in because the blog editor is its whole job.
   app.post(
     '/sign-public-image',
     {
       config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
-      preHandler: app.requireAccess('super_admin', 'admin', 'manager'),
+      preHandler: app.requireAccess('super_admin', 'admin', 'manager', 'seo'),
     },
     async (request, reply) => {
       if (!s3Configured) {

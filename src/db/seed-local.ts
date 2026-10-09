@@ -16,7 +16,7 @@ const DEFAULT_PW = process.env.LOCAL_SEED_PASSWORD ?? 'admin@12345';
 const N8N_PW = process.env.N8N_ROBOT_PASSWORD ?? 'n8n-local-12345';
 
 type Role = 'owner' | 'admin' | 'manager' | 'viewer';
-type Access = 'super_admin' | 'admin' | 'manager' | 'viewer';
+type Access = 'super_admin' | 'admin' | 'manager' | 'seo' | 'viewer';
 
 interface LocalUser {
   email: string;
@@ -67,6 +67,19 @@ const USERS: LocalUser[] = [
     password: DEFAULT_PW,
     accessLevel: 'viewer',
     memberships: { teppichreinigen_lassen: 'viewer' },
+  },
+  {
+    // Blog/SEO writer: blog, reviews (read) and brands only — see lib/access.ts.
+    email: 'mia.schulz@reinigungs-portal.com',
+    firstName: 'Mia',
+    lastName: 'Schulz',
+    password: DEFAULT_PW,
+    accessLevel: 'seo',
+    memberships: {
+      cleanilo: 'viewer',
+      hamburg_teppichreinigung: 'viewer',
+      teppichreinigen_lassen: 'viewer',
+    },
   },
   {
     email: process.env.N8N_ROBOT_EMAIL ?? 'n8n@morgenland-teppiche.de',

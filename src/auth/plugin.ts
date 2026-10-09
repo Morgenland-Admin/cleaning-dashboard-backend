@@ -3,7 +3,10 @@ import fp from 'fastify-plugin';
 import { auth } from './index.js';
 
 type Audience = 'admin' | 'partner' | 'customer';
-type AccessLevel = 'super_admin' | 'admin' | 'manager' | 'viewer' | 'none';
+// `seo` is a blog/SEO writer: the admin router only lets it reach the routes in
+// `seoMayAccess` (lib/access.ts), and the few writes it needs opt it in
+// explicitly. It is not in requireWriteAccess's list.
+type AccessLevel = 'super_admin' | 'admin' | 'manager' | 'seo' | 'viewer' | 'none';
 
 function toWebRequest(request: FastifyRequest): Request {
   const url = `${request.protocol}://${request.headers.host}${request.url}`;

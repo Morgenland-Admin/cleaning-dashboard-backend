@@ -14,7 +14,7 @@ import { badRequest, conflict, notFound } from '../../lib/http-errors.js';
 
 const ROLES = ['owner', 'admin', 'manager', 'viewer', 'partner'] as const;
 const AUDIENCES = ['admin', 'partner'] as const;
-const ACCESS_LEVELS = ['super_admin', 'admin', 'manager', 'viewer', 'none'] as const;
+const ACCESS_LEVELS = ['super_admin', 'admin', 'manager', 'seo', 'viewer', 'none'] as const;
 
 const partnerPrefillSchema = z.object({
   companyName: z.string().min(1).max(200),

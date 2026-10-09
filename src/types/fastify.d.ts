@@ -14,7 +14,7 @@ declare module 'fastify' {
     requireAuth: preHandlerHookHandler;
     requireAudience(...audiences: Array<'admin' | 'partner' | 'customer'>): preHandlerHookHandler;
     requireAccess(
-      ...levels: Array<'super_admin' | 'admin' | 'manager' | 'viewer' | 'none'>
+      ...levels: Array<'super_admin' | 'admin' | 'manager' | 'seo' | 'viewer' | 'none'>
     ): preHandlerHookHandler;
     /**
      * Gate for a whole route group: GET/HEAD/OPTIONS pass through, every other

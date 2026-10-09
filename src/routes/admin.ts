@@ -24,9 +24,17 @@ import priceAdjustmentsAdminRoutes from '../modules/price-adjustments/routes.js'
 import { seoAdminRoutes } from '../modules/seo/routes.js';
 import { aiAdminRoutes } from '../modules/ai/routes.js';
 import searchRoutes from '../modules/search/routes.js';
+import { accessLevelOf, seoMayAccess } from '../lib/access.js';
 
 const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
+  // `seo` users only reach the blog/SEO allowlist; everything else is 403,
+  // including routes registered after this line in the future.
+  app.addHook('preHandler', async (request, reply) => {
+    if (accessLevelOf(request) !== 'seo') return;
+    if (seoMayAccess(request.method, request.routeOptions.url)) return;
+    reply.code(403).send({ error: 'Insufficient access level' });
+  });
 
   await app.register(usersRoutes, { prefix: '/users' });
   await app.register(companiesRoutes, { prefix: '/companies' });

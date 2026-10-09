@@ -4,6 +4,7 @@ import { z } from 'zod';
 
 import { db } from '../../db/index.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
+import { SEO_HIDDEN_REVIEW_FIELDS, accessLevelOf, redactListForViewer } from '../../lib/access.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
 
@@ -135,7 +136,14 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
-    return { reviews: page, nextCursor };
+    // Blog/SEO writers read reviews for content, not to contact the reviewer.
+    const level = accessLevelOf(request);
+    const reviewsOut = redactListForViewer(
+      page,
+      level,
+      level === 'seo' ? SEO_HIDDEN_REVIEW_FIELDS : [],
+    );
+    return { reviews: reviewsOut, nextCursor };
   });
 
   // Mutations need at least manager level — viewers stay read-only.

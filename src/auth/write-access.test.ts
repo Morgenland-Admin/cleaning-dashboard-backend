@@ -29,7 +29,7 @@ import { buildApp, type App } from '../app.js';
 import { db, pool } from '../db/index.js';
 import { company, membership, user } from '../db/schema/shared.js';
 
-type AccessLevel = 'super_admin' | 'admin' | 'manager' | 'viewer';
+type AccessLevel = 'super_admin' | 'admin' | 'manager' | 'seo' | 'viewer';
 
 /** Identity the stubbed session returns, chosen per request by `x-test-user`. */
 interface TestIdentity {
@@ -43,6 +43,7 @@ const IDENTITIES: Record<AccessLevel, TestIdentity> = {
   super_admin: { id: `${TEST_USER_PREFIX}super`, accessLevel: 'super_admin', audience: 'admin' },
   admin: { id: `${TEST_USER_PREFIX}admin`, accessLevel: 'admin', audience: 'admin' },
   manager: { id: `${TEST_USER_PREFIX}manager`, accessLevel: 'manager', audience: 'admin' },
+  seo: { id: `${TEST_USER_PREFIX}seo`, accessLevel: 'seo', audience: 'admin' },
   viewer: { id: `${TEST_USER_PREFIX}viewer`, accessLevel: 'viewer', audience: 'admin' },
 };
 
@@ -178,6 +179,48 @@ describe(
       });
     }
 
+    // --- reads: `seo` sees the blog/SEO allowlist and nothing else ----------
+    //
+    // The scope is an allowlist (lib/access.ts `seoMayAccess`), so the refused
+    // side is every operational read plus the global surfaces the shell polls.
+    const SEO_READS = ['/admin/seo-pages', '/admin/reviews', '/admin/companies', '/admin/users/me'];
+
+    for (const url of SEO_READS) {
+      it(`seo can read ${url}`, async () => {
+        const res = await call('seo', 'GET', url);
+        assert.equal(
+          res.statusCode,
+          200,
+          `expected 200, got ${res.statusCode}: ${res.body.slice(0, 200)}`,
+        );
+      });
+    }
+
+    for (const url of [
+      ...READS.filter((u) => !SEO_READS.includes(u)),
+      '/admin/dashboard/summary',
+      '/admin/notifications/unread-count',
+      '/admin/search?q=test',
+      '/admin/tasks',
+      '/admin/partners',
+      '/admin/exports',
+      '/admin/push/status',
+    ]) {
+      it(`seo is refused GET ${url}`, async () => {
+        const res = await call('seo', 'GET', url);
+        assert.equal(
+          res.statusCode,
+          403,
+          `expected 403, got ${res.statusCode}: ${res.body.slice(0, 200)}`,
+        );
+      });
+    }
+
+    it('seo is refused brand stats (exact match on /admin/companies)', async () => {
+      const res = await call('seo', 'GET', `/admin/companies/${slug}/stats`);
+      assert.equal(res.statusCode, 403);
+    });
+
     // --- writes: a viewer must be refused ----------------------------------
     //
     // Every entry moves an order, moves money, or sends customer mail.
@@ -220,6 +263,35 @@ describe(
           403,
           `expected 403, got ${res.statusCode}: ${res.body.slice(0, 200)}`,
         );
+      });
+    }
+
+    // --- writes: `seo` writes blog/SEO pages and their images only ----------
+    //
+    // Only POST probes: an invalid PATCH body can pass a schema of all-optional
+    // fields, and a DELETE has no body to fail on — both would touch a real row.
+    const SEO_WRITES: Array<[method: 'POST', url: string]> = [
+      ['POST', '/admin/seo-pages'],
+      ['POST', '/admin/uploads/sign-public-image'],
+    ];
+
+    for (const [method, url] of WRITES) {
+      if (SEO_WRITES.some(([m, u]) => m === method && u === url)) continue;
+      it(`seo is refused ${method} ${url}`, async () => {
+        const res = await call('seo', method, url);
+        assert.equal(
+          res.statusCode,
+          403,
+          `expected 403, got ${res.statusCode}: ${res.body.slice(0, 200)}`,
+        );
+      });
+    }
+
+    for (const [method, url] of SEO_WRITES) {
+      it(`seo is allowed through to ${method} ${url}`, async () => {
+        const res = await call('seo', method, url);
+        assert.notEqual(res.statusCode, 403, `seo was blocked on ${method} ${url}`);
+        assert.notEqual(res.statusCode, 401, 'seo was treated as unauthenticated');
       });
     }
 
@@ -306,6 +378,14 @@ describe(
             'every viewer-visible order should have internalNotes nulled',
           );
         });
+      });
+
+      it('hides reviewer email + order link from seo', async () => {
+        const asSeo = bodyOf(await call('seo', 'GET', '/admin/reviews?limit=50'));
+        for (const row of asSeo.reviews as Array<Record<string, unknown>>) {
+          assert.equal(row.customerEmail, null, 'customerEmail leaked to seo');
+          assert.equal(row.orderId, null, 'orderId leaked to seo');
+        }
       });
 
       it('hides internalNotes on the contact list from a viewer', async () => {

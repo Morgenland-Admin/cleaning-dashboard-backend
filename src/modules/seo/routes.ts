@@ -113,8 +113,9 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { page: row };
   });
 
-  // Mutations need at least manager level — viewers stay read-only.
-  const canEdit = { preHandler: app.requireAccess('super_admin', 'admin', 'manager') };
+  // Mutations need at least manager level, or the dedicated `seo` level (blog
+  // writers) — viewers stay read-only.
+  const canEdit = { preHandler: app.requireAccess('super_admin', 'admin', 'manager', 'seo') };
 
   app.post('/', canEdit, async (request, reply) => {
     const body = createSchema.parse(request.body);
