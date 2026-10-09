@@ -49,7 +49,12 @@ export function sanitizeHtml(input: string): string {
       img: ['src', 'alt', 'title', 'width', 'height', 'loading'],
       th: ['colspan', 'rowspan', 'scope'],
       td: ['colspan', 'rowspan'],
-      '*': ['id', 'class'],
+      // `style` survives only as text-align (see allowedStyles) — the dashboard
+      // editor's alignment buttons. Every other declaration is dropped.
+      '*': ['id', 'class', 'style'],
+    },
+    allowedStyles: {
+      '*': { 'text-align': [/^(left|right|center|justify)$/] },
     },
     allowedSchemes: ['http', 'https', 'mailto', 'tel'],
     allowedSchemesByTag: { img: ['http', 'https'] },

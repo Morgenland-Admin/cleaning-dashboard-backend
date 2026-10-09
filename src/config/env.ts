@@ -79,6 +79,12 @@ const envSchema = z.object({
   META_CAPI_TOKEN_HAMBURG: optionalString,
   META_TEST_EVENT_CODE_HAMBURG: optionalString,
 
+  // Shared secret for the storefront's on-demand revalidation hook
+  // (POST <storefrontOrigin>/api/revalidate/). Set ⇒ publishing or editing a
+  // blog/SEO page shows on the site within seconds instead of after the 1 h ISR
+  // window. Must equal REVALIDATE_SECRET in that storefront. Unset ⇒ no-op.
+  STOREFRONT_REVALIDATE_SECRET_HAMBURG: optionalString,
+
   // Claude text assistant. Key unset ⇒ /admin/ai/* returns 503 (UI shows a hint).
   ANTHROPIC_API_KEY: optionalString,
   ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-6'),

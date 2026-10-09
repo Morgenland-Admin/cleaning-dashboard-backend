@@ -9,6 +9,8 @@ import { loadCompany } from '../../lib/company-loader.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
 import { sanitizeHtml } from '../../lib/sanitize-html.js';
+import { publicPathsFor, revalidateStorefront } from '../../lib/storefront-revalidate.js';
+import { ensureJsonLdDatePublished, setJsonLdImage, type JsonLd } from './jsonld.js';
 
 const PATH_RE = /^[a-z0-9][a-z0-9/_-]{0,299}$/;
 
@@ -51,6 +53,12 @@ const CONTENT_FIELDS = [
   'schemaJsonld',
   'faq',
 ] as const;
+
+const PUBLIC_STATUSES = ['live', 'protected'] as const;
+
+function isPublicStatus(status: string): boolean {
+  return (PUBLIC_STATUSES as readonly string[]).includes(status);
+}
 
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -137,6 +145,9 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
         source: body.source,
       })
       .returning();
+    if (row && isPublicStatus(row.status)) {
+      void revalidateStorefront(request.company!.slug, publicPathsFor(row), request.log);
+    }
     reply.code(201).send({ page: row });
   });
 
@@ -233,7 +244,25 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     if (body.faq !== undefined) patch.faq = body.faq;
     if (body.gscPosition !== undefined) patch.gscPosition = body.gscPosition.toFixed(2);
 
+    // First publish of a blog post without a date: stamp it now, so the article
+    // and the /blog index show the real publication date, not the draft's insert time.
+    const wasPublic = isPublicStatus(current.status);
+    const nextType = body.type ?? current.type;
+    if (nextType === 'blog' && body.status && isPublicStatus(body.status) && !wasPublic) {
+      const base = (patch.schemaJsonld as JsonLd | null | undefined) ?? current.schemaJsonld;
+      const stamped = ensureJsonLdDatePublished(base ?? null, new Date().toISOString());
+      if (stamped) patch.schemaJsonld = stamped;
+    }
+
     const [row] = await db.update(seoPages).set(patch).where(eq(seoPages.id, id)).returning();
+    if (row && (wasPublic || isPublicStatus(row.status))) {
+      // Old paths too: a slug change or an unpublish must drop the previous URL.
+      void revalidateStorefront(
+        request.company!.slug,
+        [...publicPathsFor(current), ...publicPathsFor(row)],
+        request.log,
+      );
+    }
     return { page: row };
   });
 
@@ -253,6 +282,9 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
       .set({ schemaJsonld, updatedAt: new Date() })
       .where(eq(seoPages.id, id))
       .returning();
+    if (row && isPublicStatus(row.status)) {
+      void revalidateStorefront(request.company!.slug, publicPathsFor(row), request.log);
+    }
     return { page: row };
   });
 
@@ -261,40 +293,12 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     const { seoPages } = request.company!.tables;
     const [row] = await db.delete(seoPages).where(eq(seoPages.id, id)).returning();
     if (!row) throw notFound('SEO page not found');
+    if (isPublicStatus(row.status)) {
+      void revalidateStorefront(request.company!.slug, publicPathsFor(row), request.log);
+    }
     reply.code(204).send();
   });
 };
-
-type JsonLd = Record<string, unknown> | unknown[];
-
-function isObjectNode(node: unknown): node is Record<string, unknown> {
-  return !!node && typeof node === 'object' && !Array.isArray(node);
-}
-
-function isArticleNode(node: unknown): node is Record<string, unknown> {
-  if (!isObjectNode(node)) return false;
-  const type = node['@type'];
-  return typeof type === 'string' && /article|blogposting/i.test(type);
-}
-
-/** Write `image` onto the Article node of a JSON-LD value (object or @graph array). */
-function setJsonLdImage(schema: JsonLd | null, imageUrl: string): JsonLd {
-  if (Array.isArray(schema)) {
-    const target = schema.find(isArticleNode) ?? schema.find(isObjectNode);
-    if (target) {
-      target.image = imageUrl;
-      return schema;
-    }
-    return [...schema, { '@type': 'Article', image: imageUrl }];
-  }
-  if (isObjectNode(schema)) {
-    schema.image = imageUrl;
-    return schema;
-  }
-  return { '@type': 'Article', image: imageUrl };
-}
-
-const PUBLIC_STATUSES = ['live', 'protected'] as const;
 
 /**
  * Overlay rows: the page already exists as a fixed storefront route (e.g. HTR's
