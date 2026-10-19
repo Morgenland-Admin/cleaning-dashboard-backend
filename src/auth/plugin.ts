@@ -3,9 +3,7 @@ import fp from 'fastify-plugin';
 import { auth } from './index.js';
 
 type Audience = 'admin' | 'partner' | 'customer';
-// `seo` is a blog/SEO writer: the admin router only lets it reach the routes in
-// `seoMayAccess` (lib/access.ts), and the few writes it needs opt it in
-// explicitly. It is not in requireWriteAccess's list.
+// `seo` only reaches routes in `seoMayAccess` (lib/access.ts); its writes opt in explicitly.
 type AccessLevel = 'super_admin' | 'admin' | 'manager' | 'seo' | 'viewer' | 'none';
 
 function toWebRequest(request: FastifyRequest): Request {
@@ -119,10 +117,8 @@ const authPlugin: FastifyPluginAsync = async (app: FastifyInstance) => {
 
   app.decorate('requireAccess', requireAccessLevels);
 
-  // Reads stay open to every member of the brand (including `viewer`); anything
-  // that mutates state, moves money or leaves the building as customer mail
-  // needs manager+. Registered as a plugin-level preHandler so a route added
-  // later is gated by default instead of being open until someone remembers.
+  // Reads are open to every brand member (incl. `viewer`); anything that mutates state,
+  // moves money or sends customer mail needs manager+. Used as a plugin-level preHandler.
   const requireManager = requireAccessLevels('super_admin', 'admin', 'manager');
   app.decorate('requireWriteAccess', async (request: FastifyRequest, reply: FastifyReply) => {
     if (request.method === 'GET' || request.method === 'HEAD' || request.method === 'OPTIONS') {

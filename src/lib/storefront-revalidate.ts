@@ -8,12 +8,13 @@ const TIMEOUT_MS = 5_000;
 /** Overlay rows (see seo/routes.ts) render on a fixed storefront route. */
 const OVERLAY_CATEGORY = 'leistung';
 
-// Per-brand secret, like the Resend / Meta creds. Unconfigured ⇒ no-op, and the
-// storefront falls back to its hourly ISR refresh.
+// Per-brand secret; unconfigured is a no-op and the storefront falls back to its hourly ISR refresh.
 function brandSecret(companySlug: string): string | undefined {
   switch (companySlug) {
     case 'hamburg_teppichreinigung':
       return env.STOREFRONT_REVALIDATE_SECRET_HAMBURG;
+    case 'cleanilo':
+      return env.STOREFRONT_REVALIDATE_SECRET_CLEANILO;
     default:
       return undefined;
   }
@@ -23,11 +24,7 @@ export function storefrontRevalidateConfigured(companySlug: string): boolean {
   return !!brandSecret(companySlug);
 }
 
-/**
- * The storefront URLs a seo_pages row renders at. Mirrors the sitemap: blog
- * paths already carry "blog/", overlay rows live on their own fixed route, the
- * rest under /seo/. A blog post also changes the /blog index.
- */
+/** Storefront URLs a seo_pages row renders at (mirrors the sitemap); a blog post also changes the /blog index. */
 export function publicPathsFor(row: {
   type: string;
   path: string;
@@ -38,11 +35,7 @@ export function publicPathsFor(row: {
   return [`/seo/${row.path}`];
 }
 
-/**
- * Tell the brand storefront to drop its cached copy of these paths so a
- * publish / edit / unpublish is visible right away. Fire-and-forget by design:
- * it never throws, and a failure only means the hourly refresh applies.
- */
+/** Drops the storefront's cached copy of these paths. Fire-and-forget: never throws; a failure just means the hourly refresh applies. */
 export async function revalidateStorefront(
   companySlug: string,
   paths: string[],

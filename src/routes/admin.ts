@@ -11,6 +11,7 @@ import { partnersAdminRoutes } from '../modules/partners/routes.js';
 import { uploadsAdminRoutes } from '../modules/uploads/routes.js';
 import { invitesAdminRoutes } from '../modules/invites/routes.js';
 import { ordersAdminCrossRoutes, ordersAdminRoutes } from '../modules/orders/routes.js';
+import { orderReceiptRoutes } from '../modules/orders/receipt-routes.js';
 import exportsAdminRoutes from '../modules/exports/routes.js';
 import pushAdminRoutes from '../modules/push/routes.js';
 import { qrAdminRoutes } from '../modules/qr/routes.js';
@@ -24,12 +25,18 @@ import priceAdjustmentsAdminRoutes from '../modules/price-adjustments/routes.js'
 import { seoAdminRoutes } from '../modules/seo/routes.js';
 import { aiAdminRoutes } from '../modules/ai/routes.js';
 import searchRoutes from '../modules/search/routes.js';
+import emailsAdminRoutes from '../modules/emails/routes.js';
+import { serviceCatalogAdminRoutes } from '../modules/service-catalog/routes.js';
+import { partnerDocumentsAdminRoutes } from '../modules/partners/documents.js';
+import { partnerApplicationsAdminRoutes } from '../modules/partners/applications.js';
+import { dispatchAdminRoutes } from '../modules/dispatch/routes.js';
+import { legacyRecordsAdminRoutes } from '../modules/legacy/routes.js';
+import { staffAdminRoutes } from '../modules/staff/routes.js';
 import { accessLevelOf, seoMayAccess } from '../lib/access.js';
 
 const adminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
-  // `seo` users only reach the blog/SEO allowlist; everything else is 403,
-  // including routes registered after this line in the future.
+  // `seo` users only reach the blog/SEO allowlist; everything else is 403.
   app.addHook('preHandler', async (request, reply) => {
     if (accessLevelOf(request) !== 'seo') return;
     if (seoMayAccess(request.method, request.routeOptions.url)) return;
@@ -49,6 +56,7 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
   await app.register(chatAdminRoutes, { prefix: '/chat' });
   await app.register(ordersAdminCrossRoutes);
   await app.register(ordersAdminRoutes, { prefix: '/orders' });
+  await app.register(orderReceiptRoutes, { prefix: '/orders' });
   await app.register(pushAdminRoutes, { prefix: '/push' });
   await app.register(tasksAdminRoutes, { prefix: '/tasks' });
   await app.register(exportsAdminRoutes, { prefix: '/exports' });
@@ -62,6 +70,13 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
   await app.register(seoAdminRoutes, { prefix: '/seo-pages' });
   await app.register(aiAdminRoutes, { prefix: '/ai' });
   await app.register(searchRoutes, { prefix: '/search' });
+  await app.register(emailsAdminRoutes, { prefix: '/emails' });
+  await app.register(serviceCatalogAdminRoutes, { prefix: '/service-catalog' });
+  await app.register(partnerDocumentsAdminRoutes, { prefix: '/partners' });
+  await app.register(partnerApplicationsAdminRoutes, { prefix: '/partner-applications' });
+  await app.register(dispatchAdminRoutes);
+  await app.register(legacyRecordsAdminRoutes, { prefix: '/legacy-records' });
+  await app.register(staffAdminRoutes, { prefix: '/staff' });
 };
 
 export default adminRoutes;

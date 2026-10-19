@@ -9,20 +9,17 @@ import { linkCustomerByEmail } from '../../lib/customers.js';
 import { tooManyRequests } from '../../lib/http-errors.js';
 import { buildCallbackFields, isInquiryRateLimited, notifyInquiryCreated } from './routes.js';
 
-// Machine-to-machine intake for the voice-AI / web-form callback funnel (via n8n):
-// creates an inquiry, runs the same geo-routing as the public form, and returns
-// the routing decision. Auth is a shared X-Intake-Token, not a user session.
+// Machine-to-machine intake for the voice-AI callback funnel (via n8n): same geo-routing as the public form.
+// Auth is a shared X-Intake-Token, not a user session.
 
 const intakeSchema = z
   .object({
-    // Phone leads may lack email/name; require phone OR email (see refine below).
     name: z.string().min(1).max(120).optional(),
     email: z.string().email().max(254).optional(),
     phone: z.string().max(32).optional(),
     service: z.string().max(200).optional(),
     message: z.string().min(1).max(5000).optional(),
-    callReason: z.string().max(2000).optional(), // "Grund des Anrufs" from the AI
-    // Service PLZ — drives routing.
+    callReason: z.string().max(2000).optional(),
     plz: z
       .string()
       .regex(/^\d{5}$/, 'plz must be exactly 5 digits')
@@ -33,7 +30,7 @@ const intakeSchema = z
       .optional(),
     source: z.string().max(64).optional(),
     locale: z.string().min(2).max(16).optional(),
-    consentPrivacy: z.boolean().optional(), // prior consent assumed; default true
+    consentPrivacy: z.boolean().optional(),
 
     consentMarketing: z.boolean().optional(),
     metadata: z.record(z.string().max(120), z.unknown()).optional(),
@@ -43,7 +40,6 @@ const intakeSchema = z
     path: ['phone'],
   });
 
-// Constant-time compare, tolerant of length mismatch.
 function tokenMatches(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
@@ -77,8 +73,7 @@ export const inquiriesIntakeRoutes: FastifyPluginAsync = async (app) => {
       const body = intakeSchema.parse(request.body);
       const { serviceInquiries, customers } = request.company!.tables;
 
-      // Idempotency: the funnel may retry — return the existing lead if the
-      // call id was already recorded, instead of duplicating it.
+      // Idempotent: the funnel may retry, so return the existing lead if the call id was already recorded.
       const retellCallId =
         typeof body.metadata?.retellCallId === 'string' ? body.metadata.retellCallId : null;
       if (retellCallId) {
@@ -104,12 +99,10 @@ export const inquiriesIntakeRoutes: FastifyPluginAsync = async (app) => {
         }
       }
 
-      // Nameless phone leads still need a dashboard label.
       const name = body.name?.trim() || 'Telefon-Lead';
       const email = body.email?.trim() || null;
 
-      // Per-email backstop against a runaway loop (checked after idempotency so a
-      // legitimate retry of the same call still returns its existing lead above).
+      // Per-email backstop; checked after idempotency so a retry of the same call still returns its lead.
       if (await isInquiryRateLimited(serviceInquiries, email)) {
         request.log.warn({ email }, 'Intake rejected — per-email hourly rate limit exceeded');
         throw tooManyRequests(
@@ -118,7 +111,6 @@ export const inquiriesIntakeRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const consentMarketing = body.consentMarketing ?? false;
-      // No email ⇒ can't dedupe a customer; the inquiry stands alone.
       const customerId = email
         ? await linkCustomerByEmail(db, customers, {
             email,

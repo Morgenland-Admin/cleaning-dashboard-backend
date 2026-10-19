@@ -1,8 +1,4 @@
-/**
- * Pure parse + dedup + plan logic for the CLEANILO historical import.
- * No side effects, no DB — shared by the dry-run runner and the commit writer
- * so the numbers Kabir signs off on are exactly what gets written.
- */
+/** Pure parse + dedup + plan logic, shared by dry run and commit so the signed-off numbers are what gets written. */
 import { readFileSync } from 'node:fs';
 
 import { computeLoyaltyTier, type LoyaltyTier } from '../src/lib/loyalty.ts';
@@ -20,10 +16,10 @@ export interface RawInvoice {
 
 export interface ParsedInvoice {
   invoiceNumber: string; // final, unique number ("2023/1238-1" for a de-duped collision)
-  originalNumber: string; // as scanned ("2023/1238"); preserved for GoBD traceability
+  originalNumber: string; // as scanned ("2023/1238"); kept for GoBD traceability
   sourceFile: string;
-  date: string; // valid ISO date — resolved to <year>-01-01 when the source was blank
-  dateEstimated: boolean; // true when the source `datum` was missing/unparseable
+  date: string; // ISO; <year>-01-01 when the source was blank
+  dateEstimated: boolean;
   grossCents: number;
   service: string;
   name: string;
@@ -66,14 +62,10 @@ export interface ImportPlan {
   invoices: ParsedInvoice[];
   customers: PlannedCustomer[];
   merges: MergeRecord[];
-  /** Empty rows (no customer / no usable data) — skipped, not imported. */
   skipped: ParsedInvoice[];
-  /** Collisions renumbered with a "-N" suffix (original → final). */
   renumbered: Array<{ from: string; to: string; name: string }>;
-  /** CRM name matches rejected as ambiguous — placeholder used instead. */
   ambiguousMatches: Array<{ invoiceNumber: string; candidates: string[] }>;
-  /** B2B segments rejected because the CRM candidates contradicted each other
-   * and the recipient name is not a company/institution — treated as B2C. */
+  /** CRM B2B segments rejected: candidates contradict each other and the name is no company/institution → B2C. */
   disputedB2B: Array<{ invoiceNumber: string; name: string; b2b: string[]; b2c: string[] }>;
 }
 
@@ -82,12 +74,10 @@ export const IMPORT_SOURCE = 'import_cleanilo_2021_26';
 const PLACEHOLDER_DOMAIN = 'import.cleanilo.local';
 
 const B2B_SUFFIX_RE = /\b(gmbh|ggmbh|ag|ug|kg|ohg|gbr|mbh|e\.?\s?v\.?|se|kgaa|ltd|inc)\b/i;
-/** Institutions that are plainly not private households but carry no commercial
- * legal form: public-law bodies, schools, day-care, clubs, foundations. */
+/** Non-household institutions without a commercial legal form: public bodies, schools, day-care, clubs, foundations. */
 const B2B_INSTITUTION_RE =
   /(k\.?\s?d\.?\s?[öÖ]\.?\s?r\.?|\bschule\b|\bschool\b|\bkita\b|\bkindergarten\b|\bverein\b|\bstiftung\b)/i;
 
-/** True when the invoice's own recipient name identifies a company or institution. */
 export function isBusinessName(name: string): boolean {
   return B2B_SUFFIX_RE.test(name) || B2B_INSTITUTION_RE.test(name);
 }
@@ -163,8 +153,7 @@ function lev(a: string, b: string): number {
   return prev[n]!;
 }
 
-/** Resolve a usable ISO date; blank/unparseable source dates fall back to the
- * invoice-number's year (Jan 1) so the record still sorts into the right year. */
+/** Blank/unparseable source dates fall back to Jan 1 of the invoice number's year. */
 function resolveDate(datum: string, rg: string): { date: string; estimated: boolean } {
   if (/^\d{4}-\d{2}-\d{2}$/.test((datum ?? '').trim()))
     return { date: datum.trim(), estimated: false };
@@ -234,22 +223,8 @@ export function parseReconciliation(csvPath: string): CsvMatch[] {
 }
 
 /**
- * Attach verified emails + B2B flags from the reconciliation onto invoices.
- *
- * A name_exact + SICHER row only yields a real address when it is the *only*
- * such candidate for that invoice. Where the CRM offers several equally-rated
- * name matches (a bare surname like "Schmidt" can hit many people), the name
- * alone does not identify the customer and this file carries no address to
- * corroborate it — so the invoice keeps a placeholder rather than risking a
- * stranger's address on a customer record. Rejections are reported.
- *
- * The segment column is treated the same way (Kabir, 08/2026). The CRM rows are
- * *candidates*, and a weak one (shared first name, shared email token) usually
- * belongs to somebody else — so a single "B2B" among contradicting candidates
- * says nothing about the invoice's recipient. B2B from the CRM is therefore
- * accepted only when no candidate for that invoice says B2C. A name that
- * identifies a company or institution on its own (`isBusinessName`) is decided
- * at parse time and never depends on the CRM at all. Rejections are reported.
+ * Attaches verified emails + B2B flags. A real address needs a sole name_exact + SICHER candidate (a name alone never
+ * verifies one, so ambiguous invoices keep a placeholder); CRM B2B counts only when no candidate says B2C.
  */
 export function applyMatches(
   invoices: ParsedInvoice[],
@@ -262,8 +237,7 @@ export function applyMatches(
   const b2bByInvoice = new Map<string, string[]>();
   const b2cByInvoice = new Map<string, string[]>();
   for (const m of matches) {
-    // Rows with neither marker are unmatched/shifted CSV lines — they carry no
-    // verdict and must not count as a contradiction.
+    // Rows with neither marker are unmatched/shifted CSV lines: no verdict, not a contradiction.
     const label = `${m.crmName || '(kein Name)'} <${m.crmEmail || '-'}> [${m.matchType}/${m.status}]`;
     const bucket = /B2B/i.test(m.segment)
       ? b2bByInvoice
@@ -294,18 +268,14 @@ export function applyMatches(
     if (!b2b) continue;
     const b2c = b2cByInvoice.get(inv.invoiceNumber);
     if (!b2c) inv.isB2B = true;
-    // Contradicted: the name alone decides, and it already did at parse time.
+    // Contradicted: only the name decides (already done at parse time).
     else if (!inv.isB2B)
       disputedB2B.push({ invoiceNumber: inv.invoiceNumber, name: inv.name, b2b, b2c });
   }
   return { ambiguous, disputedB2B };
 }
 
-/**
- * Dedup rule (agreed): verified email wins; otherwise normalised address, and
- * within one address names within edit-distance ≤ 2 collapse to one customer
- * (catches Riggers/Rieggers). Aggregates orders/spend and derives the tier.
- */
+/** Dedup: verified email wins; else normalised address, where names within edit distance 2 merge. */
 export function buildPlan(invoices: ParsedInvoice[]): {
   customers: PlannedCustomer[];
   merges: MergeRecord[];
@@ -388,17 +358,11 @@ export function buildPlan(invoices: ParsedInvoice[]): {
   return { customers, merges };
 }
 
-/** Empty row: no customer name and no address — skipped per Kabir (e.g. 2023/1224). */
 export function isEmptyInvoice(inv: ParsedInvoice): boolean {
   return inv.name.trim() === '' && !inv.street && !inv.plz;
 }
 
-/**
- * The source reused a handful of invoice numbers (manually assigned, duplicated
- * by accident). Kabir's rule: keep the first occurrence's number, suffix each
- * later one with "-1", "-2", … so every invoice number is unique for GoBD.
- * Mutates `invoiceNumber`; `originalNumber` is left untouched.
- */
+/** First occurrence keeps its number, later duplicates get "-1", "-2", … (GoBD: unique). Mutates `invoiceNumber` only. */
 export function renumberCollisions(
   invoices: ParsedInvoice[],
 ): Array<{ from: string; to: string; name: string }> {
@@ -417,12 +381,11 @@ export function renumberCollisions(
 
 export function makePlan(jsonPath: string, csvPath: string): ImportPlan {
   const all = parseInvoices(jsonPath);
-  // Match against the CRM by the original scanned number (the CSV uses those)…
+  // The CSV uses the original numbers, so match before renumbering.
   const { ambiguous: ambiguousMatches, disputedB2B } = applyMatches(
     all,
     parseReconciliation(csvPath),
   );
-  // …then drop empty rows and make the reused numbers unique.
   const skipped = all.filter(isEmptyInvoice);
   const invoices = all.filter((i) => !isEmptyInvoice(i));
   const renumbered = renumberCollisions(invoices);

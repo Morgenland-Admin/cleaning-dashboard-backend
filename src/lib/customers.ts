@@ -3,15 +3,9 @@ import { sql } from 'drizzle-orm';
 import { type db } from '../db/index.js';
 import type { TenantTables } from '../db/schema/tenant.js';
 
-/** db or an open transaction — both expose select/insert with the same shape. */
 type Executor = Pick<typeof db, 'select' | 'insert'>;
 
-/**
- * Upsert a customer by email (case-insensitive) and return its id. Never
- * overwrites an existing row — name/phone are only used when creating. Used by
- * the storefront create paths (orders, inquiries, contacts, newsletter) to keep
- * `customer_id` populated going forward; the boot-time backfill handles history.
- */
+/** Upserts a customer by email (case-insensitive) and returns its id; never overwrites an existing row (name/phone only on create). */
 export async function linkCustomerByEmail(
   exec: Executor,
   customers: TenantTables['customers'],

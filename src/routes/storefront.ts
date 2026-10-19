@@ -10,6 +10,11 @@ import { qrPublicRoutes } from '../modules/qr/routes.js';
 import { voucherPublicRoutes } from '../modules/voucher/routes.js';
 import { reviewsPublicRoutes } from '../modules/reviews/routes.js';
 import { seoPublicRoutes } from '../modules/seo/routes.js';
+import { serviceCatalogPublicRoutes } from '../modules/service-catalog/routes.js';
+import { partnerApplicationsPublicRoutes } from '../modules/partners/applications.js';
+import { brandPublicRoutes } from '../modules/brand/routes.js';
+import { accountPublicRoutes } from '../modules/account/routes.js';
+import { withdrawalsPublicRoutes } from '../modules/withdrawals/routes.js';
 
 const storefrontRoutes: FastifyPluginAsync = async (app) => {
   await app.register(catalogPublicRoutes, { prefix: '/catalog' });
@@ -24,6 +29,11 @@ const storefrontRoutes: FastifyPluginAsync = async (app) => {
   await app.register(reviewsPublicRoutes, { prefix: '/reviews' });
   await app.register(seoPublicRoutes, { prefix: '/seo' });
   await app.register(qrPublicRoutes, { prefix: '/q' });
+  await app.register(serviceCatalogPublicRoutes, { prefix: '/services' });
+  await app.register(partnerApplicationsPublicRoutes, { prefix: '/partner-applications' });
+  await app.register(brandPublicRoutes, { prefix: '/brand' });
+  await app.register(accountPublicRoutes, { prefix: '/account' });
+  await app.register(withdrawalsPublicRoutes, { prefix: '/withdrawals' });
 };
 
 export default storefrontRoutes;

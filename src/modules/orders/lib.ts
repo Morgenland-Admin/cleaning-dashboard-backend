@@ -1,21 +1,9 @@
 import { nanoid } from 'nanoid';
 
 /**
- * Status FSM mirroring workflow ALL_09. The status of an order can only move
- * along these directed edges; the admin UI greys out transitions that aren't
- * allowed from the current state.
- *
- * pending           — order row exists, no payment yet (DRAFT before checkout)
- * payment_pending   — Stripe Checkout Session created, waiting for completion
- * paid              — Stripe webhook reported success; ready for admin to accept
- * accepted          — admin acknowledged + scheduled
- * picked_up         — driver collected the carpet (or customer dropped off)
- * in_cleaning       — workshop is processing
- * ready             — done, awaiting delivery / pickup
- * delivered         — handed back to customer
- * completed         — customer confirmed receipt (or 14-day auto-complete)
- * cancelled         — terminated before payment/processing (refund handled separately)
- * refunded          — money returned, terminal
+ * Status FSM (mirrors workflow ALL_09); the admin UI greys out disallowed transitions.
+ * `completed` = customer confirmed receipt or 14-day auto-complete; `cancelled` = before
+ * processing, refund is separate.
  */
 export type OrderStatus =
   | 'pending'
@@ -46,11 +34,7 @@ export const ORDER_STATUSES: readonly OrderStatus[] = [
   'refunded',
 ];
 
-/**
- * Allowed forward + side transitions. Any paid state can move to
- * partially_refunded (some money back, order continues) or refunded (terminal).
- * A partially_refunded order can still be fully refunded later.
- */
+/** Allowed transitions; partially_refunded keeps the order going and can still be fully refunded. */
 const FORWARD: Record<OrderStatus, OrderStatus[]> = {
   pending: ['payment_pending', 'cancelled'],
   payment_pending: ['paid', 'cancelled'],
@@ -83,7 +67,55 @@ export function allowedNextStatuses(from: OrderStatus): OrderStatus[] {
   return FORWARD[from] ?? [];
 }
 
-/** Map a status to the order column that stamps its at-time. Falsy = no col. */
+export type PartnerStep = 'accepted' | 'picked_up' | 'in_cleaning' | 'ready' | 'delivered';
+
+interface PartnerProgress {
+  status: string;
+  acceptedAt?: Date | null;
+  pickedUpAt?: Date | null;
+  inCleaningAt?: Date | null;
+  readyAt?: Date | null;
+  deliveredAt?: Date | null;
+  completedAt?: Date | null;
+}
+
+/** The single status the assigned partner may set next; null when nothing is theirs to do. */
+export function partnerNextStatus(order: PartnerProgress): PartnerStep | null {
+  switch (order.status) {
+    // `paid` → `accepted` is the team's call, not the partner's.
+    case 'accepted':
+      return 'picked_up';
+    case 'picked_up':
+      return 'in_cleaning';
+    case 'in_cleaning':
+      return 'ready';
+    case 'ready':
+      return 'delivered';
+    case 'partially_refunded':
+      // Resumes after the furthest step reached; the FSM alone would allow going backwards.
+      if (order.deliveredAt || order.completedAt) return null;
+      if (order.readyAt) return 'delivered';
+      if (order.inCleaningAt) return 'ready';
+      if (order.pickedUpAt) return 'in_cleaning';
+      return order.acceptedAt ? 'picked_up' : null;
+    default:
+      return null;
+  }
+}
+
+/** Orders that are finished from the partner's side (their last step is `delivered`). */
+export const PARTNER_DONE_STATUSES: readonly OrderStatus[] = [
+  'delivered',
+  'completed',
+  'cancelled',
+  'refunded',
+];
+
+export function isPartnerDone(order: PartnerProgress): boolean {
+  if ((PARTNER_DONE_STATUSES as readonly string[]).includes(order.status)) return true;
+  return order.status === 'partially_refunded' && !!(order.deliveredAt || order.completedAt);
+}
+
 export function statusTimestampColumn(s: OrderStatus): string | null {
   switch (s) {
     case 'paid':
@@ -109,11 +141,45 @@ export function statusTimestampColumn(s: OrderStatus): string | null {
   }
 }
 
-/**
- * URL-safe random token for /bestellung/[token]. 24 chars = ~143 bits of
- * entropy — same order of magnitude as a UUIDv4, but URL-safe without
- * any percent-encoding. Nanoid's default alphabet excludes ambiguous chars.
- */
+/** URL-safe token for /bestellung/[token]; 24 chars ≈ 143 bits of entropy. */
 export function generateOrderToken(): string {
   return nanoid(24);
+}
+
+export const KIND_LABEL: Record<string, string> = {
+  teppichreinigung: 'Teppichreinigung',
+  teppichreparatur: 'Teppichreparatur',
+  polsterreinigung: 'Polsterreinigung (Vor-Ort)',
+  teppichbodenreinigung: 'Teppichbodenreinigung (Vor-Ort)',
+};
+
+/** "YYYY/000123" from the creation year — never the current year. */
+export function formatOrderNumber(id: number, createdAt: Date): string {
+  return `${createdAt.getUTCFullYear()}/${String(id).padStart(6, '0')}`;
+}
+
+/** Persisted order number; createdAt-based fallback for legacy rows. */
+export function orderNumberOf(row: {
+  id: number;
+  orderNumber?: string | null;
+  createdAt?: Date | null;
+}): string {
+  if (row.orderNumber) return row.orderNumber;
+  return formatOrderNumber(row.id, row.createdAt ?? new Date());
+}
+
+/** Done or dead orders; every other status is still in flight ("open"). */
+export const CLOSED_ORDER_STATUSES: readonly OrderStatus[] = ['completed', 'cancelled', 'refunded'];
+
+/** Substring pattern for ILIKE with the wildcard characters escaped. */
+export function likePattern(q: string): string {
+  return `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+}
+
+/** "2026/000123" → 123: rows without a stored number display one derived from the id. */
+export function derivedOrderId(q: string): number | null {
+  const m = /^(\d{4})\s*\/\s*(\d{1,9})$/.exec(q.trim());
+  if (!m) return null;
+  const n = Number(m[2]);
+  return n > 0 && n <= 2147483647 ? n : null;
 }

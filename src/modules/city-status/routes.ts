@@ -29,7 +29,6 @@ const updateSchema = z.object({
 
 export const cityStatusAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Reads stay open to any member; mutations need manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {

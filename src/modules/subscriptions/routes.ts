@@ -1,9 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { conflict, notFound, parseIntId } from '../../lib/http-errors.js';
 import { getStripe, stripeConfigured } from '../../lib/stripe.js';
 
@@ -43,26 +43,16 @@ const listQuerySchema = z.object({
 
 export const subscriptionsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Reads stay open to any member; mutations (incl. Stripe cancel) need manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
     const { limit, cursor, status, email } = listQuerySchema.parse(request.query);
     const { subscriptions } = request.company!.tables;
-    const decoded = cursor ? decodeCursor(cursor) : null;
     const conds = [];
     if (status) conds.push(eq(subscriptions.status, status));
     if (email) conds.push(eq(subscriptions.customerEmail, email));
-    if (decoded) {
-      const cw = or(
-        lt(subscriptions.createdAt, sql`${decoded.createdAt}::timestamptz`),
-        and(
-          sql`${subscriptions.createdAt} = ${decoded.createdAt}::timestamptz`,
-          lt(subscriptions.id, decoded.id),
-        ),
-      );
-      if (cw) conds.push(cw);
-    }
+    const after = keysetAfter(subscriptions, subscriptions.createdAt, subscriptions.id, cursor);
+    if (after) conds.push(after);
     const rows = await db
       .select()
       .from(subscriptions)
@@ -191,8 +181,7 @@ export const subscriptionsAdminRoutes: FastifyPluginAsync = async (app) => {
         .where(and(eq(subscriptions.id, id), eq(subscriptions.status, row.status)))
         .returning();
       if (!updated) {
-        // The synchronous Stripe webhook may have already written the target
-        // status — that's success, not a conflict.
+        // The Stripe webhook may already have written the target status: success, not a conflict.
         const [latest] = await db
           .select()
           .from(subscriptions)

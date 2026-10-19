@@ -13,9 +13,7 @@ type CompanyRow = typeof company.$inferSelect;
 const MAX_DUNNING_LEVEL = 3;
 /** Minimum days between two automated dunning steps for the same invoice. */
 const DUNNING_INTERVAL_DAYS = 7;
-/** Invoices examined per tenant per sweep — keeps a single tick bounded. */
 const PER_TENANT_BATCH = 100;
-/** Default sweep cadence. Per-invoice spacing makes a tighter interval harmless. */
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -30,11 +28,7 @@ interface DunnableInvoice {
   dunningLevel: number;
 }
 
-/**
- * Render and send a dunning notice for one invoice from the brand's own sender.
- * Best-effort — never throws. `dunningLevel` should be the level being
- * communicated (i.e. the value *after* incrementing).
- */
+/** Best-effort, never throws. `dunningLevel` is the level being communicated (after incrementing). */
 export async function sendDunningEmail(
   companyRow: CompanyRow,
   invoice: DunnableInvoice,
@@ -56,6 +50,7 @@ export async function sendDunningEmail(
   const result = await sendEmail({
     to: invoice.recipientEmail,
     from: brandSender(companyRow),
+    log: { companySlug: companyRow.slug, kind: 'dunning', refType: 'invoice', refId: invoice.id },
     apiKey: companyRow.resendApiKey ?? undefined,
     replyTo: companyRow.email ?? undefined,
     email: dunningEmail({
@@ -89,7 +84,6 @@ export async function sendDunningEmail(
   return { ok: result.ok && !result.skipped, skipped: result.skipped ?? false };
 }
 
-/** Escalate dunning for all overdue invoices of a single tenant. */
 async function sweepTenant(companyRow: CompanyRow): Promise<void> {
   const { invoices, invoiceStatusLog } = getTenantTables(companyRow.schemaName);
   const now = new Date();
@@ -102,19 +96,17 @@ async function sweepTenant(companyRow: CompanyRow): Promise<void> {
     .limit(PER_TENANT_BATCH);
 
   for (const inv of candidates) {
-    if (inv.dunningLevel >= MAX_DUNNING_LEVEL) continue; // capped — manual from here
+    if (inv.dunningLevel >= MAX_DUNNING_LEVEL) continue;
     if (
       inv.lastDunningAt &&
       now.getTime() - inv.lastDunningAt.getTime() < DUNNING_INTERVAL_DAYS * DAY_MS
     ) {
-      continue; // too soon for the next step
+      continue;
     }
 
     const nextLevel = inv.dunningLevel + 1;
-    // One bad invoice must not abort the rest of the tenant's batch.
     try {
-      // Atomic claim guards against overlapping ticks: only advance if the level
-      // and status are still what we read.
+      // Atomic claim so overlapping ticks cannot double-send: advance only if level and status are unchanged.
       const [updated] = await db
         .update(invoices)
         .set({ dunningLevel: nextLevel, lastDunningAt: now, status: 'overdue', updatedAt: now })
@@ -138,8 +130,7 @@ async function sweepTenant(companyRow: CompanyRow): Promise<void> {
 
       const res = await sendDunningEmail(companyRow, updated);
       if (!res.ok && !res.skipped) {
-        // Don't burn the step: revert the claim so the next sweep retries it
-        // (rather than silently skipping for the 7-day spacing window).
+        // Revert the claim so the next sweep retries instead of waiting out the 7-day spacing.
         await db
           .update(invoices)
           .set({ dunningLevel: inv.dunningLevel, lastDunningAt: inv.lastDunningAt, updatedAt: now })
@@ -152,21 +143,17 @@ async function sweepTenant(companyRow: CompanyRow): Promise<void> {
   }
 }
 
-/** Shared pg advisory-lock key so only one replica sweeps at a time. */
+/** pg advisory-lock key: one replica sweeps at a time. */
 const DUNNING_LOCK_KEY = 7_421_002;
 
-/**
- * One full pass over every active tenant. Guarded by a session-level advisory
- * lock so that with multiple replicas only one runs the sweep per tick — the
- * others skip cleanly. Exported for tests / manual runs.
- */
+/** One pass over every active tenant, guarded by a session advisory lock so only one replica runs it per tick. */
 export async function runDunningSweep(): Promise<void> {
   const client = await pool.connect();
   try {
     const res = await client.query<{ locked: boolean }>(
       `SELECT pg_try_advisory_lock(${DUNNING_LOCK_KEY}) AS locked`,
     );
-    if (!res.rows[0]?.locked) return; // another replica is sweeping
+    if (!res.rows[0]?.locked) return;
     try {
       const companies = await db.select().from(company).where(eq(company.isActive, true));
       for (const c of companies) {
@@ -187,12 +174,11 @@ export async function runDunningSweep(): Promise<void> {
 let workerInterval: NodeJS.Timeout | null = null;
 let inFlight: Promise<void> | null = null;
 
-/** Start the daily overdue/dunning sweep. Called once at server boot. */
 export function startDunningWorker(opts: { intervalMs?: number } = {}): void {
   if (workerInterval) return;
   const interval = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
   const tick = (): void => {
-    if (inFlight) return; // never overlap sweeps
+    if (inFlight) return;
     inFlight = runDunningSweep()
       .catch((err) => console.error('[dunning-worker]', err))
       .finally(() => {
@@ -204,7 +190,6 @@ export function startDunningWorker(opts: { intervalMs?: number } = {}): void {
   workerInterval.unref?.();
 }
 
-/** Stop the worker and wait for any in-flight sweep to finish (drain). */
 export async function stopDunningWorker(): Promise<void> {
   if (workerInterval) {
     clearInterval(workerInterval);

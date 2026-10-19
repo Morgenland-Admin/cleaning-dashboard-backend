@@ -47,12 +47,60 @@ export function verifyUnsubscribeToken(token: string): UnsubPayload | null {
       return data as UnsubPayload;
     }
   } catch {
-    // fallthrough
+    // malformed token
   }
   return null;
 }
 
-/** Random URL-safe token for double-opt-in confirmation. */
 export function randomConfirmToken(): string {
   return b64urlEncode(randomBytes(24));
+}
+
+export type CustomerTokenUse = 'login' | 'session';
+
+interface CustomerTokenPayload {
+  e: string;
+  s: string;
+  u: CustomerTokenUse;
+  x: number;
+}
+
+/** Stateless storefront customer token: proves control of an e-mail address for one brand. */
+export function signCustomerToken(
+  email: string,
+  slug: string,
+  use: CustomerTokenUse,
+  ttlSeconds: number,
+): string {
+  const payload: CustomerTokenPayload = {
+    e: email.trim().toLowerCase(),
+    s: slug,
+    u: use,
+    x: Math.floor(Date.now() / 1000) + ttlSeconds,
+  };
+  const encoded = b64urlEncode(Buffer.from(JSON.stringify(payload), 'utf8'));
+  return `${encoded}.${b64urlEncode(hmac(`customer:${encoded}`))}`;
+}
+
+export function verifyCustomerToken(
+  token: string,
+  slug: string,
+  use: CustomerTokenUse,
+): { email: string } | null {
+  const [encoded, sig, extra] = token.split('.');
+  if (!encoded || !sig || extra !== undefined) return null;
+  const expected = hmac(`customer:${encoded}`);
+  const provided = b64urlDecode(sig);
+  if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) return null;
+  try {
+    const data = JSON.parse(
+      b64urlDecode(encoded).toString('utf8'),
+    ) as Partial<CustomerTokenPayload>;
+    if (typeof data.e !== 'string' || typeof data.x !== 'number') return null;
+    if (data.s !== slug || data.u !== use) return null;
+    if (data.x < Math.floor(Date.now() / 1000)) return null;
+    return { email: data.e };
+  } catch {
+    return null;
+  }
 }

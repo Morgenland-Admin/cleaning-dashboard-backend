@@ -1,14 +1,15 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, avg, count, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, avg, count, desc, eq, isNull, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
 import { SEO_HIDDEN_REVIEW_FIELDS, accessLevelOf, redactListForViewer } from '../../lib/access.js';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
-import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
+import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
+import { requireOwnPartner } from '../partners/lib.js';
 
-/** Recompute a partner's avg rating + count from published reviews only. */
+// Average rating and count come from published reviews only.
 async function recomputePartnerRating(tables: TenantTables, partnerId: number): Promise<void> {
   const [agg] = await db
     .select({ avgRating: avg(tables.reviews.rating), n: count() })
@@ -31,8 +32,64 @@ const createReviewSchema = z.object({
 
 const REVIEWABLE_STATUSES = ['delivered', 'completed'] as const;
 
+/** "Max Mustermann" → "Max M." — never the full name or contact on a public page. */
+export function publicReviewerName(name: string | null): string {
+  const parts = (name ?? '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return 'Kunde';
+  if (parts.length === 1) return parts[0]!;
+  return `${parts[0]} ${parts[parts.length - 1]!.charAt(0).toUpperCase()}.`;
+}
+
+const publicListSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+  cursor: z.string().min(1).max(500).optional(),
+});
+
 export const reviewsPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
+
+  app.get('/', async (request) => {
+    const { limit, cursor } = publicListSchema.parse(request.query);
+    const { reviews } = request.company!.tables;
+    const conds = [eq(reviews.status, 'published')];
+    const after = keysetAfter(reviews, reviews.createdAt, reviews.id, cursor);
+    if (after) conds.push(after);
+    const [rows, [agg]] = await Promise.all([
+      db
+        .select()
+        .from(reviews)
+        .where(and(...conds))
+        .orderBy(desc(reviews.createdAt), desc(reviews.id))
+        .limit(limit + 1),
+      db
+        .select({ avgRating: avg(reviews.rating), n: count() })
+        .from(reviews)
+        .where(eq(reviews.status, 'published')),
+    ]);
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+    return {
+      summary: {
+        average: agg?.avgRating != null ? Number(Number(agg.avgRating).toFixed(2)) : null,
+        count: agg?.n ?? 0,
+      },
+      reviews: page.map((r) => ({
+        id: r.id,
+        rating: r.rating,
+        comment: r.comment,
+        authorName: publicReviewerName(r.customerName),
+        source: r.source,
+        createdAt: r.createdAt,
+        response: r.partnerResponse,
+        respondedAt: r.respondedAt,
+      })),
+      nextCursor:
+        hasMore && last
+          ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
+          : null,
+    };
+  });
 
   app.post(
     '/',
@@ -109,20 +166,11 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.get('/', async (request) => {
     const { limit, cursor, status, flagged } = listQuerySchema.parse(request.query);
     const { reviews } = request.company!.tables;
-    const decoded = cursor ? decodeCursor(cursor) : null;
-    const conds = [];
+    const conds: SQL[] = [];
     if (status) conds.push(eq(reviews.status, status));
     if (flagged !== undefined) conds.push(eq(reviews.flagged, flagged));
-    if (decoded) {
-      const cw = or(
-        lt(reviews.createdAt, sql`${decoded.createdAt}::timestamptz`),
-        and(
-          sql`${reviews.createdAt} = ${decoded.createdAt}::timestamptz`,
-          lt(reviews.id, decoded.id),
-        ),
-      );
-      if (cw) conds.push(cw);
-    }
+    const after = keysetAfter(reviews, reviews.createdAt, reviews.id, cursor);
+    if (after) conds.push(after);
     const rows = await db
       .select()
       .from(reviews)
@@ -146,7 +194,6 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
     return { reviews: reviewsOut, nextCursor };
   });
 
-  // Mutations need at least manager level — viewers stay read-only.
   const canModerate = { preHandler: app.requireAccess('super_admin', 'admin', 'manager') };
 
   const respondSchema = z.object({ response: z.string().trim().min(1).max(4000) });
@@ -206,5 +253,64 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!row) throw badRequest('Review not found');
     if (row.partnerId) await recomputePartnerRating(request.company!.tables, row.partnerId);
     reply.code(204).send();
+  });
+};
+
+const partnerRespondSchema = z.object({ response: z.string().trim().min(1).max(2000) });
+
+/** A partner's own published reviews; one public reply each (admins can still moderate it). */
+export const reviewsPartnerRoutes: FastifyPluginAsync = async (app) => {
+  app.addHook('preHandler', app.requireCompany);
+
+  app.get('/', async (request) => {
+    const partner = await requireOwnPartner(request);
+    const { reviews } = request.company!.tables;
+    const rows = await db
+      .select()
+      .from(reviews)
+      .where(and(eq(reviews.partnerId, partner.id), eq(reviews.status, 'published')))
+      .orderBy(desc(reviews.createdAt))
+      .limit(200);
+    return {
+      summary: {
+        average: partner.rating == null ? null : Number(partner.rating),
+        count: partner.ratingCount,
+      },
+      reviews: rows.map((r) => ({
+        id: r.id,
+        orderId: r.orderId,
+        rating: r.rating,
+        comment: r.comment,
+        authorName: publicReviewerName(r.customerName),
+        createdAt: r.createdAt,
+        response: r.partnerResponse,
+        respondedAt: r.respondedAt,
+      })),
+    };
+  });
+
+  app.post('/:id/response', async (request) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { response } = partnerRespondSchema.parse(request.body);
+    const partner = await requireOwnPartner(request);
+    const { reviews } = request.company!.tables;
+    const [row] = await db
+      .update(reviews)
+      .set({ partnerResponse: response, respondedAt: new Date(), updatedAt: new Date() })
+      .where(
+        and(
+          eq(reviews.id, id),
+          eq(reviews.partnerId, partner.id),
+          eq(reviews.status, 'published'),
+          isNull(reviews.partnerResponse),
+        ),
+      )
+      .returning({
+        id: reviews.id,
+        response: reviews.partnerResponse,
+        respondedAt: reviews.respondedAt,
+      });
+    if (!row) throw conflict('Review not found or already answered');
+    return { review: row };
   });
 };

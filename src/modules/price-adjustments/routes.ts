@@ -1,8 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { notFound, parseIntId } from '../../lib/http-errors.js';
 
 const createSchema = z.object({
@@ -17,7 +18,6 @@ const createSchema = z.object({
 
 export const priceAdjustmentsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Reads stay open to any member; pricing mutations need manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
@@ -29,15 +29,33 @@ export const priceAdjustmentsAdminRoutes: FastifyPluginAsync = async (app) => {
           .enum(['true', 'false'])
           .transform((v) => v === 'true')
           .optional(),
+        limit: z.coerce.number().int().min(1).max(200).default(50),
+        cursor: z.string().min(1).max(500).optional(),
       })
       .parse(request.query);
+    const conds = [];
+    if (q.active !== undefined) conds.push(eq(priceAdjustments.active, q.active));
+    const after = keysetAfter(
+      priceAdjustments,
+      priceAdjustments.createdAt,
+      priceAdjustments.id,
+      q.cursor,
+    );
+    if (after) conds.push(after);
     const rows = await db
       .select()
       .from(priceAdjustments)
-      .where(q.active !== undefined ? eq(priceAdjustments.active, q.active) : undefined)
-      .orderBy(desc(priceAdjustments.createdAt))
-      .limit(200);
-    return { adjustments: rows, note: 'Record-only — not applied to live quotes.' };
+      .where(conds.length ? and(...conds) : undefined)
+      .orderBy(desc(priceAdjustments.createdAt), desc(priceAdjustments.id))
+      .limit(q.limit + 1);
+    const hasMore = rows.length > q.limit;
+    const page = hasMore ? rows.slice(0, q.limit) : rows;
+    const last = page[page.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
+        : null;
+    return { adjustments: page, nextCursor, note: 'Record-only — not applied to live quotes.' };
   });
 
   app.post('/', async (request, reply) => {

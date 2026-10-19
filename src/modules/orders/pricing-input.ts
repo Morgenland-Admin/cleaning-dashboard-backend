@@ -126,6 +126,10 @@ export const checkoutSchema = quoteSchema.and(
       errorMap: () => ({ message: 'Privacy consent is required' }),
     }),
     consentMarketing: z.boolean().optional(),
+    /** "AGB und Widerrufsbelehrung zur Kenntnis genommen" (TERMS_CONSENT_TEXT). */
+    consentTerms: z.boolean().optional(),
+    /** § 356 Abs. 4 BGB early-start request (EARLY_START_CONSENT_TEXT); never pre-ticked. */
+    consentEarlyStart: z.boolean().optional(),
     website: z.string().max(200).optional(),
     source: z.string().trim().max(64).optional(),
     paymentMode: z.enum(['upfront', 'after_service']).optional(),

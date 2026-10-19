@@ -1,33 +1,26 @@
 import { Resend } from 'resend';
 import { env } from '../config/env.js';
 import type { BrandInfo, EmailSignature, RenderedEmail } from './templates.js';
+import { logSend, type EmailLogTag } from './log.js';
 
 const clients = new Map<string, Resend>();
 
 /**
- * Domain used for synthetic placeholder addresses on imported customers that
- * have no real email (see scripts/import-cleanilo-*). These are non-routable
- * and must never receive mail — transactional, dunning, review or newsletter.
- * Contactability is derived purely from the address, so replacing a placeholder
- * with a real email automatically re-enables sending (no flag to clear).
+ * Placeholder addresses for imported customers without an email (scripts/import-cleanilo-*).
+ * Never mail them; contactability comes from the address alone, so a real email re-enables sending.
  */
 export const NONCONTACTABLE_EMAIL_DOMAIN = 'import.cleanilo.local';
 
-/** True if `addr` is a synthetic placeholder that must never be emailed. */
 export function isNonContactableEmail(addr: string): boolean {
   return addr.trim().toLowerCase().endsWith(`@${NONCONTACTABLE_EMAIL_DOMAIN}`);
 }
 
-/**
- * True if `addr` belongs to one of our own brand domains (env.OWN_EMAIL_DOMAINS)
- * or a subdomain of one. Used to suppress confirmation/notification mail for
- * inquiries whose contact address is our own — a self-sender feedback-loop guard.
- */
+/** Own brand domain or subdomain (env.OWN_EMAIL_DOMAINS); guards against self-sender feedback loops. */
 export function isOwnDomainEmail(addr: string | null | undefined): boolean {
   if (!addr) return false;
   const at = addr.trim().toLowerCase();
   const sep = at.lastIndexOf('@');
-  if (sep < 0) return false; // not an email address — no domain to match
+  if (sep < 0) return false;
   const domain = at.slice(sep + 1);
   if (!domain) return false;
   return env.OWN_EMAIL_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`));
@@ -50,14 +43,12 @@ interface CompanyLike {
   senderName?: string | null;
 }
 
-/** Build the RFC-5322 "From" header for a given company (brand). */
 export function brandSender(company: CompanyLike): string {
   const email = company.senderEmail ?? env.ADMIN_FROM_EMAIL;
   const name = company.senderName ?? company.name ?? env.ADMIN_FROM_NAME;
   return formatSender(name, email);
 }
 
-/** Build the "From" for system / admin emails. */
 export function adminSender(): string {
   return formatSender(env.ADMIN_FROM_NAME, env.ADMIN_FROM_EMAIL);
 }
@@ -73,10 +64,9 @@ export interface SendOptions {
   email: RenderedEmail;
   replyTo?: string;
   apiKey?: string | null;
-  /** Optional file attachments (e.g. an invoice PDF). */
   attachments?: Array<{ filename: string; content: Buffer }>;
-  /** Extra SMTP headers, e.g. List-Unsubscribe for newsletter mail. */
   headers?: Record<string, string>;
+  log: EmailLogTag;
 }
 
 const RETRY_DELAYS_MS = [500, 2000];
@@ -92,11 +82,26 @@ export async function sendEmail(opts: SendOptions): Promise<{
   id?: string;
   error?: string;
 }> {
-  // Hard-block synthetic placeholder addresses at the source. This is the single
-  // choke point every send path (transactional, dunning, review, newsletter) flows
-  // through, so one guard covers them all.
+  // Every send path flows through here, so this one guard blocks placeholder addresses everywhere.
   const requested = Array.isArray(opts.to) ? opts.to : [opts.to];
   const to = requested.filter((addr) => !isNonContactableEmail(addr));
+  // Every outcome, including blocked and skipped, is logged so the dashboard shows why no mail arrived.
+  const record = (
+    status: 'sent' | 'failed' | 'skipped' | 'blocked',
+    extra: { resendId?: string; error?: string } = {},
+  ) =>
+    logSend({
+      tag: opts.log,
+      to: to.length > 0 ? to : requested,
+      from: opts.from,
+      replyTo: opts.replyTo,
+      subject: opts.email.subject,
+      html: opts.email.html,
+      attachments: opts.attachments,
+      status,
+      ...extra,
+    });
+
   if (to.length < requested.length) {
     const blocked = requested.filter(isNonContactableEmail);
     console.info(
@@ -104,6 +109,7 @@ export async function sendEmail(opts: SendOptions): Promise<{
     );
   }
   if (to.length === 0) {
+    await record('blocked', { error: 'Platzhalter-Adresse — nicht zustellbar' });
     return { ok: true, skipped: true };
   }
 
@@ -112,6 +118,7 @@ export async function sendEmail(opts: SendOptions): Promise<{
     console.info(
       `[email] (skipped — no Resend API key) to=${to.join(',')} subject="${opts.email.subject}"`,
     );
+    await record('skipped', { error: 'Kein Resend-API-Key konfiguriert' });
     return { ok: true, skipped: true };
   }
 
@@ -126,16 +133,21 @@ export async function sendEmail(opts: SendOptions): Promise<{
         replyTo: opts.replyTo,
         attachments: opts.attachments,
         headers: opts.headers,
+        tags: [{ name: 'kind', value: opts.log.kind }],
       });
       if (!res.error) {
+        await record('sent', { resendId: res.data?.id });
         return { ok: true, id: res.data?.id };
       }
       lastError = res.error.message;
-      // Permanent errors (bad recipient, invalid payload) — don't retry.
+      // Permanent errors are not retried.
       const name = res.error.name ?? '';
       const permanent = name === 'validation_error' || name === 'invalid_parameter';
       console.error(`[email] send failed (attempt ${attempt + 1}):`, res.error);
-      if (permanent) return { ok: false, error: lastError };
+      if (permanent) {
+        await record('failed', { error: lastError });
+        return { ok: false, error: lastError };
+      }
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       console.error(`[email] threw (attempt ${attempt + 1}):`, lastError);
@@ -143,10 +155,10 @@ export async function sendEmail(opts: SendOptions): Promise<{
     const delay = RETRY_DELAYS_MS[attempt];
     if (delay !== undefined) await sleep(delay);
   }
+  await record('failed', { error: lastError });
   return { ok: false, error: lastError };
 }
 
-/** Convenience: a BrandInfo shape used by the templates, from a Company row. */
 export function brandInfoFromCompany(
   c: CompanyLike & {
     primaryColor?: string | null;

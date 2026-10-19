@@ -1,13 +1,7 @@
 /**
- * Renders a reference invoice PDF for an A4 test print, so the DIN 5008 template
- * can be measured (address field 25/45 mm, fold marks 105/210 mm, punch
- * 148.5 mm, footer 264 mm) whenever the layout is touched.
- *
- * Sender, legal footer, Bankverbindung, logo and accent colour are read from the
- * real company row and mapped through `buildInvoicePdfData` — the same path
- * production invoices take. Nothing is taken from the design mock; pass --slug
- * to test-print any brand. Only the recipient and the amounts are a fixture
- * (Kabir's CL-1428 figures: netto 2.650,00 € · USt 19 % 503,50 € · 3.153,50 €).
+ * Reference invoice PDF for an A4 test print to measure the DIN 5008 layout (address field 25/45 mm,
+ * fold marks 105/210 mm, punch 148.5 mm, footer 264 mm).
+ * Identity comes from the company row (production path); only recipient and amounts are fixtures.
  *
  *   node --import tsx scripts/render-invoice-sample.ts [options]
  *
@@ -44,11 +38,7 @@ const paid = flag('--paid');
 const noTax = flag('--no-tax');
 const paket = flag('--paket');
 
-/**
- * Paketrechnung fixture: the positions describe the scope of work only, so they
- * carry no price (`unitPriceCents: 0`) and the agreed net package price is the
- * subtotal. Mirrors the multi-trade renovation invoices this mode exists for.
- */
+/** Paketrechnung fixture: positions carry no price; this net package price is the subtotal. */
 const PACKAGE_NET_CENTS = 1_250_000;
 const packageLineItems: InvoiceForEmail['lineItems'] = [
   {
@@ -117,13 +107,12 @@ const lineItems: InvoiceForEmail['lineItems'] = paket
         },
       ];
 
-// Package mode takes its subtotal from the one agreed price, not from the lines.
 const subtotalCents = paket
   ? PACKAGE_NET_CENTS
   : lineItems.reduce((a, l) => a + Math.round(l.quantity * l.unitPriceCents), 0);
 const taxCents = noTax ? 0 : Math.round((subtotalCents * 19) / 100);
 
-// Neutral placeholder recipient — never a real customer.
+// Fixtures only; never a real customer.
 const invoice: InvoiceForEmail = {
   id: 0,
   number: 'CL-1428',
@@ -151,20 +140,14 @@ const invoice: InvoiceForEmail = {
     ? 'Die Randfixierung im Flur wurde nach Rücksprache nicht ausgeführt und ist nicht berechnet.'
     : null,
   paymentMethod: paid ? 'card' : 'transfer',
-  // §35a: labour share of a real invoice is entered by the operator; 60 % of the
-  // gross here is a plausible stand-in for the test print.
+  // §35a: stand-in labour share (60 % of gross); operators enter the real one.
   craftsmanService: flag('--handwerker'),
   laborGrossCents: Math.round((subtotalCents + taxCents) * 0.6),
   laborVatCents: null,
   craftsmanNote: null,
 };
 
-/**
- * Company identity from the boot seed — the same values `db/migrate.ts` upserts
- * into the company row. Used when there's no reachable DB, so an offline test
- * print still shows our own sender / legal / bank data. It cannot reflect later
- * admin edits made via PATCH /admin/companies; the DB path (default) does.
- */
+/** Boot-seed identity for when no DB is reachable; misses later PATCH /admin/companies edits. */
 function companyFromSeed(): CompanyFull {
   const cfg = LEGACY_BOOTSTRAP[slug as keyof typeof LEGACY_BOOTSTRAP];
   if (!cfg)

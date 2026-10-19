@@ -8,9 +8,8 @@ export interface CancellationContext {
   /** Cents already refunded — caps further refunds. */
   refundedAmountCents: number;
   paidAt: Date | null;
-  /** Date-only fallback when no exact slot was confirmed. */
   preferredDate: Date | null;
-  /** Confirmed appointment "YYYY-MM-DDTHH:mm" in Europe/Berlin local time. */
+  /** "YYYY-MM-DDTHH:mm", Europe/Berlin local time. */
   confirmedSlot: string | null;
   now: Date;
 }
@@ -27,7 +26,7 @@ export interface CancellationDecision {
     | 'terminal_state'
     | 'invalid_status';
   suggestedRefundCents: number;
-  /** Hard ceiling for any refund: total minus what was already refunded. */
+  /** Hard ceiling for any refund (total minus already refunded). */
   maxRefundCents: number;
   message: string;
 }
@@ -36,7 +35,6 @@ const HOUR_MS = 60 * 60 * 1000;
 const SLOT_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/;
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})/;
 
-/** Offset (ms) that Europe/Berlin is ahead of UTC at the given instant. */
 function berlinOffsetMs(utcDate: Date): number {
   const dtf = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Europe/Berlin',
@@ -61,7 +59,6 @@ function berlinOffsetMs(utcDate: Date): number {
   return asUtc - utcDate.getTime();
 }
 
-/** Interpret naive Europe/Berlin wall-clock components as a UTC instant. */
 export function berlinLocalToUtc(
   year: number,
   month: number,
@@ -139,7 +136,6 @@ export function evaluateCancellation(ctx: CancellationContext): CancellationDeci
     };
   }
 
-  // Paid states: refunds capped at the not-yet-refunded remainder.
   const anchor = resolveCancellationAnchor(ctx);
   if (!anchor) {
     // Paid but unscheduled — Widerrufsrecht-safe default is a full refund.

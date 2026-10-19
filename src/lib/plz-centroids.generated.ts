@@ -1,9 +1,5 @@
 // AUTO-GENERATED — do not edit by hand.
-// Source: de_plz_centroids.csv (GeoNames/OSM-based, ~5-decimal precision).
-// 8298 German postal codes, one centroid per PLZ. Regenerate from the
-// CSV if the dataset is refreshed; see src/lib/geo.ts for the lookup + routing.
-//
-// Shape: PLZ (5-digit string) -> [latitude, longitude].
+// Source: de_plz_centroids.csv (GeoNames/OSM-based); PLZ -> [lat, lng], one centroid per PLZ.
 
 export const PLZ_CENTROIDS: Record<string, readonly [number, number]> = {
   "01067": [51.05755, 13.71706],

@@ -1,13 +1,7 @@
 /**
- * Boot-time company identity for the three legacy brands: the sender block,
- * legal Pflichtangaben and bank details that appear on invoices, dunning letters
- * and branded mail.
- *
- * Single source of truth for that data. `db/migrate.ts` upserts it into the
- * `company` table on every boot (coalesced — an admin edit via
- * PATCH /admin/companies always wins), and offline tooling such as
- * `scripts/render-invoice-sample.ts` reads it directly so a test print shows the
- * same identity a real invoice carries.
+ * Boot-time identity (sender, Pflichtangaben, bank) of the three legacy brands. `db/migrate.ts`
+ * upserts it into `company` on every boot, coalesced so PATCH /admin/companies edits win;
+ * offline scripts read it directly.
  */
 import { env } from '../config/env.js';
 import { type LEGACY_COMPANY_SLUGS } from '../config/companies.js';
@@ -19,39 +13,28 @@ export interface LegacyConfig {
   schemaName: string;
   keyPrefix: string;
   storefrontOrigin: string;
+  /** Extra origins allowed in CORS (e.g. the apex next to a www canonical); seeded only while empty. */
+  storefrontAliases?: string[];
+  /** Partner portal origin; seeded only while null. */
+  partnerPortalOrigin?: string;
   senderEmail: string;
   senderName: string;
   websiteUrl: string;
   resendApiKey: string | null;
+  resendWebhookSecret: string | null;
   logoUrl: string | null;
-  /** Wide wordmark for invoice PDF + email (coalesced; falls back to logoUrl). */
+  /** Wide wordmark for invoice PDF + email; falls back to logoUrl. */
   invoiceLogoUrl?: string;
-  /** Public phone (coalesced — an admin edit is never clobbered). */
   phone?: string;
-  /** Public mobile shown in the invoice header (coalesced). */
   mobile?: string;
-  /** Brand accent colour for emails + invoice PDF (coalesced). */
   primaryColor?: string;
-  /** Invoice number prefix, e.g. 'CL' → "CL-1426" (coalesced). */
+  /** Invoice number prefix, e.g. 'CL' → "CL-1426". */
   invoiceNumberPrefix?: string;
-  /**
-   * First dashboard-issued invoice number. Seeded only while the counter is null
-   * (coalesced), so a live counter is never reset. Cleanilo continues at 1426;
-   * confirm Hamburg/TRL's real numbers before their first issue.
-   */
+  /** First dashboard-issued invoice number; seeded only while the counter is null, never resets a live one. */
   invoiceNumberStart?: number;
-  /**
-   * Rich email sign-off. Unlike legal/bank identity this is brand marketing
-   * content owned by the seed, so it is OVERWRITTEN on every boot (there is no
-   * admin UI for it) — edit it here and redeploy to update all mail.
-   */
+  /** Seed-owned (no admin UI): overwritten on every boot, unlike the coalesced fields. */
   emailSignature?: EmailSignature;
-  /**
-   * Legal + banking identity for invoices / dunning. Only seeded where we have
-   * confirmed real-world data — brands left undefined keep their existing values
-   * (admins fill them in via PATCH /admin/companies). Seeded fields are
-   * coalesced so a later admin edit is never clobbered on the next boot.
-   */
+  /** Invoice/dunning identity, seeded coalesced; an undefined brand keeps its existing values. */
   legal?: {
     legalName: string;
     addressLine1: string;
@@ -63,18 +46,15 @@ export interface LegacyConfig {
     bic: string;
     bankName: string;
     bankAddress: string;
-    /** German invoice Pflichtangaben (shared across the GbR's brands). */
     vatId?: string; // USt-IdNr. — the only tax id shown on invoices
     businessId?: string; // Betriebsnummer
-    legalForm?: string; // Rechtsform
-    managingDirectors?: string; // Geschäftsführer
-    chamber?: string; // Handwerkskammer
+    legalForm?: string;
+    managingDirectors?: string;
+    chamber?: string;
   };
 }
 
-// The GbR that operates all three brands — one tax/registration identity.
-// Invoices show the USt-IdNr. only; the Steuernummer was dropped from the
-// template on Kabir's instruction (08/2026) and is no longer seeded.
+// One GbR operates all three brands. Invoices show the USt-IdNr. only, never the Steuernummer.
 const GBR_LEGAL = {
   vatId: 'DE352699047',
   businessId: '2931209889',
@@ -89,18 +69,21 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
     name: 'Cleanilo',
     schemaName: 'cleanilo',
     keyPrefix: 'cleanilo',
-    storefrontOrigin: 'https://cleanilo.de',
+    storefrontOrigin: 'https://www.cleanilo.de',
+    storefrontAliases: ['https://cleanilo.de'],
+    partnerPortalOrigin: 'https://partner.cleanilo.de',
     senderEmail: 'info@cleanilo.de',
     senderName: 'CLEANILO',
-    websiteUrl: 'https://cleanilo.de',
+    websiteUrl: 'https://www.cleanilo.de',
     resendApiKey: env.RESEND_API_KEY_CLEANILO ?? null,
+    resendWebhookSecret: env.RESEND_WEBHOOK_SECRET_CLEANILO ?? null,
     logoUrl: 'https://reinigungs-portal.com/cleanilo.png',
     invoiceLogoUrl: 'https://reinigungs-portal.com/cleanilo-invoice-logo.png',
     phone: '+49 40 432 189 15',
     mobile: '+49 177 6909604',
-    primaryColor: '#1f8a4c', // eco green — "ökologisch sauber"
+    primaryColor: '#1f8a4c',
     invoiceNumberPrefix: 'CL',
-    invoiceNumberStart: 1426, // continues the imported series (latest was 1425)
+    invoiceNumberStart: 1426, // continues the imported series (latest 1425)
     emailSignature: {
       signOff: 'Mit freundlichen Grüßen',
       signatory: 'M. Amiri',
@@ -142,10 +125,11 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
     senderName: 'Hamburg Teppichreinigung',
     websiteUrl: 'https://hamburg-teppichreinigung.de',
     resendApiKey: env.RESEND_API_KEY_HAMBURG ?? null,
+    resendWebhookSecret: env.RESEND_WEBHOOK_SECRET_HAMBURG ?? null,
     logoUrl: 'https://reinigungs-portal.com/hamburg-teppichreinigung.png',
     invoiceLogoUrl: 'https://reinigungs-portal.com/hamburg-teppichreinigung-invoice-logo.png',
     phone: '+49 40 432 189 19',
-    primaryColor: '#bd5b3e', // warm rust/brown
+    primaryColor: '#bd5b3e',
     invoiceNumberPrefix: 'HT',
     invoiceNumberStart: 1426, // TODO(Kabir): confirm HTR's real starting number before first issue
     emailSignature: {
@@ -154,8 +138,6 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
       supportLabel: 'Supportzeiten',
       supportHours: ['Mo. – Fr.: 09:00 – 17:00 Uhr', 'Sa.: 11:00 – 17:00 Uhr'],
       phone: '+49 40 432 189 19',
-      // The line is labelled "Web:" — it must carry the site, not the mailbox
-      // (the contact address is already in the legal footer of every mail).
       web: 'www.hamburg-teppichreinigung.de',
       webUrl: 'https://hamburg-teppichreinigung.de',
       hq: 'Zentrale: Brook 9, 20457 Hamburg',
@@ -167,8 +149,7 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
       },
     },
     legal: {
-      // Same GbR bank account as Cleanilo, but shown under the bare GbR name
-      // (no brand prefix) on HTR invoices.
+      // Same bank account as Cleanilo, but the bare GbR name (no brand prefix).
       legalName: 'M. Kabir Madjidian & M. Amiri GbR',
       addressLine1: 'Brook 9',
       postalCode: '20457',
@@ -192,8 +173,9 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
     senderName: 'teppichreinigen-lassen.de',
     websiteUrl: 'https://teppichreinigen-lassen.de',
     resendApiKey: env.RESEND_API_KEY_TRL ?? null,
+    resendWebhookSecret: env.RESEND_WEBHOOK_SECRET_TRL ?? null,
     logoUrl: null,
-    primaryColor: '#0f766e', // deep teal
+    primaryColor: '#0f766e',
     invoiceNumberPrefix: 'TR',
     invoiceNumberStart: 1426, // TODO(Kabir): confirm TRL's real starting number before first issue
     emailSignature: {
@@ -201,14 +183,13 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
       signatory: 'M. Amiri',
       supportLabel: 'Supportzeiten',
       supportHours: ['Mo. – Fr.: 09:00 – 17:00 Uhr', 'Sa.: 11:00 – 17:00 Uhr'],
-      // TODO(Kabir): TRL has no own phone number yet — add it here once the
-      // bundesweite Rufnummer is live, otherwise the sign-off stays web-only.
+      // TODO(Kabir): no TRL phone number yet; add once the nationwide number is live.
       web: 'www.teppichreinigen-lassen.de',
       webUrl: 'https://www.teppichreinigen-lassen.de',
       hq: 'Zentrale: Brook 9, 20457 Hamburg',
     },
     legal: {
-      // Same GbR bank account, bare GbR name (no brand prefix) on TRL invoices.
+      // Same bank account as Cleanilo, but the bare GbR name (no brand prefix).
       legalName: 'M. Kabir Madjidian & M. Amiri GbR',
       addressLine1: 'Brook 9',
       postalCode: '20457',

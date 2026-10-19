@@ -8,8 +8,9 @@ import { env } from '../../config/env.js';
 import { isValidCompanySlug } from '../../config/companies.js';
 import { db } from '../../db/index.js';
 import { account, company, membership, user, verification } from '../../db/schema/shared.js';
-import { adminSender, sendEmail } from '../../email/service.js';
-import { inviteEmail } from '../../email/templates.js';
+import { adminSender, brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
+import { inviteEmail, partnerInviteEmail } from '../../email/templates.js';
+import { geocodePlz } from '../../lib/geo.js';
 import { badRequest, conflict, notFound } from '../../lib/http-errors.js';
 
 const ROLES = ['owner', 'admin', 'manager', 'viewer', 'partner'] as const;
@@ -22,6 +23,8 @@ const partnerPrefillSchema = z.object({
   websiteUrl: z.string().url().optional(),
   city: z.string().max(120).optional(),
   postalCode: z.string().max(20).optional(),
+  serviceRadiusKm: z.number().int().min(5).max(300).optional(),
+  services: z.array(z.string().max(80)).max(60).optional(),
 });
 
 const createInviteSchema = z.object({
@@ -33,7 +36,7 @@ const createInviteSchema = z.object({
   partner: partnerPrefillSchema.optional(),
 });
 
-const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 function inviteIdentifier(token: string): string {
   return `invite:${token}`;
@@ -48,13 +51,97 @@ interface InvitePayload {
   invitedByUserId: string;
   invitedByName: string;
   /** When set, accept creates a partners row in the tenant schema. */
-  partner?: {
-    companyName: string;
-    contactPhone?: string;
-    websiteUrl?: string;
-    city?: string;
-    postalCode?: string;
+  partner?: z.infer<typeof partnerPrefillSchema>;
+}
+
+export interface IssueInviteInput {
+  email: string;
+  companySlug: string;
+  role: (typeof ROLES)[number];
+  audience: (typeof AUDIENCES)[number];
+  accessLevel: (typeof ACCESS_LEVELS)[number];
+  partner?: z.infer<typeof partnerPrefillSchema>;
+  inviter: { id: string; name: string };
+}
+
+/** Stores the invite token and mails it; partner invites go out branded, linking to the brand's portal. */
+export async function issueInvite(input: IssueInviteInput): Promise<{ expiresAt: Date }> {
+  const [companyRow] = await db
+    .select()
+    .from(company)
+    .where(eq(company.slug, input.companySlug))
+    .limit(1);
+  if (!companyRow) throw notFound('Company not found');
+
+  const [existingUser] = await db.select().from(user).where(eq(user.email, input.email)).limit(1);
+  if (existingUser) {
+    const [m] = await db
+      .select()
+      .from(membership)
+      .where(
+        and(eq(membership.userId, existingUser.id), eq(membership.companySlug, input.companySlug)),
+      )
+      .limit(1);
+    if (m) throw conflict('User is already a member of this company');
+  }
+
+  const token = randomBytes(24).toString('base64url');
+  const payload: InvitePayload = {
+    email: input.email,
+    companySlug: input.companySlug,
+    role: input.role,
+    audience: input.audience,
+    accessLevel: input.accessLevel,
+    invitedByUserId: input.inviter.id,
+    invitedByName: input.inviter.name,
+    partner: input.partner,
   };
+  const expiresAt = new Date(Date.now() + INVITE_TTL_MS);
+
+  await db.insert(verification).values({
+    id: `invite_${token}`,
+    identifier: inviteIdentifier(token),
+    value: JSON.stringify(payload),
+    expiresAt,
+  });
+
+  const portal = companyRow.partnerPortalOrigin?.replace(/\/$/, '');
+  const log = {
+    companySlug: companyRow.slug,
+    kind: 'invite' as const,
+    sentByUserId: input.inviter.id,
+  };
+  try {
+    if (input.audience === 'partner' && portal) {
+      await sendEmail({
+        to: input.email,
+        from: brandSender(companyRow),
+        apiKey: companyRow.resendApiKey ?? undefined,
+        replyTo: companyRow.email ?? undefined,
+        log,
+        email: partnerInviteEmail({
+          brand: brandInfoFromCompany(companyRow),
+          companyName: input.partner?.companyName ?? null,
+          inviteUrl: `${portal}/einladung?token=${encodeURIComponent(token)}`,
+        }),
+      });
+    } else {
+      const inviteUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/accept-invite?token=${encodeURIComponent(token)}`;
+      await sendEmail({
+        to: input.email,
+        from: adminSender(),
+        log,
+        email: inviteEmail({
+          inviterName: input.inviter.name,
+          inviteUrl,
+          brandName: companyRow.name,
+        }),
+      });
+    }
+  } catch (err) {
+    console.warn('[invites] failed to send invite email', err);
+  }
+  return { expiresAt };
 }
 
 export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
@@ -79,9 +166,8 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
         reply.code(403).send({ error: 'Forbidden — must be owner/admin on this company' });
         return;
       }
-      // Privilege ceiling: only a super_admin may mint a global super_admin.
-      // accessLevel is a platform-wide field, so a tenant owner/admin must not
-      // be able to grant it (would bypass every membership check).
+      // Privilege ceiling: accessLevel is platform-wide, so only a super_admin may mint a super_admin
+      // (a tenant owner/admin granting it would bypass every membership check).
       if (body.accessLevel === 'super_admin') {
         reply
           .code(403)
@@ -90,59 +176,15 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
-    const [companyRow] = await db
-      .select()
-      .from(company)
-      .where(eq(company.slug, body.companySlug))
-      .limit(1);
-    if (!companyRow) throw notFound('Company not found');
-
-    const [existingUser] = await db.select().from(user).where(eq(user.email, body.email)).limit(1);
-    if (existingUser) {
-      const [m] = await db
-        .select()
-        .from(membership)
-        .where(
-          and(eq(membership.userId, existingUser.id), eq(membership.companySlug, body.companySlug)),
-        )
-        .limit(1);
-      if (m) throw conflict('User is already a member of this company');
-    }
-
-    const token = randomBytes(24).toString('base64url');
-    const payload: InvitePayload = {
+    const { expiresAt } = await issueInvite({
       email: body.email,
       companySlug: body.companySlug,
       role: body.role,
       audience: body.audience,
       accessLevel: body.accessLevel,
-      invitedByUserId: inviter.id,
-      invitedByName: (inviter as { name?: string }).name ?? 'Admin',
       partner: body.partner,
-    };
-    const expiresAt = new Date(Date.now() + INVITE_TTL_MS);
-
-    await db.insert(verification).values({
-      id: `invite_${token}`,
-      identifier: inviteIdentifier(token),
-      value: JSON.stringify(payload),
-      expiresAt,
+      inviter: { id: inviter.id, name: (inviter as { name?: string }).name ?? 'Admin' },
     });
-
-    const inviteUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/accept-invite?token=${encodeURIComponent(token)}`;
-    try {
-      await sendEmail({
-        to: body.email,
-        from: adminSender(),
-        email: inviteEmail({
-          inviterName: payload.invitedByName,
-          inviteUrl,
-          brandName: companyRow.name,
-        }),
-      });
-    } catch (err) {
-      request.log.warn({ err }, 'Failed to send invite email');
-    }
 
     reply.code(201);
     return {
@@ -322,7 +364,9 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
         const { getTenantTables } = await import('../../db/schema/tenant.js');
         const companyRow = await loadCompany(payload.companySlug);
         if (companyRow) {
-          const { partners } = getTenantTables(companyRow.schemaName);
+          const tables = getTenantTables(companyRow.schemaName);
+          const { partners } = tables;
+          const coords = geocodePlz(payload.partner.postalCode);
           await db
             .insert(partners)
             .values({
@@ -333,9 +377,25 @@ export const invitesPublicRoutes: FastifyPluginAsync = async (app) => {
               websiteUrl: payload.partner.websiteUrl,
               city: payload.partner.city,
               postalCode: payload.partner.postalCode,
+              lat: coords?.lat ?? null,
+              lng: coords?.lng ?? null,
+              serviceRadiusKm: payload.partner.serviceRadiusKm ?? 30,
+              services: payload.partner.services ?? [],
               status: 'pending',
             })
             .onConflictDoNothing();
+          // A returning partner from the old CLEANILO system gets their old admin chat back.
+          try {
+            const { attachLegacyPartnerChat } = await import('../legacy/partner-chat.js');
+            const added = await attachLegacyPartnerChat(tables, {
+              userId,
+              email: payload.email,
+              phone: payload.partner.contactPhone,
+            });
+            if (added) request.log.info({ added }, 'legacy partner chat attached');
+          } catch (err) {
+            request.log.warn({ err }, 'legacy partner chat attach failed');
+          }
         }
       }
 

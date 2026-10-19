@@ -1,19 +1,8 @@
 /**
- * CLEANILO historical invoice-customer import.
- *
- *   Dry run (default, no writes):
- *     node --import tsx scripts/import-cleanilo-history.ts <invoices.json> <reconciliation.csv>
- *   Real import (guarded — direct writes to the cleanilo tenant):
- *     node --import tsx scripts/import-cleanilo-history.ts <invoices.json> <reconciliation.csv> --commit
- *
- * Automation-safety (agreed with Kabir): rows are written DIRECTLY as
- * closed/paid, bypassing every live code path — no order-confirmation,
- * auto-invoicing, status notifications or dunning fire. Invoices land as `paid`
- * (outside the dunning sweep's sent/overdue filter); all imported customers
- * carry the no-marketing flag. Original invoice numbers are preserved (GoBD).
- *
- * The dry-run path does not touch the DB layer, so it runs with no database
- * connection. Only --commit dynamically loads the writer.
+ * CLEANILO historical import, dry run by default.
+ * node --import tsx scripts/import-cleanilo-history.ts <invoices.json> <reconciliation.csv> [--commit]
+ * --commit writes directly as closed/paid, so no confirmation, auto-invoice, notification or dunning fires;
+ * original invoice numbers are kept (GoBD).
  */
 import { eur, makePlan, type ImportPlan } from './import-cleanilo-lib.ts';
 
@@ -107,6 +96,7 @@ async function main(): Promise<void> {
   }
 
   console.log('--commit set — writing to the cleanilo tenant …');
+  // Dynamic import: the dry run needs no DB connection.
   const { commitImport } = await import('./import-cleanilo-commit.ts');
   const result = await commitImport(plan);
   console.log(

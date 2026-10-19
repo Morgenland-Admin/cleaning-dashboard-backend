@@ -1,8 +1,6 @@
-// Regenerates src/lib/plz-centroids.generated.ts from src/lib/data/de_plz_centroids.csv.
-// Run after refreshing the dataset:  node scripts/gen-plz-centroids.mjs
-//
-// The build is tsc-only and does not copy non-TS assets into dist/, so the
-// centroid table ships as a compiled TS module rather than a runtime-read CSV.
+// Regenerates src/lib/plz-centroids.generated.ts from src/lib/data/de_plz_centroids.csv:
+// node scripts/gen-plz-centroids.mjs
+// A TS module, not a runtime-read CSV: the tsc-only build does not copy non-TS assets into dist/.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';

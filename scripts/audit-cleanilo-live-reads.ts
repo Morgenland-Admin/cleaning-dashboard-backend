@@ -1,9 +1,6 @@
 /**
- * Exercises the LIVE application read paths over the imported CLEANILO rows,
- * so the audit tests the dashboard's own logic and not hand-written SQL.
- * Read-only — computeCustomerTotals/computeLoyaltyTier are pure readers.
- *
- *   DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/audit-cleanilo-live-reads.ts
+ * Read-only: runs the live computeCustomerTotals / computeLoyaltyTier over the imported CLEANILO rows.
+ * DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/audit-cleanilo-live-reads.ts
  */
 import { eq, sql } from 'drizzle-orm';
 

@@ -1,12 +1,5 @@
 /**
- * teppichreinigen-lassen.de — Spezialisierte Teppichplattform.
- *
- * TRL is the specialised carpet (Teppich + Reparatur) marketplace. It does
- * NOT offer on-site Polsterreinigung — that's Hamburg-local only.
- *
- * Prices currently mirror Hamburg's B2C book. When the brand's own price tier
- * (e.g. premium / royal / exklusiv as their preisliste page promises) ships,
- * edit the fields below.
+ * TRL: carpet + repair only, no on-site Polsterreinigung (Hamburg-local). Prices mirror Hamburg's B2C book for now.
  */
 
 import { hamburgBook } from './hamburg.js';

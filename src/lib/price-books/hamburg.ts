@@ -1,8 +1,4 @@
-/**
- * Hamburg Teppichreinigung — B2C Endkundenpreise.
- *
- * Mirrors HTR_Preisliste.pdf (Stand 2026). All amounts in cents inkl. MwSt.
- */
+/** Hamburg Teppichreinigung B2C prices (HTR_Preisliste.pdf, Stand 2026); all amounts in cents incl. MwSt. */
 
 import type { PriceBook } from './types.js';
 

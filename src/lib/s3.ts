@@ -33,7 +33,9 @@ function getBucket(): string {
   return env.S3_BUCKET;
 }
 
-function buildKey(keyPrefix: string, originalName: string): string {
+export type UploadFolder = 'inquiries' | 'receipts';
+
+function buildKey(keyPrefix: string, originalName: string, folder: UploadFolder): string {
   const now = new Date();
   const year = now.getUTCFullYear();
   const month = String(now.getUTCMonth() + 1).padStart(2, '0');
@@ -43,14 +45,13 @@ function buildKey(keyPrefix: string, originalName: string): string {
       .replace(/[^a-z0-9.\-_]+/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 80) || 'file';
-  return `${keyPrefix}/inquiries/${year}/${month}/${nanoid(12)}-${safeName}`;
+  return `${keyPrefix}/${folder}/${year}/${month}/${nanoid(12)}-${safeName}`;
 }
 
 const UPLOAD_EXPIRY_SECONDS = 60 * 5;
 const DOWNLOAD_EXPIRY_SECONDS = 60 * 10;
 
-// Objects under this prefix are served publicly (bucket policy / CDN), so their
-// URLs are stable and non-expiring — suitable for blog featured images.
+// Served publicly (bucket policy / CDN) with stable, non-expiring URLs; blog images only.
 const PUBLIC_PREFIX = 'public';
 
 function buildPublicKey(keyPrefix: string, originalName: string): string {
@@ -66,7 +67,6 @@ function buildPublicKey(keyPrefix: string, originalName: string): string {
   return `${PUBLIC_PREFIX}/${keyPrefix}/blog/${year}/${month}/${nanoid(12)}-${safeName}`;
 }
 
-/** Stable public URL for an object under the public prefix. */
 export function publicAssetUrl(key: string): string {
   if (env.S3_PUBLIC_BASE_URL) {
     return `${env.S3_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}`;
@@ -77,10 +77,7 @@ export function publicAssetUrl(key: string): string {
   return `https://${getBucket()}.s3.${env.AWS_REGION}.amazonaws.com/${key}`;
 }
 
-/**
- * Presign a PUT for a publicly-readable image. The browser streams the file to
- * S3, then the caller stores publicAssetUrl(key) (e.g. in schemaJsonld.image).
- */
+/** Presigned PUT for a publicly-readable image; the caller stores publicAssetUrl(key). */
 export async function signPublicUpload(opts: {
   keyPrefix: string;
   filename: string;
@@ -107,11 +104,49 @@ export async function signUpload(opts: {
   filename: string;
   contentType: string;
   sizeBytes: number;
+  folder?: UploadFolder;
 }): Promise<{ uploadUrl: string; key: string; expiresIn: number }> {
   const bucket = getBucket();
-  const key = buildKey(opts.keyPrefix, opts.filename);
+  const key = buildKey(opts.keyPrefix, opts.filename, opts.folder ?? 'inquiries');
   const cmd = new PutObjectCommand({
     Bucket: bucket,
+    Key: key,
+    ContentType: opts.contentType,
+    ContentLength: opts.sizeBytes,
+  });
+  const uploadUrl = await getSignedUrl(client, cmd, {
+    expiresIn: UPLOAD_EXPIRY_SECONDS,
+    signableHeaders: new Set(['content-length', 'content-type']),
+  });
+  return { uploadUrl, key, expiresIn: UPLOAD_EXPIRY_SECONDS };
+}
+
+/** `<keyPrefix>/partners/<partnerId>/<area>/` — ownership of a partner file is its key prefix. */
+export function partnerKeyPrefix(
+  keyPrefix: string,
+  partnerId: number,
+  area: 'documents' | 'photos' | 'chat',
+): string {
+  return `${keyPrefix}/partners/${partnerId}/${area}/`;
+}
+
+export async function signPartnerUpload(opts: {
+  keyPrefix: string;
+  partnerId: number;
+  area: 'documents' | 'photos' | 'chat';
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+}): Promise<{ uploadUrl: string; key: string; expiresIn: number }> {
+  const safeName =
+    opts.filename
+      .toLowerCase()
+      .replace(/[^a-z0-9.\-_]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 80) || 'file';
+  const key = `${partnerKeyPrefix(opts.keyPrefix, opts.partnerId, opts.area)}${nanoid(12)}-${safeName}`;
+  const cmd = new PutObjectCommand({
+    Bucket: getBucket(),
     Key: key,
     ContentType: opts.contentType,
     ContentLength: opts.sizeBytes,
@@ -155,7 +190,7 @@ export async function putExportObject(opts: {
   return { key, sizeBytes: body.length };
 }
 
-/** Remove an expired export object (PII cleanup). Only export keys are accepted. */
+/** Removes an expired export (PII cleanup); only export keys are accepted. */
 export async function deleteExportObject(key: string): Promise<void> {
   if (!key.includes('/exports/')) {
     throw new Error(`Refusing to delete non-export key "${key}"`);
@@ -186,4 +221,23 @@ export async function signDownload(opts: {
   const cmd = new GetObjectCommand({ Bucket: bucket, Key: opts.key });
   const downloadUrl = await getSignedUrl(client, cmd, { expiresIn: DOWNLOAD_EXPIRY_SECONDS });
   return { downloadUrl, expiresIn: DOWNLOAD_EXPIRY_SECONDS };
+}
+
+/** Reads a private, tenant-scoped object (size-capped); null on any failure so one missing photo never blocks the PDF. */
+export async function getObjectBuffer(opts: {
+  keyPrefix: string;
+  key: string;
+  maxBytes?: number;
+}): Promise<{ body: Buffer; contentType: string | null } | null> {
+  if (!s3Configured || !opts.key.startsWith(`${opts.keyPrefix}/`)) return null;
+  try {
+    const res = await client.send(new GetObjectCommand({ Bucket: getBucket(), Key: opts.key }));
+    if (!res.Body) return null;
+    if (res.ContentLength != null && res.ContentLength > (opts.maxBytes ?? 10 * 1024 * 1024))
+      return null;
+    const body = Buffer.from(await res.Body.transformToByteArray());
+    return { body, contentType: res.ContentType ?? null };
+  } catch {
+    return null;
+  }
 }

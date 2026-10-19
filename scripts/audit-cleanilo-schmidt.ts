@@ -1,10 +1,6 @@
 /**
- * Read-only: can the flagged ambiguous name-match be corroborated by address or
- * invoice, as the import rules require? Looks up both CRM candidate emails in
- * every tenant (customers / inquiries / contact) and prints their addresses so
- * they can be compared with the address on the historical invoice.
- *
- *   DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/audit-cleanilo-schmidt.ts <email> [<email> …]
+ * Read-only: looks up candidate emails in every tenant and prints their addresses, to corroborate an ambiguous name match.
+ * DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/audit-cleanilo-schmidt.ts <email> [<email> …]
  */
 import { sql } from 'drizzle-orm';
 

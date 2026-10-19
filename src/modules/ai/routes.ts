@@ -7,8 +7,7 @@ import type { TenantTables } from '../../db/schema/tenant.js';
 import { generateText, isAiConfigured, AnthropicError } from '../../lib/anthropic.js';
 import { notFound } from '../../lib/http-errors.js';
 
-// "✦ Claude" text assistant: one endpoint drafts/refines operator text.
-// The source record is loaded server-side by refId (never trust the client);
+// Operator text assistant. The source record is loaded server-side by refId (never trust the client);
 // output is returned, never persisted.
 
 const KINDS = [
@@ -22,23 +21,18 @@ type AssistKind = (typeof KINDS)[number];
 
 const assistSchema = z.object({
   kind: z.enum(KINDS),
-  // Id of the contact / review / inquiry to ground the draft on.
   refId: z.number().int().positive(),
-  current: z.string().max(8000).optional(), // current draft (refine instead of restart)
-  instruction: z.string().max(2000).optional(), // free-text steering, takes priority
-  fresh: z.boolean().optional(), // ignore `current`, write from scratch
+  current: z.string().max(8000).optional(),
+  instruction: z.string().max(2000).optional(),
+  fresh: z.boolean().optional(),
 });
 
-// Structured extraction: turn an inquiry's request + drafted offer text into
-// offer line items. Grounded on the inquiry by refId; `current` is the offer
-// text box (optional). Returns JSON, unlike the free-text /assist endpoint.
 const extractItemsSchema = z.object({
   refId: z.number().int().positive(),
-  current: z.string().max(8000).optional(), // offer text box, if the operator drafted one
+  current: z.string().max(8000).optional(),
 });
 
-// One extracted service position. Prices are filled only when the text names
-// one (unitPriceGross null otherwise) — Claude is told never to invent prices.
+// Price is null unless the text names one; Claude must never invent prices.
 const extractedItemSchema = z.object({
   label: z.string().trim().min(1).max(200),
   quantity: z.coerce.number().positive().max(100_000).catch(1),
@@ -48,26 +42,21 @@ const extractedItemSchema = z.object({
 const line = (label: string, value: string | number | null | undefined): string | null =>
   value === null || value === undefined || value === '' ? null : `${label}: ${value}`;
 
-// Output-format + honesty rules every kind shares, independent of address form.
-// Appended to every prompt and NOT editable: an operator edit must not be able
-// to produce output the mail template can't use, or invented prices.
+// Appended to every prompt and NOT editable: an operator edit must not be able to produce
+// output the mail template can't use, or invented prices.
 const OUTPUT_RULES =
   'Gib ausschließlich den fertigen Text zurück — keine Einleitung, keine Erklärung, keine Anführungszeichen, kein Markdown. ' +
   'Erfinde keine Preise, Termine oder Zusagen, die nicht vorgegeben sind.';
-// Kinds that fill the body of a templated mail: the template owns the rest.
 const EMAIL_BODY_RULES =
   'Keine Betreffzeile, keine Anrede, keine Signatur — diese ergänzt die Vorlage. ';
 
 interface PromptSpec {
-  /** Editable instruction text. `{{brand}}` is replaced with the company name. */
   instructions: string;
-  /** Always appended verbatim; operators cannot change or remove this. */
   locked: string;
 }
 
-// Defaults for every kind. An `ai_prompts` row for (brand, kind) replaces
-// `instructions`; `locked` always applies. Keep prices out of the defaults —
-// they belong in a per-brand override, which is the point of the editor.
+// An `ai_prompts` row for (brand, kind) replaces `instructions`; `locked` always applies.
+// Keep prices out of the defaults (per-brand override).
 const PROMPT_SPECS: Record<AssistKind, PromptSpec> = {
   contact_reply: {
     instructions:
@@ -116,7 +105,6 @@ const PROMPT_SPECS: Record<AssistKind, PromptSpec> = {
 const renderBrand = (text: string, brand: string): string =>
   text.replace(/\{\{\s*brand\s*\}\}/g, brand);
 
-/** Effective system prompt: the brand's override (or the default) + locked rules. */
 async function systemPromptFor(
   kind: AssistKind,
   brand: string,
@@ -132,8 +120,6 @@ async function systemPromptFor(
   return `${renderBrand(instructions, brand)} ${spec.locked}`;
 }
 
-// Grounding context for an inquiry, shared by the quote draft and the
-// structured line-item extraction below. Loaded server-side by refId.
 async function loadInquiryQuoteContext(refId: number, tables: TenantTables): Promise<string> {
   const [inq] = await db
     .select()
@@ -141,8 +127,7 @@ async function loadInquiryQuoteContext(refId: number, tables: TenantTables): Pro
     .where(eq(tables.serviceInquiries.id, refId))
     .limit(1);
   if (!inq) throw notFound('Inquiry not found');
-  // The AI vision pipeline drops carpet/dirt details into metadata.carpet;
-  // surface it so the offer can reference what was actually requested.
+  // metadata.carpet is written by the AI vision pipeline.
   const carpet = (inq.metadata as { carpet?: unknown } | null)?.carpet;
   return [
     line('Name', inq.name),
@@ -159,8 +144,6 @@ async function loadInquiryQuoteContext(refId: number, tables: TenantTables): Pro
     .join('\n');
 }
 
-// Grounding context for a kind, from its loaded row. The system prompt comes
-// from systemPromptFor() so a brand override can replace the instructions.
 async function loadContext(kind: AssistKind, refId: number, tables: TenantTables): Promise<string> {
   switch (kind) {
     case 'contact_reply': {
@@ -248,8 +231,7 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
 
-  // Bounded: this hits a paid API. Manager+ — a `viewer` cannot send the
-  // resulting text anywhere, so there is no reason to let them spend on it.
+  // Paid API: manager+ only (a `viewer` cannot send the text anywhere).
   const requireWrite = app.requireAccess('super_admin', 'admin', 'manager');
 
   app.post(
@@ -292,10 +274,7 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // --- Prompt editor -----------------------------------------------------
-  // Operators tune the instructions per brand (prices change, tone changes).
-  // Reads are open to any admin user; writes are admin-only, because a prompt
-  // decides what goes out to customers.
+  // Prompt editor: reads for any admin user; writes admin-only, because a prompt decides what goes out to customers.
   const requirePromptWrite = { preHandler: app.requireAccess('super_admin', 'admin') };
 
   app.get('/prompts', async (request) => {
@@ -309,14 +288,11 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
         const spec = PROMPT_SPECS[kind];
         return {
           kind,
-          // What the editor shows: the override if any, else the default.
           body: override?.body ?? spec.instructions,
           defaultBody: spec.instructions,
-          // Appended on every call, read-only in the UI.
           lockedRules: spec.locked,
           isCustom: !!override,
           updatedAt: override?.updatedAt ?? null,
-          // Rendered preview so the operator sees what {{brand}} becomes.
           brand,
         };
       }),
@@ -326,15 +302,14 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
   const promptParams = z.object({ kind: z.enum(KINDS) });
   const promptBody = z.object({ body: z.string().trim().min(20).max(8000) });
 
-  // PATCH, not PUT: the shared frontend request helper only speaks GET/POST/PATCH/DELETE.
+  // PATCH, not PUT: the frontend request helper has no PUT.
   app.patch('/prompts/:kind', requirePromptWrite, async (request) => {
     const { kind } = promptParams.parse(request.params);
     const { body } = promptBody.parse(request.body);
     const slug = request.company!.slug;
     const userId = request.authUser?.id ?? null;
 
-    // Saving the untouched default is a reset, not an override — keeps the row
-    // absent so future default changes still reach this brand.
+    // Saving the untouched default resets the override, so future default changes still reach this brand.
     if (body === PROMPT_SPECS[kind].instructions.trim()) {
       await db
         .delete(aiPrompts)
@@ -362,7 +337,6 @@ export const aiAdminRoutes: FastifyPluginAsync = async (app) => {
     return { kind, isCustom: false, body: PROMPT_SPECS[kind].instructions };
   });
 
-  // Extract offer line items from the inquiry request + drafted offer text.
   app.post(
     '/extract-offer-items',
     { preHandler: requireWrite, config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },

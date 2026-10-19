@@ -122,7 +122,6 @@ export async function sendPushToUser(
   return { sent, pruned: deadIds.length };
 }
 
-/** Short-TTL variant for the "test notification" button. */
 export async function sendTestPushToUser(
   userId: string,
   payload: PushPayload,

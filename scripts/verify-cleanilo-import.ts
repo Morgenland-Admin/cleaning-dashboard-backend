@@ -1,15 +1,7 @@
 /**
- * Read-only audit of the CLEANILO historical import (no writes).
- *
- *   DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/verify-cleanilo-import.ts
- *
- * Checks the state the import is supposed to leave behind:
- *  - row counts (customers / orders / invoices) split imported vs. pre-existing
- *  - revenue reconciliation against the source total
- *  - automation-safety invariants (no dunning-eligible invoice, no open order,
- *    no marketing opt-in, no live invoice-number sequence burned)
- *  - the 7 renumbered collisions and the 10 verified emails
- *  - customer_id linkage on orders and invoices
+ * Read-only audit of the CLEANILO historical import: counts, revenue reconciliation, automation-safety
+ * invariants, renumbering, linkage.
+ * DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/verify-cleanilo-import.ts
  */
 import { sql } from 'drizzle-orm';
 
@@ -87,12 +79,8 @@ async function main(): Promise<void> {
   );
   const placeholder = await rows('customers', `email like '%@import.cleanilo.local'`);
   const verified = custImported - placeholder;
-  // 57 at import time; 6 rejected 08/2026 when B2B stopped being ORed across
-  // contradicting CRM candidates (Kabir's call — see fix-cleanilo-b2b.ts).
   L(`  b2b tagged                 ${b2b}   (expected 51)`);
   L(`  placeholder emails         ${placeholder}`);
-  // 9, not 10: one CRM name match had several equally-rated candidates and no
-  // way to corroborate by address or invoice, so it keeps a placeholder.
   L(`  verified real emails       ${verified}   (expected 9)`);
 
   const renum = await q<{ number: string; recipient_name: string; total_cents: number }>(

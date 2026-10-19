@@ -3,6 +3,7 @@ import { env } from './config/env.js';
 import { pool } from './db/index.js';
 import { startExportWorker, stopExportWorker } from './lib/exports.js';
 import { startDunningWorker, stopDunningWorker } from './lib/dunning.js';
+import { startOfferExpiryWorker, stopOfferExpiryWorker } from './lib/offer-expiry.js';
 
 // Single-replica only: chat hub and caches are in-process (needs Redis to scale out).
 const SHUTDOWN_DEADLINE_MS = 15_000;
@@ -18,13 +19,13 @@ async function main() {
 
   startExportWorker();
   startDunningWorker();
+  startOfferExpiryWorker();
 
   let shuttingDown = false;
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     process.on(sig, () => {
       if (shuttingDown) return;
       shuttingDown = true;
-      // Never hang past the deadline on a stuck close.
       const deadline = setTimeout(() => {
         console.error(`Shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms — forcing exit`);
         process.exit(1);
@@ -34,6 +35,7 @@ async function main() {
         app.log.info(`Received ${sig}, shutting down...`);
         stopExportWorker();
         await stopDunningWorker(); // drain any in-flight sweep before closing the pool
+        await stopOfferExpiryWorker();
         await app.close();
         await pool.end();
         process.exit(0);

@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
-import { and, desc, eq, gte, lt, or, sql } from 'drizzle-orm';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { and, desc, eq, gte, ilike, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { z } from 'zod';
 import { env } from '../../config/env.js';
 import { accessLevelOf, redactListForViewer } from '../../lib/access.js';
@@ -32,12 +32,14 @@ const subscribeSchema = z.object({
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).max(500).optional(),
+  status: z.enum(['confirmed', 'pending', 'unsubscribed']).optional(),
+  q: z.string().trim().min(1).max(200).optional(),
 });
 
-const CONFIRM_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+const CONFIRM_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
-function appBaseUrl(): string {
-  return env.APP_BASE_URL.replace(/\/$/, '');
+function likeTerm(q: string): string {
+  return `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
 }
 
 function apiBaseUrl(): string {
@@ -57,10 +59,9 @@ function renderHtmlPage(
   reply: FastifyReply,
   opts: {
     title: string;
-    /** Heading text — will be HTML-escaped before injection. */
+    /** HTML-escaped before injection. */
     heading: string;
-    /** Pre-rendered, already-trusted HTML for the body. Caller is responsible
-     * for escaping any user-controlled segments before passing them here. */
+    /** Trusted pre-rendered HTML; the caller must escape any user-controlled segments. */
     bodyHtml: string;
     status?: number;
   },
@@ -74,8 +75,8 @@ function renderHtmlPage(
 }
 
 export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
-  // Unsubscribe form + RFC 8058 clients POST urlencoded bodies; the token is
-  // in the query string, so accept and discard the body.
+  // The unsubscribe form and RFC 8058 clients POST urlencoded bodies; the token is in the query string,
+  // so the body is accepted and discarded.
   app.addContentTypeParser(
     'application/x-www-form-urlencoded',
     { parseAs: 'string' },
@@ -101,10 +102,10 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
       const confirmToken = randomConfirmToken();
       const confirmTokenExpiresAt = new Date(Date.now() + CONFIRM_TOKEN_TTL_MS);
 
+      // Marketing opt-in is set on confirm (double opt-in), not here.
       const customerId = await linkCustomerByEmail(db, customers, {
         email: body.email,
         name: [body.firstName, body.lastName].filter(Boolean).join(' ') || null,
-        marketingOptIn: true,
       });
 
       const [row] = await db
@@ -140,6 +141,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
           const result = await sendEmail({
             to: row.email,
             from: brandSender(companyRow),
+            log: { companySlug: slug, kind: 'newsletter_confirm' },
             apiKey: companyRow.resendApiKey ?? undefined,
             replyTo: companyRow.email ?? undefined,
             // RFC 8058 one-click unsubscribe (Gmail/Yahoo bulk-sender rules).
@@ -181,7 +183,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
         return renderHtmlPage(reply, {
           title: 'Ungültiger Link',
           heading: 'Ungültiger Bestätigungs-Link',
-          bodyHtml: '<p>Bitte fordere eine neue Anmeldung an.</p>',
+          bodyHtml: '<p>Bitte melden Sie sich erneut zum Newsletter an.</p>',
           status: 400,
         });
       }
@@ -217,21 +219,29 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
         return renderHtmlPage(reply, {
           title: 'Abgelaufen',
           heading: 'Bestätigungs-Link ungültig oder abgelaufen',
-          bodyHtml: '<p>Bitte melde dich erneut an, um einen neuen Link zu erhalten.</p>',
+          bodyHtml: '<p>Bitte melden Sie sich erneut an, um einen neuen Link zu erhalten.</p>',
           status: 410,
         });
       }
       if (!row.confirmed) {
-        await db
-          .update(tables.newsletterSubscribers)
-          .set({
-            confirmed: true,
-            confirmedAt: now,
-            confirmToken: null,
-            confirmTokenExpiresAt: null,
-            updatedAt: now,
-          })
-          .where(eq(tables.newsletterSubscribers.id, row.id));
+        await db.transaction(async (tx) => {
+          await tx
+            .update(tables.newsletterSubscribers)
+            .set({
+              confirmed: true,
+              confirmedAt: now,
+              confirmToken: null,
+              confirmTokenExpiresAt: null,
+              updatedAt: now,
+            })
+            .where(eq(tables.newsletterSubscribers.id, row.id));
+          if (row.customerId) {
+            await tx
+              .update(tables.customers)
+              .set({ marketingOptIn: true, updatedAt: now })
+              .where(eq(tables.customers.id, row.customerId));
+          }
+        });
       }
       const unsubscribeUrl = `${apiBaseUrl()}/storefront/newsletter/unsubscribe?token=${encodeURIComponent(
         signUnsubscribeToken({ id: row.id, slug: companyRow.slug }),
@@ -240,8 +250,8 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
       return renderHtmlPage(reply, {
         title: 'Bestätigt',
         heading: `Newsletter bestätigt · ${companyRow.name}`,
-        bodyHtml: `<p>Danke! Du erhältst künftig den Newsletter von <strong>${safeName}</strong>.</p>
-        <p style="margin-top:24px;font-size:12px;color:#6b5b48;">Du möchtest doch nicht? <a href="${escapeHtml(unsubscribeUrl)}" style="color:#6b5b48;">Hier abmelden</a>.</p>`,
+        bodyHtml: `<p>Vielen Dank! Sie erhalten künftig den Newsletter von <strong>${safeName}</strong>.</p>
+        <p style="margin-top:24px;font-size:12px;color:#6b5b48;">Sie möchten den Newsletter doch nicht erhalten? <a href="${escapeHtml(unsubscribeUrl)}" style="color:#6b5b48;">Hier abmelden</a>.</p>`,
       });
     },
   );
@@ -250,7 +260,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
     token: z.string().min(8).max(500),
   });
 
-  /** Confirmation page only — mail scanners prefetch GETs, so POST does the work. */
+  /** Confirmation page only: mail scanners prefetch GETs, so the POST does the work. */
   app.get(
     '/unsubscribe',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
@@ -261,7 +271,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
         return renderHtmlPage(reply, {
           title: 'Ungültiger Link',
           heading: 'Ungültiger Abmelde-Link',
-          bodyHtml: '<p>Bitte verwende den Link aus der letzten Newsletter-Mail.</p>',
+          bodyHtml: '<p>Bitte verwenden Sie den Link aus der letzten Newsletter-E-Mail.</p>',
           status: 400,
         });
       }
@@ -283,7 +293,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
       return renderHtmlPage(reply, {
         title: 'Abmelden',
         heading: `Newsletter abmelden · ${companyRow.name}`,
-        bodyHtml: `<p>Möchtest du keine Newsletter mehr von <strong>${safeName}</strong> erhalten?</p>
+        bodyHtml: `<p>Möchten Sie keinen Newsletter mehr von <strong>${safeName}</strong> erhalten?</p>
         <form method="post" action="${escapeHtml(action)}" style="margin-top:16px;">
           <button type="submit" style="background:#bd5b3e;color:#fff;border:0;border-radius:8px;padding:12px 24px;font-size:14px;cursor:pointer;">Jetzt abmelden</button>
         </form>`,
@@ -291,7 +301,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  /** Performs the unsubscribe. Also serves RFC 8058 one-click POSTs. */
+  /** Also serves RFC 8058 one-click POSTs. */
   app.post(
     '/unsubscribe',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
@@ -322,16 +332,28 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
       const tenant = await import('../../db/schema/tenant.js');
       const tables = tenant.getTenantTables(companyRow.schemaName);
       const now = new Date();
-      await db
-        .update(tables.newsletterSubscribers)
-        .set({ unsubscribedAt: now, updatedAt: now })
-        .where(eq(tables.newsletterSubscribers.id, payload.id));
+      await db.transaction(async (tx) => {
+        const [sub] = await tx
+          .update(tables.newsletterSubscribers)
+          .set({ unsubscribedAt: now, updatedAt: now })
+          .where(eq(tables.newsletterSubscribers.id, payload.id))
+          .returning({ customerId: tables.newsletterSubscribers.customerId });
+        // Unsubscribing withdraws the marketing consent on the customer record too.
+        if (sub?.customerId) {
+          await tx
+            .update(tables.customers)
+            .set({ marketingOptIn: false, updatedAt: now })
+            .where(eq(tables.customers.id, sub.customerId));
+        }
+      });
       const safeName = escapeHtml(companyRow.name);
+      // The brand's website, not APP_BASE_URL (that is the admin dashboard).
+      const site = companyRow.storefrontOrigin ?? companyRow.websiteUrl;
       return renderHtmlPage(reply, {
         title: 'Abgemeldet',
-        heading: `Du bist abgemeldet · ${companyRow.name}`,
-        bodyHtml: `<p>Wir senden dir keine weiteren Newsletter mehr von <strong>${safeName}</strong>.</p>
-        <p style="margin-top:8px;font-size:12px;color:#6b5b48;">War das ein Versehen? Du kannst dich jederzeit auf ${escapeHtml(appBaseUrl())} wieder anmelden.</p>`,
+        heading: `Sie sind abgemeldet · ${companyRow.name}`,
+        bodyHtml: `<p>Wir senden Ihnen keinen Newsletter mehr von <strong>${safeName}</strong>.</p>
+        <p style="margin-top:8px;font-size:12px;color:#6b5b48;">War das ein Versehen? Sie können sich jederzeit ${site ? `auf ${escapeHtml(site)}` : 'auf unserer Website'} wieder anmelden.</p>`,
       });
     },
   );
@@ -340,28 +362,45 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
 export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
-  // Deleting subscribers and bulk-importing consent records — manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
-    const { limit, cursor } = listQuerySchema.parse(request.query);
-    const { newsletterSubscribers } = request.company!.tables;
-    const decoded = cursor ? decodeCursor(cursor) : null;
-    const where = decoded
+    const { limit, cursor, status, q } = listQuerySchema.parse(request.query);
+    const subs = request.company!.tables.newsletterSubscribers;
+    const statusOf = {
+      unsubscribed: isNotNull(subs.unsubscribedAt),
+      confirmed: and(isNull(subs.unsubscribedAt), eq(subs.confirmed, true))!,
+      pending: and(isNull(subs.unsubscribedAt), eq(subs.confirmed, false))!,
+    };
+    const search = q
       ? or(
-          lt(newsletterSubscribers.createdAt, sql`${decoded.createdAt}::timestamptz`),
-          and(
-            sql`${newsletterSubscribers.createdAt} = ${decoded.createdAt}::timestamptz`,
-            lt(newsletterSubscribers.id, decoded.id),
-          ),
+          ilike(subs.email, likeTerm(q)),
+          ilike(subs.firstName, likeTerm(q)),
+          ilike(subs.lastName, likeTerm(q)),
         )
       : undefined;
-    const rows = await db
-      .select()
-      .from(newsletterSubscribers)
-      .where(where)
-      .orderBy(desc(newsletterSubscribers.createdAt), desc(newsletterSubscribers.id))
-      .limit(limit + 1);
+    const after = keysetAfter(subs, subs.createdAt, subs.id, cursor);
+    const [rows, counts] = await Promise.all([
+      db
+        .select()
+        .from(subs)
+        .where(and(search, status ? statusOf[status] : undefined, after))
+        .orderBy(desc(subs.createdAt), desc(subs.id))
+        .limit(limit + 1),
+      // Tab counts for the current search; only the first page needs them.
+      cursor
+        ? null
+        : db
+            .select({
+              all: sql<number>`count(*)::int`,
+              confirmed: sql<number>`(count(*) filter (where ${statusOf.confirmed}))::int`,
+              pending: sql<number>`(count(*) filter (where ${statusOf.pending}))::int`,
+              unsubscribed: sql<number>`(count(*) filter (where ${statusOf.unsubscribed}))::int`,
+            })
+            .from(subs)
+            .where(search)
+            .then((r) => r[0] ?? null),
+    ]);
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
     const last = page[page.length - 1];
@@ -369,10 +408,11 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
-    // Subscriber rows carry the IP/user-agent captured at signup.
+    // Subscriber rows carry the signup IP/user-agent; redacted for viewers.
     return {
       subscribers: redactListForViewer(page, accessLevelOf(request)),
       nextCursor,
+      counts,
     };
   });
 
@@ -398,14 +438,12 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
     csv: z
       .string()
       .min(8)
-      .max(10 * 1024 * 1024), // 10 MB hard cap
+      .max(10 * 1024 * 1024),
     dryRun: z.boolean().default(false),
     tag: z.string().trim().max(64).optional(),
     source: z.string().trim().max(64).default('csv-import'),
-    /**
-     * UWG §7: the sender must prove consent. Rows import as confirmed only
-     * when the admin attests proof exists; otherwise they must double-opt-in.
-     */
+    // UWG §7: the sender must prove consent. Rows import as confirmed only when the admin attests
+    // proof exists, otherwise they must double-opt-in.
     attestConsent: z.boolean().default(false),
   });
 
