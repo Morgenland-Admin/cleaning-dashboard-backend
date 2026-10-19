@@ -4,7 +4,6 @@ import { test } from 'node:test';
 import { craftsmanNoteText, craftsmanVatFromGross, INVOICE_THANK_YOU } from './invoice-text.js';
 
 test('craftsmanVatFromGross: VAT contained in a gross amount at 19 %', () => {
-  // Kabir's reference figures: 200,00 € gross labour contain 31,93 € VAT.
   assert.equal(craftsmanVatFromGross(20_000), 3193);
   assert.equal(craftsmanVatFromGross(70_000), 11_176);
 });

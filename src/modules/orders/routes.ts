@@ -1,5 +1,17 @@
-import type { FastifyPluginAsync, FastifyInstance } from 'fastify';
-import { and, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastify';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  ilike,
+  inArray,
+  isNull,
+  notInArray,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 import { z } from 'zod';
 import type Stripe from 'stripe';
 
@@ -19,10 +31,10 @@ import {
   pickupSchedulingLinkEmail,
 } from '../../email/templates.js';
 import { accessLevelOf, isPrivileged, redactForViewer } from '../../lib/access.js';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
 import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
-import { computeCommission, parseCommissionRate } from '../../lib/commission.js';
+import { computeCommission } from '../../lib/commission.js';
 import { createInvoiceDraftForOrder } from '../invoices/from-order.js';
 import { computeLoyaltyTier } from '../../lib/loyalty.js';
 import { captureException } from '../../lib/observability.js';
@@ -41,10 +53,21 @@ import {
 import {
   allowedNextStatuses,
   canTransition,
+  CLOSED_ORDER_STATUSES,
+  derivedOrderId,
+  formatOrderNumber,
   generateOrderToken,
+  KIND_LABEL,
+  likePattern,
+  orderNumberOf,
   type OrderStatus,
   statusTimestampColumn,
 } from './lib.js';
+import {
+  assignOrderToPartner,
+  notifyPartnerOfAssignment,
+  resolveCommissionRate,
+} from './assign.js';
 import {
   checkoutSchema,
   quoteSchema,
@@ -67,27 +90,7 @@ import {
   type CalendlyWebhookPayload,
 } from '../../lib/calendly.js';
 
-const KIND_LABEL: Record<string, string> = {
-  teppichreinigung: 'Teppichreinigung',
-  teppichreparatur: 'Teppichreparatur',
-  polsterreinigung: 'Polsterreinigung (Vor-Ort)',
-  teppichbodenreinigung: 'Teppichbodenreinigung (Vor-Ort)',
-};
-
-/** "YYYY/000123" from the creation year — never the current year. */
-function formatOrderNumber(id: number, createdAt: Date): string {
-  return `${createdAt.getUTCFullYear()}/${String(id).padStart(6, '0')}`;
-}
-
-/** Persisted order number; createdAt-based fallback for legacy rows. */
-function orderNumberOf(row: {
-  id: number;
-  orderNumber?: string | null;
-  createdAt?: Date | null;
-}): string {
-  if (row.orderNumber) return row.orderNumber;
-  return formatOrderNumber(row.id, row.createdAt ?? new Date());
-}
+export { orderNumberOf };
 
 /** Per-brand card-statement suffix (Stripe: alnum + space, 22-char limit). */
 function statementSuffix(companyName: string): string | undefined {
@@ -100,7 +103,6 @@ function statementSuffix(companyName: string): string | undefined {
   return cleaned.length >= 2 ? cleaned : undefined;
 }
 
-/** "YYYY-MM-DDTHH:mm" → "DD.MM.YYYY · HH:mm Uhr" for German display. */
 function formatSlotDe(slot: string): string {
   const [d, t] = slot.split('T');
   const [y, m, day] = (d ?? '').split('-');
@@ -108,11 +110,7 @@ function formatSlotDe(slot: string): string {
   return `${day}.${m}.${y}${t ? ` · ${t} Uhr` : ''}`;
 }
 
-/**
- * Service address for the Calendly booking — it answers the event type's
- * address question and is what the crew navigates to. Deliberately just the
- * address: the calendar is an internal ops view, no order value on it.
- */
+/** Service address for the Calendly booking: address only, no order value (internal calendar). */
 function calendarAddressText(row: {
   addressLine1: string | null;
   addressLine2: string | null;
@@ -126,10 +124,6 @@ function calendarAddressText(row: {
   return address || row.pickupLabel || null;
 }
 
-/**
- * One-line "what is this job" for the event type's free-text question, so the
- * crew sees the service on the calendar entry without opening the dashboard.
- */
 function calendarServiceSummary(row: {
   kind: string;
   orderNumber?: string | null;
@@ -160,7 +154,7 @@ interface NotifyCustomerArgs {
   refundCents?: number;
 }
 
-async function notifyCustomerStatusChange(args: NotifyCustomerArgs): Promise<void> {
+export async function notifyCustomerStatusChange(args: NotifyCustomerArgs): Promise<void> {
   if (!isStatusEmailableStatus(args.toStatus)) return;
   if (args.toStatus === args.fromStatus) return;
 
@@ -178,6 +172,12 @@ async function notifyCustomerStatusChange(args: NotifyCustomerArgs): Promise<voi
     await sendEmail({
       to: args.order.customerEmail,
       from: brandSender(companyRow),
+      log: {
+        companySlug: companyRow.slug,
+        kind: 'order_status',
+        refType: 'order',
+        refId: args.order.id,
+      },
       apiKey: companyRow.resendApiKey ?? undefined,
       replyTo: companyRow.email ?? undefined,
       email: orderStatusUpdateEmail({
@@ -226,8 +226,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
       const body: CheckoutInput = checkoutSchema.parse(request.body);
       const provider: 'stripe' | 'paypal' = body.provider === 'paypal' ? 'paypal' : 'stripe';
 
-      // After-service bookings are confirmed without an upfront charge; an admin
-      // sends a Stripe link later, so they still validate against the Stripe config.
+      // After-service orders are charged later via a Stripe link: provider must still be configured.
       const providerReady = provider === 'paypal' ? paypalConfigured : stripeConfigured;
       if (!providerReady) {
         reply.code(503).send({ error: 'Payments are not configured on this server' });
@@ -275,7 +274,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
       const paymentMode = body.paymentMode ?? 'upfront';
       const isAfterService = paymentMode === 'after_service';
 
-      // Validate everything fallible BEFORE the insert — no orphaned rows.
+      // Validate before the insert: no orphaned rows.
       let discounts: Array<{ promotion_code: string }> | undefined;
       if (!isAfterService) {
         if (
@@ -348,9 +347,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           : null;
 
       const now = new Date();
-      // 'after_service' orders skip Stripe checkout entirely — they go straight
-      // into the service pipeline (status 'accepted') and payment is collected
-      // by an admin once the work is done (cash / EC card / credit-card link).
+      // after_service: no checkout, straight to 'accepted'; an admin collects payment after the work.
 
       const orderRow = await db.transaction(async (tx) => {
         const customerId = await linkCustomerByEmail(tx, customers, {
@@ -405,7 +402,6 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         const order = inserted[0];
         if (!order) throw new Error('Failed to insert order row');
 
-        // Stamp the order number from the creation year so it never drifts.
         const stampedNumber = formatOrderNumber(order.id, order.createdAt);
         await tx.update(orders).set({ orderNumber: stampedNumber }).where(eq(orders.id, order.id));
         order.orderNumber = stampedNumber;
@@ -432,7 +428,6 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return order;
       });
 
-      // --- Pay-after-service: no Stripe checkout, just confirm the booking. ---
       if (isAfterService) {
         try {
           const brand = brandInfoFromCompany(companyRow);
@@ -449,6 +444,12 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           await sendEmail({
             to: body.customer.email,
             from: brandSender(companyRow),
+            log: {
+              companySlug: companyRow.slug,
+              kind: 'order_confirmation',
+              refType: 'order',
+              refId: orderRow.id,
+            },
             apiKey: companyRow.resendApiKey ?? undefined,
             replyTo: companyRow.email ?? undefined,
             email: orderConfirmationEmail({
@@ -474,6 +475,12 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
             await sendEmail({
               to: companyRow.email,
               from: brandSender(companyRow),
+              log: {
+                companySlug: companyRow.slug,
+                kind: 'staff_notification',
+                refType: 'order',
+                refId: orderRow.id,
+              },
               apiKey: companyRow.resendApiKey ?? undefined,
               replyTo: body.customer.email,
               email: newOrderAdminEmail({
@@ -521,15 +528,14 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
 
-      // --- PayPal (native Orders v2): money settles directly in the PayPal account. ---
+      // PayPal Orders v2: money settles in the PayPal account, not Stripe.
       if (provider === 'paypal') {
         let paypalOrder;
         try {
           paypalOrder = await createPayPalOrder({
             amountCents: quote.totalCents,
             referenceId: publicToken,
-            // invoiceId maps the capture/webhook back to this order AND makes PayPal
-            // itself reject an accidental double-pay for the same order.
+            // invoiceId maps capture/webhook to the order; PayPal also rejects a double-pay with it.
             invoiceId: `${request.company!.slug}_${orderRow.id}`,
             description: `${companyRow.name} · ${KIND_LABEL[body.kind] ?? body.kind} · ${orderNumberOf(orderRow)}`,
             brandName: companyRow.name,
@@ -588,8 +594,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         session = await stripe.checkout.sessions.create(
           {
             mode: 'payment',
-            // PayPal is handled by the native Orders v2 flow (lib/paypal.ts) so the
-            // money lands in the PayPal account — not routed through Stripe here.
+            // No 'paypal' here: it runs through the native Orders v2 flow (lib/paypal.ts).
             payment_method_types: ['card', 'amazon_pay', 'link'],
             currency: 'eur',
             line_items: [
@@ -625,7 +630,6 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           { idempotencyKey: `checkout_${request.company!.slug}_${orderRow.id}` },
         );
       } catch (err) {
-        // Don't strand the fresh row as an orphaned 'pending' order.
         request.log.error({ err, orderId: orderRow.id }, 'Stripe session creation failed');
         await markOrderCancelled(
           app,
@@ -699,8 +703,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         paypalCaptureId: _pc,
         ...safe
       } = row;
-      // Dispute + Meta fbp/fbc are internal; expose only the Purchase eventId
-      // so the success page can fire a deduped browser Purchase.
+      // Dispute and Meta fbp/fbc stay internal; only the Purchase eventId is exposed (dedupe).
       const { dispute: _dispute, meta: _meta, ...publicMeta } = safe.metadata ?? {};
       const metaPurchaseEventId =
         (safe.metadata as { meta?: { eventId?: string } } | null)?.meta?.eventId ?? null;
@@ -717,9 +720,8 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // Capture a PayPal order after the buyer approves it in the PayPal popup.
-  // Called by the storefront's onApprove handler. Idempotent: finalizePaidOrder
-  // and the PAYMENT.CAPTURE.COMPLETED webhook both no-op once the order is paid.
+  // Capture after buyer approval (storefront onApprove). Idempotent: finalizePaidOrder and the
+  // PAYMENT.CAPTURE.COMPLETED webhook both no-op once paid.
   app.post(
     '/:token/paypal/capture',
     { config: { rateLimit: { max: 12, timeWindow: '1 minute' } } },
@@ -743,7 +745,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         reply.code(400).send({ error: 'Order is not a PayPal order' });
         return;
       }
-      // Already finalized (capture retried, or the webhook beat us here) — succeed idempotently.
+      // Already finalized (retry, or the webhook won): succeed idempotently.
       if (row.status !== 'pending' && row.status !== 'payment_pending') {
         reply.code(200).send({ ok: true, status: row.status, publicToken: token });
         return;
@@ -761,8 +763,8 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
 
-      // Only a COMPLETED capture means money was received. A PENDING or declined
-      // capture must NOT mark the order paid — the webhook finalizes it if it later clears.
+      // Only COMPLETED means money received; PENDING/declined must not mark paid (the webhook
+      // finalizes it if it clears).
       if (capture.captureStatus !== 'COMPLETED') {
         request.log.warn(
           { orderId: row.id, orderStatus: capture.status, captureStatus: capture.captureStatus },
@@ -834,8 +836,7 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
     reply.code(200).send({ received: true });
   });
 
-  // Native PayPal webhook (PAYMENT.CAPTURE.* etc). Backstop to the synchronous
-  // capture endpoint — reconciles the order if the buyer's browser dropped off.
+  // PayPal webhook: backstop for the capture endpoint when the buyer's browser dropped off.
   app.post('/paypal', async (request, reply) => {
     if (!paypalConfigured || !env.PAYPAL_WEBHOOK_ID) {
       reply.code(503).send({ error: 'PayPal webhook not configured' });
@@ -883,10 +884,8 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
     reply.code(200).send({ received: true });
   });
 
-  // Calendly invitee.created / invitee.canceled. Only matters for bookings we did
-  // not make ourselves: the customer self-booking via a scheduling link, or a
-  // reschedule/cancel done inside Calendly. Our own /invitees bookings are already
-  // recorded synchronously, and land here as a harmless confirmation.
+  // invitee.created/canceled: matters for self-bookings via scheduling link and reschedule/cancel
+  // inside Calendly; our own bookings are already recorded and land here as a no-op.
   app.post('/calendly', async (request, reply) => {
     if (!env.CALENDLY_WEBHOOK_SIGNING_KEY) {
       reply.code(503).send({ error: 'Calendly webhook not configured' });
@@ -927,10 +926,8 @@ export const ordersWebhookRoutes: FastifyPluginAsync = async (app) => {
 };
 
 /**
- * Route an invitee event back onto its order. Correlation runs through
- * `tracking.utm_content` (`order:<companySlug>:<orderId>`), which we set on both
- * the direct booking and the single-use scheduling link — the Calendly account is
- * shared across brands, so the payload alone cannot say which tenant it belongs to.
+ * Routes an invitee event to its order via `tracking.utm_content` (`order:<companySlug>:<orderId>`);
+ * the Calendly account is shared across brands, so the payload alone can't name the tenant.
  */
 async function handleCalendlyEvent(
   app: FastifyInstance,
@@ -969,7 +966,7 @@ async function handleCalendlyEvent(
   const now = new Date().toISOString();
 
   if (kind === 'invitee.canceled') {
-    // Don't resurrect state for an event we already replaced with a newer one.
+    // Ignore a cancel for an event already replaced by a newer one.
     if (existing?.inviteeUri && payload.uri && existing.inviteeUri !== payload.uri) return;
     const next: CalendlyPickupMeta = {
       ...(existing ?? { source: 'webhook', updatedAt: now }),
@@ -1006,8 +1003,7 @@ async function handleCalendlyEvent(
   await db
     .update(tables.orders)
     .set({
-      // The customer's pick is the appointment — mirror it into the fields the
-      // panel and the 24h cancellation rule read.
+      // The customer's pick is the appointment: mirror it into what the panel and 24h rule read.
       ...(slot ? { preferredDate: slot.slice(0, 10) } : {}),
       metadata: { ...meta, ...(slot ? { confirmedSlot: slot } : {}), calendly: next },
       updatedAt: new Date(),
@@ -1029,7 +1025,7 @@ interface PayPalWebhookEvent {
   };
 }
 
-/** invoice_id is `${companySlug}_${orderId}` — parse it back to route the event. */
+/** invoice_id format: `${companySlug}_${orderId}`. */
 function parsePayPalInvoiceId(
   invoiceId: string | undefined,
 ): { companySlug: string; orderId: number } | null {
@@ -1042,7 +1038,6 @@ function parsePayPalInvoiceId(
   return { companySlug, orderId };
 }
 
-/** Resolve the parent capture id of a refund resource from its `up` link. */
 function paypalCaptureIdFromRefund(resource: PayPalWebhookEvent['resource']): string | null {
   const fromData = resource?.supplementary_data?.related_ids?.capture_id;
   if (fromData) return fromData;
@@ -1132,8 +1127,7 @@ async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Pro
         );
         return;
       }
-      // A payment-link for an already-running "pay after service" order: just
-      // record the payment, don't run the new-order onboarding (emails sent at booking).
+      // Pay-after-service payment link: record the payment only; booking emails already went out.
       if (session.metadata?.afterService === '1') {
         await markAfterServicePaid(app, companySlug, orderId, session);
         return;
@@ -1209,7 +1203,6 @@ async function handleStripeEvent(app: FastifyInstance, event: Stripe.Event): Pro
   }
 }
 
-/** Find the partner row (across all tenant schemas) for a Connect account and sync flags. */
 async function syncPartnerConnectAccount(
   app: FastifyInstance,
   account: Stripe.Account,
@@ -1242,7 +1235,6 @@ async function syncPartnerConnectAccount(
   }
 }
 
-/** Mark an order's payout failed when its Connect transfer is reversed/fails. */
 async function markPayoutFailedByTransfer(app: FastifyInstance, transferId: string): Promise<void> {
   const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
   const { getTenantTables } = await import('../../db/schema/tenant.js');
@@ -1310,7 +1302,6 @@ async function syncSubscriptionFromStripe(
   app.log.warn({ stripeSubscriptionId: sub.id }, 'Subscription webhook for unknown subscription');
 }
 
-/** Flag the affected order when a chargeback/dispute is opened. */
 async function markOrderDisputedByPaymentIntent(
   app: FastifyInstance,
   paymentIntentId: string,
@@ -1367,12 +1358,10 @@ async function markOrderDisputedByPaymentIntent(
   app.log.warn({ paymentIntentId }, 'Dispute webhook for unknown payment intent');
 }
 
-/** Provider-agnostic snapshot of a completed payment, fed into finalizePaidOrder. */
 interface PaidInfo {
   provider: 'stripe' | 'paypal';
-  /** Free-text shown in the order status log, e.g. 'paid' or 'PayPal capture COMPLETED'. */
   statusLabel: string;
-  /** Amount actually charged, in cents (null if the provider didn't report it). */
+  /** Charged amount in cents; null if the provider didn't report it. */
   amountTotalCents: number | null;
   discountCents: number;
   stripePaymentIntentId?: string | null;
@@ -1380,7 +1369,6 @@ interface PaidInfo {
   paypalCaptureId?: string | null;
 }
 
-/** Thin Stripe adapter — keeps the webhook call site unchanged. */
 async function markOrderPaid(
   app: FastifyInstance,
   companySlug: string,
@@ -1397,7 +1385,6 @@ async function markOrderPaid(
   });
 }
 
-/** PayPal adapter — runs the same onboarding as a Stripe payment. */
 async function markOrderPaidPayPal(
   app: FastifyInstance,
   companySlug: string,
@@ -1452,8 +1439,7 @@ async function finalizePaidOrder(
   if (isAlreadyAdvanced) return;
 
   const now = new Date();
-  // Payment-identifying columns, keyed by provider. paypalOrderId is set at order
-  // creation, so only overwrite it when this event actually carries a value.
+  // paypalOrderId is set at order creation: only overwrite it when the event carries one.
   const providerCols =
     paid.provider === 'paypal'
       ? {
@@ -1530,8 +1516,7 @@ async function finalizePaidOrder(
 
   await aggregateCustomerOnPaid(app, tables, order, paidTotal, now);
 
-  // Server-side Meta Purchase, deduped via the eventId stored at checkout. The
-  // claimed status-claim above guarantees this runs once per order.
+  // Server-side Meta Purchase, deduped via the eventId stored at checkout; runs once (claim above).
   try {
     const metaCtx = (order.metadata as { meta?: MetaEventContext } | null)?.meta;
     if (metaCtx?.eventId) {
@@ -1556,8 +1541,7 @@ async function finalizePaidOrder(
     app.log.warn({ err, orderId }, 'Meta Purchase CAPI dispatch failed');
   }
 
-  // Auto-create the draft invoice for this paid order (idempotent, best-effort).
-  // Replaces the n8n ALL_12 creator; a mail/render failure never blocks it.
+  // Auto-create the draft invoice (idempotent, best-effort); a failure never blocks payment.
   try {
     const { autoCreateInvoiceForPaidOrder } = await import('../invoices/auto-invoice.js');
     const res = await autoCreateInvoiceForPaidOrder(tables, order, companySlug, app.log);
@@ -1596,6 +1580,12 @@ async function finalizePaidOrder(
     const confirmRes = await sendEmail({
       to: order.customerEmail,
       from: brandSender(companyRow),
+      log: {
+        companySlug: companyRow.slug,
+        kind: 'order_confirmation',
+        refType: 'order',
+        refId: orderId,
+      },
       apiKey: companyRow.resendApiKey ?? undefined,
       replyTo: companyRow.email ?? undefined,
       email: orderConfirmationEmail({
@@ -1616,7 +1606,6 @@ async function finalizePaidOrder(
       }),
     });
     if (!confirmRes.ok) {
-      // Surface in the order's status log, not just a log line.
       app.log.error(
         { orderId, error: confirmRes.error },
         'Order confirmation email failed to send',
@@ -1634,6 +1623,12 @@ async function finalizePaidOrder(
       const adminRes = await sendEmail({
         to: companyRow.email,
         from: brandSender(companyRow),
+        log: {
+          companySlug: companyRow.slug,
+          kind: 'staff_notification',
+          refType: 'order',
+          refId: orderId,
+        },
         apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: order.customerEmail,
         email: newOrderAdminEmail({
@@ -1671,10 +1666,7 @@ async function finalizePaidOrder(
   }
 }
 
-/**
- * Roll a paid order into the customers table (lifetime totals + loyalty tier).
- * Best-effort: logs and swallows errors so it never blocks a payment.
- */
+/** Rolls a paid order into the customers table (totals + tier). Best-effort: never blocks payment. */
 async function aggregateCustomerOnPaid(
   app: FastifyInstance,
   tables: TenantTables,
@@ -1689,7 +1681,7 @@ async function aggregateCustomerOnPaid(
 ): Promise<void> {
   try {
     const { customers } = tables;
-    // Normalize so "Max@Web.de" and "max@web.de" aggregate into one customer.
+    // Lowercase so "Max@Web.de" and "max@web.de" are one customer.
     const email = order.customerEmail.trim().toLowerCase();
     const [cust] = await db
       .insert(customers)
@@ -1711,8 +1703,7 @@ async function aggregateCustomerOnPaid(
           totalSpentCents: sql`${customers.totalSpentCents} + ${paidTotal}`,
           name: sql`coalesce(${customers.name}, ${order.customerName})`,
           phone: sql`coalesce(${customers.phone}, ${order.customerPhone})`,
-          // Customer may already exist (linked at order creation) — keep the
-          // earliest firstOrderAt instead of leaving it null.
+          // Customer may already exist (linked at order creation): keep the earliest firstOrderAt.
           firstOrderAt: sql`coalesce(${customers.firstOrderAt}, ${now})`,
           lastOrderAt: now,
           updatedAt: now,
@@ -1734,10 +1725,8 @@ async function aggregateCustomerOnPaid(
 }
 
 /**
- * Record a credit-card payment for a "pay after service" order paid via a
- * payment link. Idempotent on paidAt. Unlike markOrderPaid it does NOT change
- * the service status (the admin drives that) and does NOT resend booking emails
- * (those were sent at checkout time).
+ * Records a credit-card payment for a pay-after-service order. Idempotent on paidAt. Unlike
+ * markOrderPaid it neither changes the service status (admin drives it) nor resends booking emails.
  */
 async function markAfterServicePaid(
   app: FastifyInstance,
@@ -1760,7 +1749,7 @@ async function markAfterServicePaid(
     app.log.warn({ orderId, companySlug }, 'after-service webhook for unknown order');
     return;
   }
-  if (order.paidAt) return; // already settled — idempotent
+  if (order.paidAt) return;
   if (order.status === 'cancelled' || order.status === 'refunded') {
     // Payment on a cancelled order — record loudly, skip loyalty aggregation.
     app.log.error(
@@ -1768,9 +1757,7 @@ async function markAfterServicePaid(
       'Payment received on a cancelled order — refund required',
     );
     const now = new Date();
-    // Single transaction so the money-claim and its audit note can't diverge
-    // if the process dies between them — this is exactly the case where the
-    // "refund required" note must not be lost.
+    // One transaction so the money claim and its "refund required" note can't diverge.
     await db.transaction(async (tx) => {
       const claimedRows = await tx
         .update(tables.orders)
@@ -1878,9 +1865,8 @@ async function markOrderCancelled(
 }
 
 /**
- * Cancel the Calendly event held for an order and record that in metadata.
+ * Cancels the Calendly event held for an order and records it in metadata (returned).
  * Best-effort: a Calendly outage must never fail the cancellation it follows.
- * Returns the new metadata so callers can answer with an up-to-date order.
  */
 async function releaseCalendlyPickup(args: {
   orders: TenantTables['orders'];
@@ -1933,7 +1919,6 @@ async function markOrderRefundedByPaymentIntent(
     const refundedTotal = refundAmountCents ?? order.totalCents;
     if (refundedTotal <= order.refundedAmountCents) return;
     if (order.status === 'refunded' || order.status === 'cancelled') {
-      // Status already terminal — just record the refunded amount.
       await db
         .update(tables.orders)
         .set({
@@ -1982,7 +1967,7 @@ async function markOrderRefundedByPaymentIntent(
   app.log.warn({ paymentIntentId }, 'Refund webhook for unknown payment intent');
 }
 
-/** Apply a PayPal refund/reversal to an order by company + id. Returns false if not found. */
+/** Applies a PayPal refund/reversal; false if the order isn't found. */
 async function markOrderRefundedPayPal(
   app: FastifyInstance,
   companySlug: string,
@@ -2055,7 +2040,6 @@ async function markOrderRefundedPayPal(
   return true;
 }
 
-/** Locate an order by PayPal capture id across tenant schemas, then apply the refund. */
 async function markOrderRefundedByPayPalCapture(
   app: FastifyInstance,
   captureId: string,
@@ -2098,6 +2082,49 @@ const listQuerySchema = z.object({
     .optional(),
 });
 
+const adminListQuerySchema = listQuerySchema.extend({
+  /** `open` = still in flight; `closed` = completed / cancelled / refunded. A `status` wins over it. */
+  view: z.enum(['open', 'closed']).optional(),
+  q: z.string().trim().min(1).max(100).optional(),
+});
+
+const countsQuerySchema = adminListQuerySchema.pick({ q: true });
+
+/** Status group + free-text filter shared by the brand list and the cross-brand list. */
+function adminListConditions(
+  orders: TenantTables['orders'],
+  { status, view, q }: Pick<z.infer<typeof adminListQuerySchema>, 'status' | 'view' | 'q'>,
+): SQL[] {
+  const conds: SQL[] = [];
+  if (status) conds.push(eq(orders.status, status));
+  else if (view === 'open') conds.push(notInArray(orders.status, [...CLOSED_ORDER_STATUSES]));
+  else if (view === 'closed') conds.push(inArray(orders.status, [...CLOSED_ORDER_STATUSES]));
+  if (q) {
+    const like = likePattern(q);
+    const id = derivedOrderId(q);
+    const match = or(
+      ilike(orders.orderNumber, like),
+      ilike(orders.customerName, like),
+      ilike(orders.customerEmail, like),
+      ilike(orders.customerPhone, like),
+      id ? eq(orders.id, id) : undefined,
+    );
+    if (match) conds.push(match);
+  }
+  return conds;
+}
+
+/** Per-status counts for the tabs; `q` narrows them like the list's search. */
+async function orderStatusCounts(orders: TenantTables['orders'], q?: string) {
+  const conds = adminListConditions(orders, { q });
+  const rows = await db
+    .select({ status: orders.status, n: sql<number>`count(*)::int` })
+    .from(orders)
+    .where(conds.length ? and(...conds) : undefined)
+    .groupBy(orders.status);
+  return Object.fromEntries(rows.map((r) => [r.status, r.n])) as Record<string, number>;
+}
+
 const transitionSchema = z.object({
   toStatus: z.enum([
     'accepted',
@@ -2116,39 +2143,43 @@ const updateInternalNotesSchema = z.object({
   internalNotes: z.string().trim().max(4000).nullable(),
 });
 
-// The viewer read model lives in lib/access.ts — it used to be private to this
-// module, which meant every other module returning the same columns leaked them.
+/** Recomputed partner split for a changed order total (none once paid out). */
+export async function commissionPatch(
+  tables: TenantTables,
+  order: { assignedPartnerId: number | null; payoutStatus: string; kind: string },
+  newTotal: number,
+): Promise<Record<string, number>> {
+  if (!order.assignedPartnerId || order.payoutStatus === 'paid') return {};
+  const [partner] = await db
+    .select({ commissionRate: tables.partners.commissionRate })
+    .from(tables.partners)
+    .where(eq(tables.partners.id, order.assignedPartnerId))
+    .limit(1);
+  // Same rate chain as the original assignment, so an edit never drifts to the platform default.
+  const rate = partner ? await resolveCommissionRate(tables, partner, order.kind) : null;
+  const split = computeCommission(newTotal, rate);
+  return { commissionCents: split.commissionCents, partnerPayoutCents: split.partnerPayoutCents };
+}
+
+// Viewer read model lives in lib/access.ts; every module returning these columns must use it.
 const redactOrderPii = redactForViewer;
 
 export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Every mutation here moves an order, money, or customer mail — manager+.
-  // Reads stay open so a `viewer` can still work the list.
+  // Every mutation moves an order, money or customer mail: manager+. Reads stay open for viewers.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
-    const { limit, cursor, status } = listQuerySchema.parse(request.query);
+    const { limit, cursor, ...filter } = adminListQuerySchema.parse(request.query);
     const { orders } = request.company!.tables;
-    const decoded = cursor ? decodeCursor(cursor) : null;
-    const cursorWhere = decoded
-      ? or(
-          lt(orders.createdAt, sql`${decoded.createdAt}::timestamptz`),
-          and(
-            sql`${orders.createdAt} = ${decoded.createdAt}::timestamptz`,
-            lt(orders.id, decoded.id),
-          ),
-        )
-      : undefined;
-    const where = status
-      ? cursorWhere
-        ? and(cursorWhere, eq(orders.status, status))
-        : eq(orders.status, status)
-      : cursorWhere;
+    const conds = adminListConditions(orders, filter);
+    const after = keysetAfter(orders, orders.createdAt, orders.id, cursor);
+    if (after) conds.push(after);
 
     const rows = await db
       .select()
       .from(orders)
-      .where(where)
+      .where(conds.length ? and(...conds) : undefined)
       .orderBy(desc(orders.createdAt), desc(orders.id))
       .limit(limit + 1);
     const hasMore = rows.length > limit;
@@ -2165,9 +2196,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // Admin-created order (phone booking, walk-in). No payment is taken here: it's
-  // created as an offline `after_service`/`accepted` order, then settled later via
-  // the existing payment-link / record-payment / transition actions.
+  app.get('/counts', async (request) => {
+    const { q } = countsQuerySchema.parse(request.query);
+    return { counts: await orderStatusCounts(request.company!.tables.orders, q) };
+  });
+
+  // Admin-created order (phone/walk-in): no payment taken; created offline as after_service/accepted
+  // and settled later via payment link / record-payment.
   const createOrderSchema = z.object({
     kind: z.enum([
       'teppichreinigung',
@@ -2220,7 +2255,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     const adminId = request.authUser!.id;
     const { orders, orderItems, orderStatusLog, customers } = request.company!.tables;
 
-    // Total is recomputed from the line items server-side — never trusted from the client.
+    // Total recomputed server-side from the lines, never trusted from the client.
     const lines = body.items.map((it) => ({
       code: it.code ?? 'manual',
       label: it.label,
@@ -2313,15 +2348,17 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       reply.code(404).send({ error: 'Order not found' });
       return;
     }
-    const items = await db.select().from(orderItems).where(eq(orderItems.orderId, id));
+    const items = await db
+      .select()
+      .from(orderItems)
+      .where(eq(orderItems.orderId, id))
+      .orderBy(asc(orderItems.id));
     const log = await db
       .select()
       .from(orderStatusLog)
       .where(eq(orderStatusLog.orderId, id))
       .orderBy(desc(orderStatusLog.createdAt));
-    // The order's invoice, if one exists. Summary only — the full record lives
-    // at /admin/invoices/:id — but enough for the pane to decide between
-    // "create", "open the draft" and "issued, here is the number".
+    // Invoice summary for the pane (create / open draft / issued); full record: /admin/invoices/:id.
     const { invoices } = request.company!.tables;
     const [invoiceRow] = await db
       .select({
@@ -2347,16 +2384,9 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * Create the draft invoice for this order by hand.
-   *
-   * Deliberately never issues, whatever the brand's `auto_issue_invoices` says:
-   * the whole point of the button is to get an editable draft carrying the
-   * order's positions, so work agreed after the booking (a repair, say) can be
-   * added and the customer still gets one invoice. Finalising is a separate,
-   * explicit step on the invoice itself.
-   *
-   * Idempotent — an order already carrying an invoice returns that one with
-   * `created: false` rather than a second document.
+   * Creates the draft invoice by hand. Never issues, whatever `auto_issue_invoices` says:
+   * finalising is a separate step on the invoice. Idempotent: an existing invoice comes back
+   * with `created: false`.
    */
   app.post('/:id/invoice', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
@@ -2389,7 +2419,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     const adminId = request.authUser!.id;
     const now = new Date();
 
-    // Advancing an order's status is an operational write — viewers are read-only.
     const callerLevel = accessLevelOf(request);
     if (!isPrivileged(callerLevel)) {
       reply.code(403).send({ error: 'Nur Manager/Admin dürfen den Auftragsstatus ändern.' });
@@ -2493,14 +2522,10 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
 
-  // --- Pay-after-service collection ----------------------------------------
-
   const recordPaymentSchema = z.object({
-    /** Offline methods settled in person on handover. */
     method: z.enum(['cash', 'ec_card']),
   });
 
-  /** Mark an after-service order paid in cash or by EC card (collected in person). */
   app.post('/:id/record-payment', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { method } = recordPaymentSchema.parse(request.body);
@@ -2550,10 +2575,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
 
-  /**
-   * Create a Stripe credit-card payment link for an after-service order and
-   * email it to the customer. The webhook marks the order paid on completion.
-   */
+  /** Emails a Stripe payment link for an after-service order; the webhook marks it paid. */
   app.post('/:id/payment-link', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { orders, orderStatusLog } = request.company!.tables;
@@ -2643,6 +2665,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       await sendEmail({
         to: row.customerEmail,
         from: brandSender(companyRow),
+        log: {
+          companySlug: companyRow.slug,
+          kind: 'payment_request',
+          refType: 'order',
+          refId: id,
+          sentByUserId: adminId,
+        },
         apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
         email: paymentRequestEmail({
@@ -2684,9 +2713,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 
   const cancelSchema = z.object({
-    /** Operator's note — required when overriding suggested refund. */
     reason: z.string().trim().max(2000).optional(),
-    /** Override the rule-engine's suggested refund. Capped at order total. */
     refundCentsOverride: z.number().int().min(0).optional(),
   });
 
@@ -2818,8 +2845,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    // Free the slot in the CLEANILO calendar — otherwise a cancelled order keeps
-    // blocking Calendly availability and the crew sees a job that isn't happening.
+    // Free the CLEANILO calendar slot so a cancelled order doesn't keep blocking availability.
     const releasedMetadata = await releaseCalendlyPickup({
       orders,
       order: updated,
@@ -2847,7 +2873,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       refundCents,
     }).catch(() => null);
 
-    // Notify n8n on cancel (ALL_06), fire-and-forget.
     void fireN8nWebhook(
       env.N8N_CANCEL_WEBHOOK_URL,
       {
@@ -2940,9 +2965,8 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     }
     let updated = confirmed;
 
-    // Push the confirmed pickup onto the CLEANILO Calendly calendar (brand
-    // exception — one calendar for all brands). The order stays authoritative:
-    // a Calendly failure is reported back, never rolled back.
+    // Book the pickup into the CLEANILO Calendly calendar (brand exception: one calendar for all
+    // brands). A Calendly failure is reported back, never rolled back.
     const booking = await bookConfirmedSlot({
       companySlug,
       orderId: id,
@@ -2978,6 +3002,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
         await sendEmail({
           to: row.customerEmail,
           from: brandSender(companyRow),
+          log: {
+            companySlug,
+            kind: 'appointment_confirmed',
+            refType: 'order',
+            refId: row.id,
+            sentByUserId: request.authUser?.id,
+          },
           apiKey: companyRow.resendApiKey ?? undefined,
           replyTo: companyRow.email ?? undefined,
           email: appointmentConfirmedEmail({
@@ -2995,8 +3026,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
     return {
       order: { ...updated, orderNumber: orderNumberOf(updated) },
-      // Surfaced as a warning in the panel — the operator needs to know when the
-      // slot did not make it onto the CLEANILO calendar.
+      // The panel warns when the slot did not make it onto the CLEANILO calendar.
       calendly: {
         configured: calendlyBookingConfigured,
         booked: booking.ok && !booking.skipped,
@@ -3006,9 +3036,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // Fallback route: hand the customer a single-use CLEANILO scheduling link and
-  // let them pick the time. Calendly writes the event to the CLEANILO Google
-  // Calendar and the invitee.created webhook writes the slot back onto the order.
+  // Fallback: single-use CLEANILO scheduling link; the invitee.created webhook writes the slot back.
   app.post('/:id/pickup-booking-link', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { send } = z.object({ send: z.boolean().default(true) }).parse(request.body ?? {});
@@ -3033,8 +3061,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    // Persist before sending: the link is single-use, so losing it to a failed
-    // send would burn it. Stored first, the panel can always show/copy it.
+    // Persist before sending: the link is single-use, so a failed send must not lose it.
     const [updated] = await db
       .update(orders)
       .set({
@@ -3062,10 +3089,16 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       const result = await sendEmail({
         to: row.customerEmail,
         from: brandSender(companyRow),
+        log: {
+          companySlug,
+          kind: 'pickup_scheduling',
+          refType: 'order',
+          refId: row.id,
+          sentByUserId: request.authUser?.id,
+        },
         apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
-        // Under the order's OWN brand — the CLEANILO exception covers the Calendly
-        // booking page and calendar, not our customer mail.
+        // Order's OWN brand: the CLEANILO exception covers the Calendly page and calendar, not mail.
         email: pickupSchedulingLinkEmail({
           brand: brandInfoFromCompany(companyRow),
           customerName: row.customerName,
@@ -3078,7 +3111,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
           { orderId: id, error: result.error },
           'calendly: scheduling link email failed',
         );
-        // The link exists and is stored — hand it back so it can be sent by hand.
         reply.code(502).send({
           error:
             'Buchungslink wurde erstellt, aber die E-Mail konnte nicht gesendet werden. Der Link steht im Auftrag und kann manuell verschickt werden.',
@@ -3098,9 +3130,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // Operator proposes up to 3 pickup/appointment times directly from the panel
-  // (independent of whatever the booking carried). These become the
-  // `preferredSlots` the operator then confirms one of via /confirm-appointment.
+  // Operator proposes up to 3 times: stored as `preferredSlots`, confirmed via /confirm-appointment.
   app.post('/:id/propose-slots', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { slots } = z
@@ -3137,9 +3167,8 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     return { order: { ...updated, orderNumber: orderNumberOf(updated) } };
   });
 
-  // Free-form operator message to the customer about an order — the
-  // "✦ Claude compose + send" box on the panel. Sent under the order's OWN
-  // brand (brand separation holds here); logged to metadata.messages (no DDL).
+  // Free-form operator message ("✦ Claude" box). Sent under the order's OWN brand; logged to
+  // metadata.messages (no DDL).
   app.post('/:id/message', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { body } = z.object({ body: z.string().trim().min(1).max(8000) }).parse(request.body);
@@ -3175,6 +3204,13 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     const result = await sendEmail({
       to: row.customerEmail,
       from: brandSender(companyRow),
+      log: {
+        companySlug,
+        kind: 'order_message',
+        refType: 'order',
+        refId: row.id,
+        sentByUserId: adminId,
+      },
       apiKey: companyRow.resendApiKey ?? undefined,
       replyTo: companyRow.email ?? undefined,
       email: orderMessageEmail({
@@ -3301,8 +3337,8 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.post('/:id/assign', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { partnerId } = assignSchema.parse(request.body);
-    const { orders, partners } = request.company!.tables;
-    const now = new Date();
+    const tables = request.company!.tables;
+    const { orders, partners } = tables;
 
     const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
     if (!order) throw notFound('Order not found');
@@ -3313,37 +3349,22 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
       throw badRequest('Partner is not active — approve them before assigning orders');
     }
 
-    const split = computeCommission(order.totalCents, parseCommissionRate(partner.commissionRate));
+    const result = await assignOrderToPartner(tables, order, partner);
+    if (!result) throw conflict('Order is closed and cannot be assigned');
+    const { order: updated, split } = result;
 
-    const [updated] = await db
-      .update(orders)
-      .set({
-        assignedPartnerId: partnerId,
-        assignedAt: now,
-        commissionCents: split.commissionCents,
-        partnerPayoutCents: split.partnerPayoutCents,
-        payoutStatus: order.payoutStatus === 'paid' ? 'paid' : 'pending',
-        updatedAt: now,
-      })
-      .where(eq(orders.id, id))
-      .returning();
-
-    try {
-      const { sendPushToUser } = await import('../../lib/push.js');
-      await sendPushToUser(partner.userId, {
-        title: `${request.company!.name} · Neuer Auftrag zugewiesen`,
-        body: `${orderNumberOf(updated!)} · ${KIND_LABEL[order.kind] ?? order.kind} · Auszahlung ${formatEurFromCents(split.partnerPayoutCents)}`,
-        url: `/partner/auftraege?id=${id}`,
-        tag: `assign:${id}`,
-        brandSlug: request.company!.slug,
-      });
-    } catch (err) {
-      request.log.warn({ err, orderId: id }, 'assignment push dispatch failed');
-    }
+    void notifyPartnerOfAssignment({
+      companySlug: request.company!.slug,
+      companyName: request.company!.name,
+      order: updated,
+      partner,
+      split,
+      log: request.log,
+    });
 
     const payoutReady = partner.payoutsEnabled && partner.stripeConnectStatus === 'active';
     return {
-      order: { ...updated, orderNumber: orderNumberOf(updated!) },
+      order: { ...updated, orderNumber: orderNumberOf(updated) },
       commission: split,
       payoutReady,
       warning: payoutReady
@@ -3390,8 +3411,7 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
 
       const [order] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
       if (!order) throw notFound('Order not found');
-      // PayPal-direct orders funded the PayPal account, not the Stripe balance — there
-      // is no charge to transfer from. Partner must be paid manually via PayPal.
+      // PayPal-direct orders funded the PayPal account, not Stripe: no charge to transfer from.
       if (order.paymentProvider === 'paypal') {
         throw badRequest(
           'Dieser Auftrag wurde über PayPal bezahlt — eine Stripe-Connect-Auszahlung ist nicht möglich. Bitte den Partner manuell über PayPal auszahlen.',
@@ -3485,21 +3505,6 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
     unitPriceCents: z.number().int().min(0).max(100_000_000),
   });
   const NON_EDITABLE: OrderStatus[] = ['cancelled', 'refunded', 'partially_refunded'];
-
-  async function commissionPatch(
-    tables: TenantTables,
-    order: { assignedPartnerId: number | null; payoutStatus: string },
-    newTotal: number,
-  ): Promise<Record<string, number>> {
-    if (!order.assignedPartnerId || order.payoutStatus === 'paid') return {};
-    const [partner] = await db
-      .select({ commissionRate: tables.partners.commissionRate })
-      .from(tables.partners)
-      .where(eq(tables.partners.id, order.assignedPartnerId))
-      .limit(1);
-    const split = computeCommission(newTotal, parseCommissionRate(partner?.commissionRate));
-    return { commissionCents: split.commissionCents, partnerPayoutCents: split.partnerPayoutCents };
-  }
 
   app.post('/:id/upsell', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
@@ -3639,57 +3644,39 @@ export const ordersAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 };
 
-const crossListQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(200).default(50),
-  status: z
-    .enum([
-      'pending',
-      'payment_pending',
-      'paid',
-      'accepted',
-      'picked_up',
-      'in_cleaning',
-      'ready',
-      'delivered',
-      'completed',
-      'cancelled',
-      'partially_refunded',
-      'refunded',
-    ])
-    .optional(),
-});
+const crossListQuerySchema = adminListQuerySchema.omit({ cursor: true });
 
 export const ordersAdminCrossRoutes: FastifyPluginAsync = async (app) => {
-  app.get('/orders/all', async (request) => {
-    const { limit, status } = crossListQuerySchema.parse(request.query);
+  /** Active brands the caller may read: all for super_admin, else their memberships. */
+  async function readableCompanies(request: FastifyRequest) {
     const { loadAllActiveCompanies } = await import('../../lib/company-loader.js');
-    const { getTenantTables } = await import('../../db/schema/tenant.js');
     const { membership } = await import('../../db/schema/shared.js');
-
     const allCompanies = await loadAllActiveCompanies();
-    const isSuperAdmin =
-      (request.authUser as unknown as { accessLevel?: string }).accessLevel === 'super_admin';
-    let companies = allCompanies;
-    if (!isSuperAdmin) {
-      const mine = await db
-        .select({ slug: membership.companySlug })
-        .from(membership)
-        .where(eq(membership.userId, request.authUser!.id));
-      const allowed = new Set(mine.map((m) => m.slug));
-      companies = allCompanies.filter((c) => allowed.has(c.slug));
-    }
+    if (accessLevelOf(request) === 'super_admin') return allCompanies;
+    const mine = await db
+      .select({ slug: membership.companySlug })
+      .from(membership)
+      .where(eq(membership.userId, request.authUser!.id));
+    const allowed = new Set(mine.map((m) => m.slug));
+    return allCompanies.filter((c) => allowed.has(c.slug));
+  }
+
+  app.get('/orders/all', async (request) => {
+    const { limit, ...filter } = crossListQuerySchema.parse(request.query);
+    const { getTenantTables } = await import('../../db/schema/tenant.js');
+    const companies = await readableCompanies(request);
+    const accessLevel = accessLevelOf(request);
 
     type EnrichedOrder = Awaited<ReturnType<typeof fetchOrdersForCompany>>[number];
     async function fetchOrdersForCompany(c: (typeof companies)[number]) {
       const tables = getTenantTables(c.schemaName);
-      const where = status ? eq(tables.orders.status, status) : undefined;
+      const conds = adminListConditions(tables.orders, filter);
       const rows = await db
         .select()
         .from(tables.orders)
-        .where(where)
+        .where(conds.length ? and(...conds) : undefined)
         .orderBy(desc(tables.orders.createdAt), desc(tables.orders.id))
         .limit(limit);
-      const accessLevel = accessLevelOf(request);
       return rows.map((r) =>
         redactOrderPii(
           {
@@ -3715,173 +3702,18 @@ export const ordersAdminCrossRoutes: FastifyPluginAsync = async (app) => {
       nextCursor: null,
     };
   });
-};
 
-const partnerTransitionSchema = z.object({
-  toStatus: z.enum(['picked_up', 'in_cleaning', 'ready', 'delivered']),
-  reason: z.string().trim().max(500).optional(),
-});
-
-export const ordersPartnerRoutes: FastifyPluginAsync = async (app) => {
-  app.addHook('preHandler', app.requireCompany);
-
-  async function resolvePartnerId(userId: string, tables: TenantTables): Promise<number | null> {
-    const [p] = await db
-      .select({ id: tables.partners.id })
-      .from(tables.partners)
-      .where(eq(tables.partners.userId, userId))
-      .limit(1);
-    return p?.id ?? null;
-  }
-
-  function toPartnerView(row: Record<string, unknown>) {
-    const {
-      customerEmail: _e,
-      internalNotes: _n,
-      ipAddress: _i,
-      userAgent: _u,
-      stripeSessionId: _s,
-      stripePaymentIntentId: _p,
-      stripeTransferId: _t,
-      ...safe
-    } = row;
-    // Dispute details are internal — strip them from the partner view too.
-    const { dispute: _dispute, ...partnerMeta } = (safe.metadata ?? {}) as Record<string, unknown>;
-    return {
-      ...safe,
-      metadata: partnerMeta,
-      orderNumber: orderNumberOf({
-        id: Number(row.id),
-        orderNumber: row.orderNumber as string | null | undefined,
-        createdAt: row.createdAt as Date | null | undefined,
-      }),
-    };
-  }
-
-  app.get('/', async (request, reply) => {
-    const userId = request.authUser!.id;
-    const tables = request.company!.tables;
-    const partnerId = await resolvePartnerId(userId, tables);
-    if (!partnerId) {
-      reply.send({ orders: [] });
-      return;
+  app.get('/orders/all/counts', async (request) => {
+    const { q } = countsQuerySchema.parse(request.query);
+    const { getTenantTables } = await import('../../db/schema/tenant.js');
+    const companies = await readableCompanies(request);
+    const perCompany = await Promise.all(
+      companies.map((c) => orderStatusCounts(getTenantTables(c.schemaName).orders, q)),
+    );
+    const counts: Record<string, number> = {};
+    for (const one of perCompany) {
+      for (const [status, n] of Object.entries(one)) counts[status] = (counts[status] ?? 0) + n;
     }
-    const { limit, cursor, status } = listQuerySchema.parse(request.query);
-    const { orders } = tables;
-    const decoded = cursor ? decodeCursor(cursor) : null;
-    const conds = [eq(orders.assignedPartnerId, partnerId)];
-    if (status) conds.push(eq(orders.status, status));
-    if (decoded) {
-      const cursorWhere = or(
-        lt(orders.createdAt, sql`${decoded.createdAt}::timestamptz`),
-        and(
-          sql`${orders.createdAt} = ${decoded.createdAt}::timestamptz`,
-          lt(orders.id, decoded.id),
-        ),
-      );
-      if (cursorWhere) conds.push(cursorWhere);
-    }
-    const rows = await db
-      .select()
-      .from(orders)
-      .where(and(...conds))
-      .orderBy(desc(orders.createdAt), desc(orders.id))
-      .limit(limit + 1);
-    const hasMore = rows.length > limit;
-    const page = hasMore ? rows.slice(0, limit) : rows;
-    const last = page[page.length - 1];
-    const nextCursor =
-      hasMore && last
-        ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
-        : null;
-    reply.send({ orders: page.map(toPartnerView), nextCursor });
-  });
-
-  app.get('/:id', async (request, reply) => {
-    const id = parseIntId((request.params as { id: string }).id);
-    const userId = request.authUser!.id;
-    const tables = request.company!.tables;
-    const partnerId = await resolvePartnerId(userId, tables);
-    const { orders, orderItems, orderStatusLog } = tables;
-    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
-    if (!row || row.assignedPartnerId !== partnerId) {
-      reply.code(404).send({ error: 'Order not found' });
-      return;
-    }
-    const items = await db.select().from(orderItems).where(eq(orderItems.orderId, id));
-    const log = await db
-      .select()
-      .from(orderStatusLog)
-      .where(eq(orderStatusLog.orderId, id))
-      .orderBy(desc(orderStatusLog.createdAt));
-    reply.send({
-      order: toPartnerView(row),
-      items,
-      statusLog: log,
-      allowedNextStatuses: allowedNextStatuses(row.status as OrderStatus).filter((s) =>
-        (['picked_up', 'in_cleaning', 'ready', 'delivered'] as OrderStatus[]).includes(s),
-      ),
-    });
-  });
-
-  app.post('/:id/transition', async (request, reply) => {
-    const id = parseIntId((request.params as { id: string }).id);
-    const { toStatus, reason } = partnerTransitionSchema.parse(request.body);
-    const userId = request.authUser!.id;
-    const tables = request.company!.tables;
-    const partnerId = await resolvePartnerId(userId, tables);
-    const { orders, orderStatusLog } = tables;
-    const now = new Date();
-
-    const [row] = await db.select().from(orders).where(eq(orders.id, id)).limit(1);
-    if (!row || row.assignedPartnerId !== partnerId) {
-      reply.code(404).send({ error: 'Order not found' });
-      return;
-    }
-    if (!canTransition(row.status as OrderStatus, toStatus)) {
-      reply.code(409).send({
-        error: `Cannot transition from ${row.status} to ${toStatus}`,
-        allowedNextStatuses: allowedNextStatuses(row.status as OrderStatus),
-      });
-      return;
-    }
-
-    const timestampCol = statusTimestampColumn(toStatus);
-    const patch: Record<string, unknown> = { status: toStatus, updatedAt: now };
-    if (timestampCol) patch[timestampCol] = now;
-
-    // CAS: a concurrent admin cancel/refund wins, this becomes 409.
-    const updated = await db.transaction(async (tx) => {
-      const [u] = await tx
-        .update(orders)
-        .set(patch)
-        .where(and(eq(orders.id, id), eq(orders.status, row.status)))
-        .returning();
-      if (!u) return null;
-      await tx.insert(orderStatusLog).values({
-        orderId: id,
-        fromStatus: row.status,
-        toStatus,
-        changedByUserId: userId,
-        reason: reason ?? 'Partner update',
-      });
-      return u;
-    });
-    if (!updated) {
-      reply.code(409).send({
-        error: 'Auftrag wurde zwischenzeitlich geändert — bitte neu laden.',
-      });
-      return;
-    }
-
-    void notifyCustomerStatusChange({
-      log: request.log,
-      companySlug: request.company!.slug,
-      order: { ...updated, orderNumber: orderNumberOf(updated) },
-      fromStatus: row.status as OrderStatus,
-      toStatus,
-    }).catch(() => null);
-
-    reply.send({ order: toPartnerView(updated) });
+    return { counts };
   });
 };

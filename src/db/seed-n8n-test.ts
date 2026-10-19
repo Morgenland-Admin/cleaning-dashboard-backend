@@ -1,4 +1,4 @@
-// Prod-safe seed for n8n live tests: only test rows, tagged source='n8n-test'.
+// Prod-safe: inserts only test rows, tagged source='n8n-test'.
 //   pnpm db:seed:n8n-test           insert (idempotent per brand)
 //   pnpm db:seed:n8n-test --clean   remove all 'n8n-test' rows
 import { eq, sql } from 'drizzle-orm';
@@ -31,7 +31,7 @@ async function seedBrand(schemaName: string): Promise<boolean> {
     .select({ n: sql<number>`count(*)::int` })
     .from(t.orders)
     .where(eq(t.orders.source, SOURCE));
-  if (Number(n) > 0) return false; // already seeded
+  if (Number(n) > 0) return false;
 
   const now = new Date();
   const baseOrder = {

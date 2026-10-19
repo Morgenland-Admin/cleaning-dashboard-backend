@@ -9,24 +9,15 @@ import {
 import { berlinLocalToUtc } from './cancellation.js';
 
 /**
- * Pickup appointments ↔ Calendly. Kept out of routes.ts because the state lives
- * in `orders.metadata.calendly` and needs a single owner.
- *
- * Route (decided 2026-08-06, see docs/calendly-pickups.md): the operator confirms
- * a slot in the dashboard and we book it into the CLEANILO Calendly event type via
- * the Scheduling API. Calendly owns the write to the CLEANILO Google Calendar, so
- * the confirmed pickup shows up there automatically — no Google credentials, and
- * Calendly's reminders / cancel / reschedule links come along for free.
- *
- * Our order stays the source of truth: a Calendly failure never blocks or rolls
- * back the confirmation, it is reported back to the operator instead.
+ * Pickup appointments ↔ Calendly (state in `orders.metadata.calendly`). Always booked into the
+ * CLEANILO event type. The order stays source of truth: a Calendly failure never blocks the confirmation.
  */
 
 export type CalendlyPickupStatus = 'booked' | 'link_sent' | 'cancelled' | 'failed';
 
 export interface CalendlyPickupMeta {
   status: CalendlyPickupStatus;
-  /** Berlin wall-clock slot ("YYYY-MM-DDTHH:mm") this booking represents. */
+  /** Berlin wall-clock slot ("YYYY-MM-DDTHH:mm"). */
   slot?: string | null;
   /** UTC instant Calendly holds. */
   startTime?: string | null;
@@ -34,18 +25,14 @@ export interface CalendlyPickupMeta {
   inviteeUri?: string | null;
   cancelUrl?: string | null;
   rescheduleUrl?: string | null;
-  /** Single-use scheduling URL, when the customer books themselves. */
   bookingUrl?: string | null;
-  /** Who wrote this state: the dashboard action or an incoming Calendly webhook. */
   source: 'dashboard' | 'webhook';
-  /** Operator-facing failure reason for status 'failed'. */
   error?: string | null;
   updatedAt: string;
 }
 
 const SLOT_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/;
 
-/** Read the Calendly block out of an order's metadata, if it looks like ours. */
 export function readCalendlyMeta(metadata: unknown): CalendlyPickupMeta | null {
   if (!metadata || typeof metadata !== 'object') return null;
   const raw = (metadata as { calendly?: unknown }).calendly;
@@ -62,18 +49,12 @@ export function readCalendlyMeta(metadata: unknown): CalendlyPickupMeta | null {
   return raw as CalendlyPickupMeta;
 }
 
-/** "YYYY-MM-DDTHH:mm" (Europe/Berlin wall clock) → the UTC instant it denotes. */
 export function slotToUtc(slot: string): Date | null {
   const m = SLOT_RE.exec(slot);
   if (!m) return null;
   return berlinLocalToUtc(Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]));
 }
 
-/**
- * UTC instant → "YYYY-MM-DDTHH:mm" Europe/Berlin wall clock, the shape the rest of
- * the app stores slots in. Used when a booking arrives from Calendly rather than
- * from us.
- */
 export function utcToBerlinSlot(utcIso: string): string | null {
   const d = new Date(utcIso);
   if (Number.isNaN(d.getTime())) return null;
@@ -98,36 +79,27 @@ export function utcToBerlinSlot(utcIso: string): string | null {
 export interface BookConfirmedSlotArgs {
   companySlug: string;
   orderId: number;
-  /** Berlin wall-clock slot the operator confirmed. */
   slot: string;
   customerName: string;
   customerEmail: string;
   customerPhone?: string | null;
-  /** Service address — answers the event type's address question. */
   addressText?: string | null;
-  /** What the job is, for the event type's "what do you need" question. */
   serviceSummary?: string | null;
-  /** Existing Calendly state, so a re-confirmation replaces the old event. */
   existing: CalendlyPickupMeta | null;
   log: { warn: (obj: object, msg?: string) => void; error: (obj: object, msg?: string) => void };
 }
 
 export interface BookConfirmedSlotResult {
-  /** Whether a Calendly booking now exists for this slot. */
   ok: boolean;
-  /** Not configured at all — nothing attempted, nothing to report as an error. */
+  /** Calendly not configured: nothing attempted, not an error. */
   skipped?: boolean;
-  /** Slot is no longer bookable in Calendly — the operator must pick another. */
   slotUnavailable?: boolean;
   error?: string;
-  /** Metadata to persist, or null when nothing changed. */
+  /** Metadata to persist; null = unchanged. */
   meta: CalendlyPickupMeta | null;
 }
 
-/**
- * Book the operator-confirmed slot into the CLEANILO Calendly calendar. Replaces
- * any event previously booked for this order (re-confirmation). Never throws.
- */
+/** Books the confirmed slot; replaces an earlier event for this order. Never throws. */
 export async function bookConfirmedSlot(
   args: BookConfirmedSlotArgs,
 ): Promise<BookConfirmedSlotResult> {
@@ -140,7 +112,7 @@ export async function bookConfirmedSlot(
     return { ok: false, error: `Unlesbarer Termin: ${args.slot}`, meta: null };
   }
 
-  // Already booked for exactly this slot — don't create a duplicate event.
+  // Idempotent: this slot is already booked.
   if (
     args.existing?.status === 'booked' &&
     args.existing.slot === args.slot &&
@@ -149,9 +121,7 @@ export async function bookConfirmedSlot(
     return { ok: true, meta: null };
   }
 
-  // Re-confirmation of a different time: drop the stale event first so the
-  // calendar doesn't keep both. Best-effort — a failure here must not stop the
-  // new booking, it just leaves one entry to clear by hand.
+  // Best-effort cancel of the superseded event; a failure must not block the new booking.
   if (args.existing?.status === 'booked' && args.existing.eventUri) {
     const cancelled = await cancelPickupAppointment(
       args.existing.eventUri,
@@ -224,11 +194,7 @@ export interface CreateBookingLinkResult {
   meta: CalendlyPickupMeta | null;
 }
 
-/**
- * Fallback route: a single-use CLEANILO scheduling link the customer books
- * themselves. Calendly still writes the event to the CLEANILO Google Calendar and
- * the invitee.created webhook writes the chosen time back onto the order.
- */
+/** Fallback: single-use scheduling link; the invitee.created webhook writes the chosen time back. */
 export async function createBookingLink(args: {
   companySlug: string;
   orderId: number;

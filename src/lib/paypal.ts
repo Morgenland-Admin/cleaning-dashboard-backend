@@ -121,7 +121,6 @@ export async function createPayPalOrder(args: {
 
 export interface PayPalCapture {
   id: string;
-  /** Order-level status (e.g. COMPLETED). */
   status: string;
   /** Capture-level status of the resolved capture — only COMPLETED means money received. */
   captureStatus: string | null;
@@ -178,7 +177,6 @@ export async function capturePayPalOrder(
   return normalizeCapture(raw);
 }
 
-/** Read a PayPal order. */
 export async function getPayPalOrder(paypalOrderId: string): Promise<PayPalCapture> {
   const raw = await paypalFetch<RawCaptureResponse>(
     `/v2/checkout/orders/${encodeURIComponent(paypalOrderId)}`,

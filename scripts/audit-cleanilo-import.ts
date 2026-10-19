@@ -1,12 +1,6 @@
 /**
- * Row-by-row reconciliation of the CLEANILO import plan against what is
- * actually in the tenant. Read-only.
- *
- *   DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/audit-cleanilo-import.ts <invoices.json> <reconciliation.csv>
- *
- * Fails loudly on: a planned invoice missing from the DB, an amount/recipient
- * mismatch, a planned customer missing, or an imported row in the DB that the
- * plan does not account for.
+ * Read-only row-by-row reconciliation of the CLEANILO import plan against the tenant; exits 1 on any mismatch.
+ * DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/audit-cleanilo-import.ts <invoices.json> <reconciliation.csv>
  */
 import { sql } from 'drizzle-orm';
 
@@ -64,13 +58,11 @@ async function main(): Promise<void> {
   L(`  in DB but NOT in plan      ${extra.length}`);
   for (const e of extra) L(`    ✗ ${e.number}  ${e.recipient_name}  ${eur(Number(e.total_cents))}`);
 
-  // Skipped rows must be absent.
   const skippedPresent = plan.skipped.filter((sk) =>
     dbInvoices.some((r) => r.number === sk.invoiceNumber),
   );
   L(`  skipped rows wrongly in DB ${skippedPresent.length}   (must be 0)`);
 
-  // Original numbers of renumbered invoices must be recorded in notes.
   let noteOk = 0;
   for (const r of plan.renumbered) {
     const row = dbInvoices.find((d) => d.number === r.to);
@@ -79,14 +71,13 @@ async function main(): Promise<void> {
   }
   L(`  renumbered w/ original-Nr  ${noteOk}/${plan.renumbered.length}`);
 
-  // Estimated-date invoices must have no service_date (no false Leistungsdatum).
+  // Estimated dates must leave service_date null (no false Leistungsdatum).
   const est = plan.invoices.filter((i) => i.dateEstimated);
   const estBad = est.filter(
     (i) => dbByKey.get(key(i.invoiceNumber, i.grossCents, i.name))?.service_date !== null,
   );
   L(`  est.-date w/o serviceDate  ${est.length - estBad.length}/${est.length}`);
 
-  // Customers: every planned email present, and every planned total matches.
   const dbCustomers = await q<{
     email: string;
     name: string;
@@ -120,10 +111,9 @@ async function main(): Promise<void> {
     );
   }
 
-  // Merge groups: each merged customer must hold all of its invoices.
   let mergeOk = 0;
   for (const m of plan.merges) {
-    // Merge records carry no customer key — match on the invoice-number set.
+    // Merge records carry no customer key; match on the invoice-number set.
     const wanted = [...m.invoices].sort().join(',');
     const cust = plan.customers.find(
       (c) =>

@@ -1,21 +1,8 @@
 /**
- * Seed the HTR main-domain category pages (/leistungen/<slug>) into
- * hamburg_teppichreinigung.seo_pages so the SEO autopilot can read and PATCH
- * them through the normal /admin/seo-pages API.
- *
- *   node --import tsx scripts/import-htr-category-pages.ts --dry-run
- *   node --import tsx scripts/import-htr-category-pages.ts
- *   node --import tsx scripts/import-htr-category-pages.ts --overwrite   # re-seed from the template
- *   DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/import-htr-category-pages.ts
- *
- * Source of truth for the seed is the storefront's own template content
- * (hamburg-teppichreinigung-frontend/src/lib/leistungen-content.ts) — after the
- * seed, the DB row wins for the patchable fields and the template file only
- * serves as the fallback when the backend is unreachable. Point the loader at a
- * different checkout with HTR_FRONTEND_DIR.
- *
- * Existing rows are left alone unless --overwrite is passed, so re-running this
- * can never silently discard autopilot edits.
+ * Seeds the HTR /leistungen/<slug> pages into hamburg_teppichreinigung.seo_pages from the storefront's
+ * leistungen-content.ts (HTR_FRONTEND_DIR overrides the checkout).
+ * node --import tsx scripts/import-htr-category-pages.ts [--dry-run] [--overwrite]  (DOTENV_CONFIG_PATH=.env.prod for prod)
+ * Existing rows are skipped without --overwrite, so autopilot edits are never discarded.
  */
 import { eq } from 'drizzle-orm';
 import path from 'node:path';
@@ -44,7 +31,6 @@ type Leistung = {
   seo?: { heading: string; intro: string; more: string[] };
 };
 
-/** Escape the five XML/HTML specials so template text can't inject markup. */
 function esc(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -54,15 +40,11 @@ function esc(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
-/**
- * The template stores paragraphs in a mini-markup: *emphasis* and
- * [label](/href). Translate that to the HTML the seo_pages body_html holds.
- */
+/** Template mini-markup (*emphasis*, [label](/href)) → seo_pages body_html. */
 function paragraphToHtml(text: string): string {
   const html = esc(text)
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label: string, href: string) => {
-      // Only site-relative links live in this content; anything else is dropped
-      // back to plain text rather than guessing a scheme.
+      // Site-relative links only; anything else drops to plain text.
       if (!href.startsWith('/')) return label;
       return `<a href="${href}">${label}</a>`;
     })
@@ -96,12 +78,11 @@ async function main(): Promise<void> {
       category: CATEGORY,
       city: 'Hamburg',
       region: 'Hamburg',
-      // Heading of the SEO text section; *…* is rendered highlighted.
+      // *…* renders highlighted.
       title: l.seo.heading,
       metaTitle: l.metaTitle,
       metaDescription: l.metaDesc,
-      // The template splits the H1 into a plain and an emphasised half; the
-      // single DB field keeps the emphasis as *…*.
+      // The template splits the H1 in two; the single DB field keeps the emphasis as *…*.
       h1: `${l.h1} *${l.h1Emphasis}*`.trim(),
       bodyHtml: buildBodyHtml(l.seo),
       faq: l.faq.map((f) => ({ question: f.q, answer: f.a })),

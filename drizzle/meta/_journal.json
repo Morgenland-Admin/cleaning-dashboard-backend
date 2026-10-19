@@ -64,6 +64,20 @@
       "when": 1789000300000,
       "tag": "0008_add_company_auto_issue_invoices",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789000400000,
+      "tag": "0009_add_email_log",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789000500000,
+      "tag": "0010_add_company_partner_portal",
+      "breakpoints": true
     }
   ]
 }

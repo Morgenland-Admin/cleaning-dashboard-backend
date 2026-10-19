@@ -51,14 +51,12 @@ test('cancelling <24h before appointment → 50% refund', () => {
 });
 
 test('confirmed slot 27h away in Berlin time counts as well in advance', () => {
-  // Slot is 27h away in Berlin time; the old midnight-UTC anchor said <24h.
   const d = evaluateCancellation(ctx({ confirmedSlot: '2026-06-03T17:00' }));
   assert.equal(d.reasonCode, 'well_in_advance');
   assert.equal(d.suggestedRefundCents, 5000);
 });
 
 test('date-only appointment anchors to end of day Berlin (customer benefit)', () => {
-  // Anchor = tomorrow 23:59 Berlin, ~34h away → full refund.
   const d = evaluateCancellation(ctx({ preferredDate: new Date('2026-06-03') }));
   assert.equal(d.reasonCode, 'well_in_advance');
 });
@@ -86,7 +84,7 @@ test('partially refunded order <24h suggests at most the remaining amount', () =
     }),
   );
   assert.equal(d.mode, 'partial');
-  // 50% of total would be 2500, but only 1000 is left to refund.
+  // Capped at the 1000 still refundable (50% would be 2500).
   assert.equal(d.suggestedRefundCents, 1000);
   assert.equal(d.maxRefundCents, 1000);
 });
@@ -106,9 +104,7 @@ test('already terminal states are denied', () => {
 });
 
 test('berlinLocalToUtc handles CEST (summer) and CET (winter)', () => {
-  // Summer: Berlin = UTC+2.
   assert.equal(berlinLocalToUtc(2026, 6, 3, 17, 0).toISOString(), '2026-06-03T15:00:00.000Z');
-  // Winter: Berlin = UTC+1.
   assert.equal(berlinLocalToUtc(2026, 1, 15, 17, 0).toISOString(), '2026-01-15T16:00:00.000Z');
 });
 

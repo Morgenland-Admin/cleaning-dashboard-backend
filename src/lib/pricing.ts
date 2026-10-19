@@ -44,11 +44,8 @@ export const TEPPICHBODEN_TIERS = ['basis', 'standard', 'premium'] as const;
 export type TeppichbodenTier = (typeof TEPPICHBODEN_TIERS)[number];
 
 /**
- * Flächenstaffeln — Festpreis pro Auftrag (nicht pro m²).
- *
- * Die letzte Bracket `ab_150` hat im PriceBook für jede Tier einen `null`-Preis
- * und löst im Engine eine "individuelles-Angebot"-Antwort aus
- * (`outOfArea: true`). Das Frontend leitet dann auf das Kontaktformular.
+ * Flächenstaffeln: Festpreis pro Auftrag (not per m²). `ab_150` has a null price in every PriceBook and
+ * yields `outOfArea: true`; the frontend then routes to the contact form.
  */
 export const TEPPICHBODEN_BRACKETS = [
   'bis_30',
@@ -85,7 +82,6 @@ export type OrderServiceInput =
       carpets: CarpetLineInput[];
       pickupMode: 'pickup' | 'drop_off';
       pickupPlz?: string;
-      /** Geocoded address coords — used for accurate distance-based zoning. */
       pickupCoords?: Coords;
     }
   | {
@@ -105,7 +101,7 @@ export type OrderServiceInput =
       kind: 'teppichbodenreinigung';
       tier: TeppichbodenTier;
       bracket: TeppichbodenBracket;
-      /** Optionale, exakte Flächen-Angabe — nur zur Anzeige / E-Mail-Hinweis. */
+      /** Display / email hint only. */
       sqm?: number;
       addressPlz: string;
       addressCoords?: Coords;
@@ -479,14 +475,13 @@ function serviceUnavailable(book: PriceBook, label: string): PriceQuote {
   );
 }
 
-function formatSqm(n: number): string {
+export function formatSqm(n: number): string {
   return n.toLocaleString('de-DE', {
     minimumFractionDigits: n % 1 === 0 ? 0 : 1,
     maximumFractionDigits: 2,
   });
 }
 
-/** Format cents as German EUR string, e.g. 2990 → "29,90 €". */
 export function formatEurFromCents(cents: number): string {
   return (cents / 100).toLocaleString('de-DE', {
     style: 'currency',

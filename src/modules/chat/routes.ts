@@ -1,12 +1,21 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { desc, eq, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
 import { user } from '../../db/schema/shared.js';
-import { broadcast, roomKey, type ChatMessagePayload } from './hub.js';
+import { broadcast, hasRole, roomKey, type ChatMessagePayload } from './hub.js';
+import {
+  ensureConversation,
+  findConversation,
+  markDelivered,
+  markRead,
+  messagePage,
+  pageQuerySchema,
+  previewOf,
+} from './lib.js';
 
-const sendBodySchema = z
+export const sendBodySchema = z
   .object({
     body: z.string().max(8000).optional(),
     attachments: z
@@ -28,17 +37,20 @@ const sendBodySchema = z
 
 const typingSchema = z.object({ isTyping: z.boolean() });
 
-function rowToPayload(row: {
-  id: number;
-  conversationId: number;
-  senderUserId: string;
-  senderRole: string;
-  body: string | null;
-  attachments: Array<{ key: string; name: string; size: number; contentType?: string }>;
-  deliveredAt: Date | null;
-  readAt: Date | null;
-  createdAt: Date;
-}): ChatMessagePayload {
+export function rowToPayload(
+  row: {
+    id: number;
+    conversationId: number;
+    senderUserId: string;
+    senderRole: string;
+    body: string | null;
+    attachments: Array<{ key: string; name: string; size: number; contentType?: string }>;
+    deliveredAt: Date | null;
+    readAt: Date | null;
+    createdAt: Date;
+  },
+  senderName?: string | null,
+): ChatMessagePayload {
   return {
     id: row.id,
     conversationId: row.conversationId,
@@ -49,6 +61,7 @@ function rowToPayload(row: {
     deliveredAt: row.deliveredAt?.toISOString() ?? null,
     readAt: row.readAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
+    ...(senderName !== undefined ? { senderName } : {}),
   };
 }
 
@@ -61,11 +74,14 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
     const rows = await db
       .select({
         id: chatConversations.id,
+        partnerId: partners.id,
         partnerUserId: partners.userId,
         partnerCompanyName: partners.companyName,
         partnerContactEmail: partners.contactEmail,
+        partnerContactPhone: partners.contactPhone,
         partnerName: user.name,
         partnerEmail: user.email,
+        partnerPhone: user.phone,
         partnerStatus: partners.status,
         lastMessageAt: chatConversations.lastMessageAt,
         lastMessagePreview: chatConversations.lastMessagePreview,
@@ -77,12 +93,23 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
       .leftJoin(user, eq(user.id, partners.userId))
       .where(inArray(partners.status, ['pending', 'active']))
       .orderBy(sql`${chatConversations.lastMessageAt} desc nulls last`, desc(partners.createdAt));
+    // The list reaching an admin counts as delivery of the partners' messages.
+    await markDelivered(
+      request.company!.tables,
+      request.company!.slug,
+      rows.flatMap((r) =>
+        r.id != null && r.partnerUserId ? [{ id: r.id, partnerUserId: r.partnerUserId }] : [],
+      ),
+      'partner',
+    );
     return { conversations: rows };
   });
 
   app.get('/conversations/:partnerUserId/messages', async (request, reply) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
-    const { chatConversations, chatMessages, partners } = request.company!.tables;
+    const { before, limit = 50 } = pageQuerySchema.parse(request.query);
+    const tables = request.company!.tables;
+    const { partners } = tables;
 
     const [partnerRow] = await db
       .select({ userId: partners.userId })
@@ -94,30 +121,38 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
 
-    let [conv] = await db
-      .select()
-      .from(chatConversations)
-      .where(eq(chatConversations.partnerUserId, partnerUserId))
-      .limit(1);
-    if (!conv) {
-      [conv] = await db.insert(chatConversations).values({ partnerUserId }).returning();
-    }
+    const conv = await ensureConversation(tables, partnerUserId);
 
-    const messages = await db
-      .select()
-      .from(chatMessages)
-      .where(eq(chatMessages.conversationId, conv!.id))
-      .orderBy(asc(chatMessages.createdAt))
-      .limit(100);
+    if (!before) {
+      await markDelivered(
+        tables,
+        request.company!.slug,
+        [{ id: conv.id, partnerUserId }],
+        'partner',
+      );
+    }
+    const { rows, hasMore } = await messagePage(tables, conv.id, { before, limit });
+    const senderIds = [
+      ...new Set(rows.filter((r) => r.senderRole === 'admin').map((r) => r.senderUserId)),
+    ];
+    const names = senderIds.length
+      ? await db
+          .select({ id: user.id, name: user.name })
+          .from(user)
+          .where(inArray(user.id, senderIds))
+      : [];
+    const nameOf = new Map(names.map((n) => [n.id, n.name]));
 
     return {
       conversation: conv,
-      messages: messages.map(rowToPayload),
+      messages: rows.map((r) =>
+        rowToPayload(r, r.senderRole === 'admin' ? (nameOf.get(r.senderUserId) ?? null) : null),
+      ),
+      hasMore,
     };
   });
 
-  // Sending to a partner workshop is a real outbound action — manager+.
-  // Read/typing receipts stay open so a `viewer` can follow a thread.
+  // Manager+ to send; read/typing receipts stay open so a `viewer` can follow a thread.
   app.post(
     '/conversations/:partnerUserId/messages',
     { preHandler: app.requireAccess('super_admin', 'admin', 'manager') },
@@ -138,32 +173,20 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
 
+      const conv = await ensureConversation(request.company!.tables, partnerUserId);
       const result = await db.transaction(async (tx) => {
-        let [conv] = await tx
-          .select()
-          .from(chatConversations)
-          .where(eq(chatConversations.partnerUserId, partnerUserId))
-          .limit(1);
-        if (!conv) {
-          [conv] = await tx.insert(chatConversations).values({ partnerUserId }).returning();
-        }
-
-        const preview = body.body
-          ? body.body.slice(0, 200)
-          : body.attachments && body.attachments.length > 0
-            ? `📎 ${body.attachments[0]!.name}`
-            : '';
-
+        const preview = previewOf(body.body, body.attachments);
         const now = new Date();
         const [inserted] = await tx
           .insert(chatMessages)
           .values({
-            conversationId: conv!.id,
+            conversationId: conv.id,
             senderUserId: adminId,
             senderRole: 'admin',
             body: body.body ?? null,
             attachments: body.attachments ?? [],
-            deliveredAt: now,
+            // Delivered right away only when the partner has the thread open.
+            deliveredAt: hasRole(roomKey(slug, partnerUserId), 'partner') ? now : null,
           })
           .returning();
 
@@ -175,12 +198,12 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
             unreadForPartner: sql`${chatConversations.unreadForPartner} + 1`,
             updatedAt: now,
           })
-          .where(eq(chatConversations.id, conv!.id));
+          .where(eq(chatConversations.id, conv.id));
 
-        return { conversation: conv!, message: inserted! };
+        return { conversation: conv, message: inserted! };
       });
 
-      const payload = rowToPayload(result.message);
+      const payload = rowToPayload(result.message, request.authUser!.name ?? null);
       broadcast(
         roomKey(slug, partnerUserId),
         {
@@ -191,13 +214,12 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
         adminId,
       );
 
-      // PWA push for the partner — the WS broadcast only reaches open tabs.
       try {
         const { sendPushToUser } = await import('../../lib/push.js');
         await sendPushToUser(partnerUserId, {
           title: `${request.company!.name} · Neue Nachricht`,
           body: body.body ? body.body.slice(0, 120) : '📎 Anhang erhalten',
-          url: '/chat',
+          url: '/nachrichten',
           tag: `chat:${result.conversation.id}`,
           brandSlug: slug,
         });
@@ -213,35 +235,20 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
   app.post('/conversations/:partnerUserId/read', async (request, reply) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
     const slug = request.company!.slug;
-    const { chatConversations, chatMessages } = request.company!.tables;
+    const { chatConversations } = request.company!.tables;
 
-    const [conv] = await db
-      .select()
-      .from(chatConversations)
-      .where(eq(chatConversations.partnerUserId, partnerUserId))
-      .limit(1);
+    const conv = await findConversation(request.company!.tables, partnerUserId);
     if (!conv) {
       reply.code(204).send();
       return;
     }
 
     const now = new Date();
-    await db.transaction(async (tx) => {
-      await tx
-        .update(chatMessages)
-        .set({ readAt: now })
-        .where(
-          and(
-            eq(chatMessages.conversationId, conv.id),
-            eq(chatMessages.senderRole, 'partner'),
-            sql`${chatMessages.readAt} IS NULL`,
-          ),
-        );
-      await tx
-        .update(chatConversations)
-        .set({ unreadForAdmin: 0, updatedAt: now })
-        .where(eq(chatConversations.id, conv.id));
-    });
+    await markRead(request.company!.tables, conv.id, 'partner', now);
+    await db
+      .update(chatConversations)
+      .set({ unreadForAdmin: 0, updatedAt: now })
+      .where(eq(chatConversations.id, conv.id));
 
     broadcast(
       roomKey(slug, partnerUserId),
@@ -261,13 +268,8 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
     const partnerUserId = (request.params as { partnerUserId: string }).partnerUserId;
     const { isTyping } = typingSchema.parse(request.body);
     const slug = request.company!.slug;
-    const { chatConversations } = request.company!.tables;
 
-    const [conv] = await db
-      .select({ id: chatConversations.id })
-      .from(chatConversations)
-      .where(eq(chatConversations.partnerUserId, partnerUserId))
-      .limit(1);
+    const conv = await findConversation(request.company!.tables, partnerUserId);
     if (!conv) {
       reply.code(204).send();
       return;

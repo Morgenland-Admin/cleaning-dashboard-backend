@@ -3,6 +3,8 @@ dist/
 .env
 .env.local
 .env.prod
+.env.legacy
+.env.legacy-s3
 .env.*.local
 *.log
 .DS_Store
@@ -11,3 +13,6 @@ coverage/
 .vscode/
 drizzle/.snapshots/
 email-samples/
+
+# Local development notes
+docs/

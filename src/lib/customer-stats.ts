@@ -5,14 +5,8 @@ import type { TenantTables } from '../db/schema/tenant.js';
 import { computeLoyaltyTier } from './loyalty.js';
 
 /**
- * Customer money/volume stats.
- *
- * A customer's turnover comes from two places: paid orders (webshop / booking)
- * and paid invoices written by hand in the dashboard. Standalone invoices — the
- * ones with no `order_id` — are the only invoices counted, because an invoice
- * created for a paid order bills money the order already accounts for. Voided
- * and unpaid invoices never count as turnover; they show up as "invoiced" and
- * "open" figures instead.
+ * Turnover = paid orders + paid standalone invoices (no `order_id`); an invoice for a paid order would
+ * double-count. Void and unpaid invoices never count as turnover.
  */
 
 interface Totals {
@@ -22,7 +16,6 @@ interface Totals {
   lastAt: Date | null;
 }
 
-/** Live turnover of one customer: paid orders + paid standalone invoices. */
 export async function computeCustomerTotals(
   tables: TenantTables,
   customerId: number,
@@ -34,8 +27,7 @@ export async function computeCustomerTotals(
   const [orderAgg] = await db
     .select({
       count: sql<number>`count(*)::int`,
-      // Refunds come back off the turnover; a per-row greatest() keeps an
-      // over-refunded row from eating another order's money.
+      // Refunds reduce turnover; per-row greatest() stops an over-refunded row eating another order's money.
       sum: sql<number>`coalesce(sum(greatest(${orders.totalCents} - ${orders.refundedAmountCents}, 0)), 0)::int`,
       first: sql<Date | null>`min(${orders.paidAt})`,
       last: sql<Date | null>`max(${orders.paidAt})`,
@@ -64,8 +56,7 @@ export async function computeCustomerTotals(
       ),
     );
 
-  // Aggregates selected through raw `sql` come back as Date or as the ISO
-  // string the driver read — accept both rather than silently dropping stamps.
+  // Raw `sql` aggregates come back as a Date or an ISO string; accept both.
   const dates = [orderAgg?.first, orderAgg?.last, invoiceAgg?.first, invoiceAgg?.last]
     .map((d) => (d == null ? NaN : new Date(d as string | Date).getTime()))
     .filter((ms) => Number.isFinite(ms));
@@ -78,12 +69,7 @@ export async function computeCustomerTotals(
   };
 }
 
-/**
- * Recompute the stored aggregates (`total_orders`, `total_spent_cents`,
- * first/last order stamps) and the loyalty tier from live data. Used by the
- * "Recompute tier" action and whenever an invoice is settled, so the customer
- * record can never drift from the orders and invoices behind it.
- */
+/** Recomputes the stored aggregates and loyalty tier from live data; call whenever an invoice is settled. */
 export async function recomputeCustomerAggregates(
   tables: TenantTables,
   customerId: number,
@@ -112,11 +98,7 @@ export async function recomputeCustomerAggregates(
   return updated ?? null;
 }
 
-/**
- * Called after an invoice is settled. Resolves the customer from the invoice
- * (`customer_id`, else the recipient email) and recomputes their aggregates.
- * Best-effort: never let a bookkeeping stat break the payment flow.
- */
+/** After an invoice is settled: resolves the customer (customer_id, else recipient email) and recomputes. Best-effort. */
 export async function recomputeCustomerForInvoice(
   tables: TenantTables,
   invoice: { customerId: number | null; recipientEmail: string | null },

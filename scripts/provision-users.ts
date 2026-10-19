@@ -1,18 +1,8 @@
 /**
- * Create dashboard (audience `admin`) users with a password and a membership on
- * every brand. Public sign-up is disabled, so this is how accounts with a known
- * initial password get made — e.g. the `seo` blog writers.
- *
- *   Dry run:  DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/provision-users.ts <users.json>
- *   Apply:    … scripts/provision-users.ts <users.json> --commit
- *
- * <users.json> is an array of { email, firstName, lastName, password, accessLevel }.
- * Keep it OUT of the repo — it carries plaintext passwords. Delete it afterwards.
- *
- * Idempotent and non-destructive: an email that already exists is reported and
- * left alone (no password reset, no access-level change — a re-run must never
- * downgrade a real admin). Memberships are insert-only for the same reason.
- * `super_admin` is not accepted here; that stays with seed-prod.ts.
+ * Creates dashboard (audience `admin`) users + a membership on every brand. Existing emails are left untouched
+ * (a re-run must never reset a password or downgrade an admin); `super_admin` is not accepted.
+ * DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/provision-users.ts <users.json> [--commit]
+ * The JSON (email, firstName, lastName, password, accessLevel) holds plaintext passwords: keep it out of the repo.
  */
 import { readFileSync } from 'node:fs';
 

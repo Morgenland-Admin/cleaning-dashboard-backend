@@ -1,20 +1,6 @@
 /**
- * Boot-time DB bootstrap + migration script.
- *
- * Runs ahead of `node dist/server.js` (see Dockerfile CMD). Three phases:
- *
- *   1. Ensure the three legacy tenant schemas exist. Drizzle migrations
- *      reference tables in these schemas (e.g. CREATE TABLE "cleanilo".orders);
- *      without the schemas, migration 0000 fails on a fresh database.
- *
- *   2. Run drizzle migrations idempotently.
- *
- *   3. Upsert the three legacy company rows so the X-Company-Slug header
- *      resolves on first boot. This is the absolute minimum runtime state
- *      needed for the storefronts to work. Additional companies are created
- *      via POST /admin/companies once an admin user exists.
- *
- * Idempotent: rerunning is safe on every container start.
+ * Runs before `node dist/server.js` and is safe to rerun on every start: creates the legacy tenant
+ * schemas (migration 0000 references them), applies drizzle migrations, upserts the legacy company rows.
  */
 
 import { drizzle } from 'drizzle-orm/node-postgres';
@@ -24,20 +10,21 @@ import pg from 'pg';
 
 import { env } from '../config/env.js';
 import { LEGACY_BOOTSTRAP } from './bootstrap-companies.js';
+import { SERVICE_CATALOG_SEED } from './service-catalog-seed.js';
 import { company } from './schema/shared.js';
-import { createTenantSchemaSql } from './schema/tenant.js';
+import { createTenantSchemaSql, getTenantTables } from './schema/tenant.js';
+import { and, isNotNull, isNull } from 'drizzle-orm';
+import { geocodePlz } from '../lib/geo.js';
 
 const { Pool } = pg;
 
-// pg_advisory_lock key, shared by all replicas.
 const MIGRATION_LOCK_KEY = 7_421_001;
 
 async function main(): Promise<void> {
   const pool = new Pool({ connectionString: env.DATABASE_URL });
   const db = drizzle(pool);
 
-  // Serialize migrations across replicas. Advisory locks are session-level,
-  // so lock and unlock must run on the same pinned client.
+  // Serializes replicas; the lock is session-level, so unlock must use the same client.
   console.log('[migrate] acquiring advisory lock…');
   const lockClient = await pool.connect();
   await lockClient.query(`SELECT pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
@@ -64,23 +51,25 @@ async function main(): Promise<void> {
       updatedAt: new Date(),
     };
     if (cfg.resendApiKey) updateSet.resendApiKey = cfg.resendApiKey;
-    // Only set a default logo when none exists — never clobber an admin upload.
+    if (cfg.resendWebhookSecret) updateSet.resendWebhookSecret = cfg.resendWebhookSecret;
+    // Coalesced fields only seed blanks, so admin edits (uploads, live counter) win.
     if (cfg.logoUrl) updateSet.logoUrl = sql`coalesce(${company.logoUrl}, ${cfg.logoUrl})`;
     if (cfg.invoiceLogoUrl)
       updateSet.invoiceLogoUrl = sql`coalesce(${company.invoiceLogoUrl}, ${cfg.invoiceLogoUrl})`;
-    // Phone / mobile / accent: seed only where blank so an admin edit wins.
     if (cfg.phone) updateSet.phone = sql`coalesce(${company.phone}, ${cfg.phone})`;
     if (cfg.mobile) updateSet.mobile = sql`coalesce(${company.mobile}, ${cfg.mobile})`;
     if (cfg.primaryColor)
       updateSet.primaryColor = sql`coalesce(${company.primaryColor}, ${cfg.primaryColor})`;
-    // Invoice numbering: seed only where blank so an admin edit / live counter wins.
+    if (cfg.partnerPortalOrigin)
+      updateSet.partnerPortalOrigin = sql`coalesce(${company.partnerPortalOrigin}, ${cfg.partnerPortalOrigin})`;
+    if (cfg.storefrontAliases?.length)
+      updateSet.storefrontAliases = sql`CASE WHEN ${company.storefrontAliases} = '[]'::jsonb THEN ${JSON.stringify(cfg.storefrontAliases)}::jsonb ELSE ${company.storefrontAliases} END`;
     if (cfg.invoiceNumberPrefix)
       updateSet.invoiceNumberPrefix = sql`coalesce(${company.invoiceNumberPrefix}, ${cfg.invoiceNumberPrefix})`;
     if (cfg.invoiceNumberStart != null)
       updateSet.invoiceNumberNext = sql`coalesce(${company.invoiceNumberNext}, ${cfg.invoiceNumberStart})`;
-    // Email signature is seed-owned brand content → overwrite on every boot.
+    // Seed-owned: overwritten on every boot.
     if (cfg.emailSignature) updateSet.emailSignature = cfg.emailSignature;
-    // Legal + banking identity: seed only where blank so admin edits always win.
     if (cfg.legal) {
       const l = cfg.legal;
       updateSet.legalName = sql`coalesce(${company.legalName}, ${l.legalName})`;
@@ -110,9 +99,12 @@ async function main(): Promise<void> {
         schemaName: cfg.schemaName,
         keyPrefix: cfg.keyPrefix,
         storefrontOrigin: cfg.storefrontOrigin,
+        storefrontAliases: cfg.storefrontAliases ?? [],
+        partnerPortalOrigin: cfg.partnerPortalOrigin,
         senderEmail: cfg.senderEmail,
         senderName: cfg.senderName,
         resendApiKey: cfg.resendApiKey,
+        resendWebhookSecret: cfg.resendWebhookSecret,
         logoUrl: cfg.logoUrl,
         invoiceLogoUrl: cfg.invoiceLogoUrl,
         websiteUrl: cfg.websiteUrl,
@@ -145,6 +137,34 @@ async function main(): Promise<void> {
           : {}),
       })
       .onConflictDoUpdate({ target: company.slug, set: updateSet });
+  }
+
+  console.log('[migrate] seeding service catalogs…');
+  for (const [slug, rows] of Object.entries(SERVICE_CATALOG_SEED)) {
+    const cfg = LEGACY_BOOTSTRAP[slug as keyof typeof LEGACY_BOOTSTRAP];
+    if (!cfg) continue;
+    const { serviceCatalog } = getTenantTables(cfg.schemaName);
+    await db
+      .insert(serviceCatalog)
+      .values(rows.map((r, i) => ({ ...r, sortOrder: i })))
+      .onConflictDoNothing({ target: serviceCatalog.slug });
+  }
+
+  console.log('[migrate] geocoding partner base locations…');
+  for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
+    const { partners } = getTenantTables(cfg.schemaName);
+    const pending = await db
+      .select({ id: partners.id, postalCode: partners.postalCode })
+      .from(partners)
+      .where(and(isNull(partners.lat), isNotNull(partners.postalCode)));
+    for (const p of pending) {
+      const coords = geocodePlz(p.postalCode);
+      if (!coords) continue;
+      await db
+        .update(partners)
+        .set({ lat: coords.lat, lng: coords.lng })
+        .where(sql`${partners.id} = ${p.id}`);
+    }
   }
 
   await lockClient.query(`SELECT pg_advisory_unlock(${MIGRATION_LOCK_KEY})`);

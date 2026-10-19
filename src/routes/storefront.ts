@@ -10,6 +10,9 @@ import { qrPublicRoutes } from '../modules/qr/routes.js';
 import { voucherPublicRoutes } from '../modules/voucher/routes.js';
 import { reviewsPublicRoutes } from '../modules/reviews/routes.js';
 import { seoPublicRoutes } from '../modules/seo/routes.js';
+import { serviceCatalogPublicRoutes } from '../modules/service-catalog/routes.js';
+import { partnerApplicationsPublicRoutes } from '../modules/partners/applications.js';
+import { brandPublicRoutes } from '../modules/brand/routes.js';
 
 const storefrontRoutes: FastifyPluginAsync = async (app) => {
   await app.register(catalogPublicRoutes, { prefix: '/catalog' });
@@ -24,6 +27,9 @@ const storefrontRoutes: FastifyPluginAsync = async (app) => {
   await app.register(reviewsPublicRoutes, { prefix: '/reviews' });
   await app.register(seoPublicRoutes, { prefix: '/seo' });
   await app.register(qrPublicRoutes, { prefix: '/q' });
+  await app.register(serviceCatalogPublicRoutes, { prefix: '/services' });
+  await app.register(partnerApplicationsPublicRoutes, { prefix: '/partner-applications' });
+  await app.register(brandPublicRoutes, { prefix: '/brand' });
 };
 
 export default storefrontRoutes;

@@ -1,19 +1,26 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, asc, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { accessLevelOf, redactForViewer } from '../../lib/access.js';
 import { db } from '../../db/index.js';
 import { company, user } from '../../db/schema/shared.js';
 import { linkCustomerByEmail } from '../../lib/customers.js';
-import { brandInfoFromCompany, brandSender, sendEmail } from '../../email/service.js';
+import {
+  brandInfoFromCompany,
+  brandSender,
+  isNonContactableEmail,
+  sendEmail,
+} from '../../email/service.js';
 import { env } from '../../config/env.js';
 import {
   adminInboxNotificationEmail,
   contactAckEmail,
   contactReplyEmail,
 } from '../../email/templates.js';
-import { notFound, parseIntId } from '../../lib/http-errors.js';
+import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
+import type { TenantTables } from '../../db/schema/tenant.js';
+import { likePattern, NO_SOURCE } from '../inquiries/filters.js';
 import { metaEventContextSchema, sendMetaServerEvent } from '../../lib/meta-capi.js';
 
 const submitSchema = z.object({
@@ -119,6 +126,12 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
             await sendEmail({
               to: row.email,
               from: brandSender(companyRow),
+              log: {
+                companySlug: companyRow.slug,
+                kind: 'contact_ack',
+                refType: 'contact',
+                refId: row.id,
+              },
               apiKey: companyRow.resendApiKey ?? undefined,
               replyTo: companyRow.email ?? undefined,
               email: contactAckEmail({
@@ -129,10 +142,16 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
               }),
             });
             if (companyRow.email) {
-              const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/contacts?id=${row.id}`;
+              const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/contacts/${request.company!.slug}/${row.id}`;
               await sendEmail({
                 to: companyRow.email,
                 from: brandSender(companyRow),
+                log: {
+                  companySlug: companyRow.slug,
+                  kind: 'staff_notification',
+                  refType: 'contact',
+                  refId: row.id,
+                },
                 apiKey: companyRow.resendApiKey ?? undefined,
                 replyTo: row.email,
                 email: adminInboxNotificationEmail({
@@ -159,7 +178,7 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
           await sendPushToBrandAdmins(request.company!.slug, {
             title: `${request.company!.slug} · Kontaktanfrage`,
             body: `${row.name}: ${(row.subject || row.message || '').slice(0, 120)}`,
-            url: `/contacts?id=${row.id}`,
+            url: `/contacts/${request.company!.slug}/${row.id}`,
             tag: `contact:${row.id}`,
             brandSlug: request.company!.slug,
           });
@@ -211,33 +230,65 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
 
 const redactPii = redactForViewer;
 
+// `open` = not answered yet.
+const CONTACT_STATUS_FILTER = ['open', 'new', 'read', 'replied', 'archived', 'all'] as const;
+type ContactStatusFilter = (typeof CONTACT_STATUS_FILTER)[number];
+
+function contactFilters(
+  cm: TenantTables['contactMessages'],
+  opts: { status?: ContactStatusFilter; q?: string; source?: string },
+): SQL[] {
+  const conds: SQL[] = [];
+  if (opts.status === 'open') conds.push(inArray(cm.status, ['new', 'read']));
+  else if (opts.status && opts.status !== 'all') conds.push(eq(cm.status, opts.status));
+  if (opts.source === NO_SOURCE) conds.push(isNull(cm.source));
+  else if (opts.source) conds.push(eq(cm.source, opts.source));
+  if (opts.q) {
+    const like = likePattern(opts.q);
+    const parts = [
+      ilike(cm.name, like),
+      ilike(cm.email, like),
+      ilike(cm.phone, like),
+      ilike(cm.subject, like),
+      ilike(cm.message, like),
+    ];
+    const id = /^#?(\d{1,9})$/.exec(opts.q.trim());
+    if (id) parts.push(eq(cm.id, Number(id[1])));
+    const search = or(...parts);
+    if (search) conds.push(search);
+  }
+  return conds;
+}
+
 export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
-  // Replies leave the building as customer mail — manager+ for writes.
   app.addHook('preHandler', app.requireWriteAccess);
 
-  const listQuerySchema = z.object({
+  const filterSchema = z.object({
+    status: z.enum(CONTACT_STATUS_FILTER).optional(),
+    q: z.string().trim().min(1).max(200).optional(),
+    source: z.string().trim().min(1).max(64).optional(),
+  });
+  const listQuerySchema = filterSchema.extend({
     limit: z.coerce.number().int().min(1).max(200).default(50),
     cursor: z.string().min(1).max(500).optional(),
   });
   app.get('/', async (request) => {
-    const { limit, cursor } = listQuerySchema.parse(request.query);
+    const { limit, cursor, ...filters } = listQuerySchema.parse(request.query);
     const { contactMessages } = request.company!.tables;
-    const decoded = cursor ? decodeCursor(cursor) : null;
-    const where = decoded
-      ? or(
-          lt(contactMessages.createdAt, sql`${decoded.createdAt}::timestamptz`),
-          and(
-            sql`${contactMessages.createdAt} = ${decoded.createdAt}::timestamptz`,
-            lt(contactMessages.id, decoded.id),
-          ),
-        )
-      : undefined;
+    const conds = contactFilters(contactMessages, filters);
+    const after = keysetAfter(
+      contactMessages,
+      contactMessages.createdAt,
+      contactMessages.id,
+      cursor,
+    );
+    if (after) conds.push(after);
     const rows = await db
       .select()
       .from(contactMessages)
-      .where(where)
+      .where(conds.length ? and(...conds) : undefined)
       .orderBy(desc(contactMessages.createdAt), desc(contactMessages.id))
       .limit(limit + 1);
     const hasMore = rows.length > limit;
@@ -252,6 +303,29 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       messages: page.map((r) => redactPii(r, accessLevel)),
       nextCursor,
     };
+  });
+
+  // Tab counts for the list: per status under the search, per source under search + status.
+  app.get('/counts', async (request) => {
+    const { status, q, source } = filterSchema.parse(request.query);
+    const { contactMessages: cm } = request.company!.tables;
+    const statusConds = contactFilters(cm, { q, source });
+    const sourceConds = contactFilters(cm, { q, status });
+    const [byStatusRows, bySourceRows] = await Promise.all([
+      db
+        .select({ key: cm.status, n: sql<number>`count(*)::int` })
+        .from(cm)
+        .where(statusConds.length ? and(...statusConds) : undefined)
+        .groupBy(cm.status),
+      db
+        .select({ key: cm.source, n: sql<number>`count(*)::int` })
+        .from(cm)
+        .where(sourceConds.length ? and(...sourceConds) : undefined)
+        .groupBy(cm.source),
+    ]);
+    const byStatus = Object.fromEntries(byStatusRows.map((r) => [r.key, r.n]));
+    const bySource = Object.fromEntries(bySourceRows.map((r) => [r.key ?? NO_SOURCE, r.n]));
+    return { byStatus, bySource };
   });
 
   app.get('/:id', async (request) => {
@@ -296,6 +370,9 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(contactMessages.id, id))
       .limit(1);
     if (!msg) throw notFound('Contact message not found');
+    // Imported rows can carry a placeholder address; a "reply" would be stored but never delivered.
+    if (isNonContactableEmail(msg.email))
+      throw badRequest('This contact has no deliverable email address');
 
     const [adminRow] = await db
       .select({ name: user.name })
@@ -305,7 +382,7 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!adminRow) {
       request.log.warn({ adminId }, 'Admin user row missing during contact reply');
     }
-    // Internal audit trail only — the mail itself signs as the brand.
+    // Internal audit trail only; the mail signs as the brand.
     const sentByName = adminRow?.name ?? null;
 
     const [companyRow] = await db
@@ -319,6 +396,13 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       const result = await sendEmail({
         to: msg.email,
         from: brandSender(companyRow),
+        log: {
+          companySlug: companyRow.slug,
+          kind: 'contact_reply',
+          refType: 'contact',
+          refId: msg.id,
+          sentByUserId: adminId,
+        },
         apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
         email: contactReplyEmail({

@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { s3Configured, signDownload, signPublicUpload, signUpload } from '../../lib/s3.js';
 
-const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_BYTES = 10 * 1024 * 1024;
 const ALLOWED_TYPES = new Set([
   'image/jpeg',
   'image/png',
@@ -10,11 +10,23 @@ const ALLOWED_TYPES = new Set([
   'image/heic',
   'image/heif',
 ]);
+// Private storefront uploads also take PDF/Word (CVs on the cleanilo.de job path).
+const STOREFRONT_TYPES = new Set([
+  ...ALLOWED_TYPES,
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
 
 const signSchema = z.object({
   filename: z.string().min(1).max(200),
   contentType: z.string().min(1).max(80),
   size: z.number().int().positive().max(MAX_BYTES),
+});
+
+// Admin uploads may target a folder; the public storefront path never can.
+const adminSignSchema = signSchema.extend({
+  folder: z.enum(['inquiries', 'receipts']).optional(),
 });
 
 export const uploadsPublicRoutes: FastifyPluginAsync = async (app) => {
@@ -33,9 +45,9 @@ export const uploadsPublicRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
       const body = signSchema.parse(request.body);
-      if (!ALLOWED_TYPES.has(body.contentType)) {
+      if (!STOREFRONT_TYPES.has(body.contentType)) {
         reply.code(415).send({
-          error: `Unsupported file type "${body.contentType}". Allowed: ${[...ALLOWED_TYPES].join(', ')}`,
+          error: `Unsupported file type "${body.contentType}". Allowed: ${[...STOREFRONT_TYPES].join(', ')}`,
         });
         return;
       }
@@ -61,7 +73,6 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
     '/sign-upload',
     {
       config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
-      // Viewers are read-only.
       preHandler: app.requireAccess('super_admin', 'admin', 'manager'),
     },
     async (request, reply) => {
@@ -69,7 +80,7 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
         reply.code(503).send({ error: 'Uploads are not configured on this server' });
         return;
       }
-      const body = signSchema.parse(request.body);
+      const body = adminSignSchema.parse(request.body);
       const ADMIN_ALLOWED_TYPES = new Set([
         'image/jpeg',
         'image/png',
@@ -94,14 +105,14 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
         filename: body.filename,
         contentType: body.contentType,
         sizeBytes: body.size,
+        folder: body.folder,
       });
       reply.code(201).send({ uploadUrl, key, expiresIn });
     },
   );
 
-  // Presign a publicly-readable image upload (e.g. a blog featured image). Returns
-  // a stable public URL the caller stores in the article's schemaJsonld.image.
-  // `seo` is let in because the blog editor is its whole job.
+  // Presigns a publicly-readable image upload (e.g. blog featured image); the caller stores the returned URL
+  // in schemaJsonld.image. `seo` is allowed because the blog editor needs it.
   app.post(
     '/sign-public-image',
     {

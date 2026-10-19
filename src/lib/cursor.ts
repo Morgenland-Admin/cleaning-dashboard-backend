@@ -1,18 +1,13 @@
+import { and, lt, or, sql, type SQL } from 'drizzle-orm';
+import type { AnyPgColumn, AnyPgTable } from 'drizzle-orm/pg-core';
+
 /**
- * Stable opaque cursor for list pagination. Encodes the last row's
- * (createdAt, id) tuple so the next page can do
- *   WHERE (created_at, id) < ($cursorCreatedAt, $cursorId)
- *   ORDER BY created_at DESC, id DESC
- * — which is stable even when many rows share the same created_at second.
- *
- * Format: base64url(JSON.stringify({ c: ISO, i: number })). Encoded so it
- * looks like a single opaque token to clients; decoded server-side.
+ * Opaque keyset cursor: the last row's (createdAt, id), for `WHERE (created_at, id) < (...)
+ * ORDER BY created_at DESC, id DESC` — stable even when rows share a created_at.
  */
 
 export interface ListCursor {
-  /** ISO 8601 timestamp of the last row on the previous page. */
   createdAt: string;
-  /** Primary key of the last row. */
   id: number;
 }
 
@@ -45,7 +40,24 @@ export function decodeCursor(token: string): ListCursor | null {
       return { createdAt: data.c, id: data.i };
     }
   } catch {
-    // fallthrough
+    // malformed token
   }
   return null;
+}
+
+/**
+ * Rows after the cursor in `ORDER BY created_at DESC, id DESC`. Postgres stores microseconds but the
+ * cursor only carries milliseconds, so the boundary is re-read from the cursor row itself; otherwise
+ * rows inserted by one statement (CSV imports) fall out of page 2.
+ */
+export function keysetAfter(
+  table: AnyPgTable,
+  createdAt: AnyPgColumn,
+  id: AnyPgColumn,
+  cursor: string | undefined,
+): SQL | undefined {
+  const decoded = cursor ? decodeCursor(cursor) : null;
+  if (!decoded) return undefined;
+  const boundary = sql`coalesce((select ${createdAt} from ${table} where ${id} = ${decoded.id}), ${decoded.createdAt}::timestamptz)`;
+  return or(lt(createdAt, boundary), and(sql`${createdAt} = ${boundary}`, lt(id, decoded.id)));
 }

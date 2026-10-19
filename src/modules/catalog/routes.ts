@@ -6,21 +6,15 @@ import type { PriceBook } from '../../lib/price-books/types.js';
 interface TierDto {
   code: string;
   label: string;
-  /**
-   * Für Bracket-Services (unit: 'bracket') sind die Preise tier × bracket
-   * — `unitPriceCents` ist dann nicht aussagekräftig und wird mit `0`
-   * belegt. Clients sollen `brackets` lesen.
-   */
+  /** Bei unit 'bracket' ist unitPriceCents immer 0 — Clients lesen `brackets`. */
   unitPriceCents: number;
-  /** Optionale Kurzbeschreibung pro Tier (für Card-Subtitle). */
   description?: string;
 }
 
 interface BracketDto {
   code: string;
   label: string;
-  /** Preis je Tier-Code (z. B. `{ basis: 21000, standard: 27900, premium: 39000 }`).
-   *  `null` ⇒ "auf Anfrage". */
+  /** Preis je Tier-Code; `null` = "auf Anfrage". */
   pricesCents: Record<string, number | null>;
 }
 
@@ -29,7 +23,6 @@ interface ServiceDto {
   label: string;
   unit: 'qm' | 'lfdm' | 'stueck' | 'bracket';
   tiers: TierDto[];
-  /** Nur gesetzt für `unit: 'bracket'`. */
   brackets?: BracketDto[];
   options: Record<string, unknown>;
 }

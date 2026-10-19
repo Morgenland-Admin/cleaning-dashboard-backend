@@ -11,7 +11,8 @@ import adminRoutes from './routes/admin.js';
 import internalRoutes from './routes/internal.js';
 import partnerRoutes from './routes/partner.js';
 import storefrontRoutes from './routes/storefront.js';
-import { loadAllActiveCompanies } from './lib/company-loader.js';
+import { resendWebhookRoutes } from './modules/emails/webhook.js';
+import { companyOrigins, loadAllActiveCompanies } from './lib/company-loader.js';
 import { db } from './db/index.js';
 import { sql } from 'drizzle-orm';
 import { initObservability } from './lib/observability.js';
@@ -41,7 +42,7 @@ export async function buildApp(opts: FastifyServerOptions = {}) {
         : {
             redact: { paths: redactPaths, censor: '[redacted]' },
           },
-    trustProxy: 1,
+    trustProxy: env.TRUST_PROXY,
     ...opts,
   });
 
@@ -51,7 +52,7 @@ export async function buildApp(opts: FastifyServerOptions = {}) {
       const companies = await loadAllActiveCompanies();
       const next = new Set<string>();
       for (const c of companies) {
-        if (c.storefrontOrigin) next.add(c.storefrontOrigin);
+        for (const o of companyOrigins(c)) next.add(o);
       }
       dynamicOrigins.clear();
       for (const o of next) dynamicOrigins.add(o);
@@ -120,6 +121,7 @@ export async function buildApp(opts: FastifyServerOptions = {}) {
   await app.register(partnerRoutes, { prefix: '/partner' });
   await app.register(storefrontRoutes, { prefix: '/storefront' });
   await app.register(internalRoutes, { prefix: '/internal' });
+  await app.register(resendWebhookRoutes, { prefix: '/webhooks' });
 
   const chatWsPlugin = (await import('./modules/chat/ws.js')).default;
   await app.register(chatWsPlugin, { prefix: '/ws' });

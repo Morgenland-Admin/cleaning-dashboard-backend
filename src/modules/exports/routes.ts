@@ -1,9 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, desc, eq, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { exportJobs, membership } from '../../db/schema/shared.js';
 import { parseIntId } from '../../lib/http-errors.js';
 import { s3Configured, signObjectDownload } from '../../lib/s3.js';
@@ -78,20 +78,8 @@ export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
     const userId = request.authUser!.id;
     const conds = [eq(exportJobs.requestedByUserId, userId)];
     if (q.status !== 'all') conds.push(eq(exportJobs.status, q.status));
-    if (q.cursor) {
-      const cur = decodeCursor(q.cursor);
-      // Tuple predicate matching the (createdAt DESC, id DESC) ordering.
-      if (cur) {
-        const cw = or(
-          lt(exportJobs.createdAt, sql`${cur.createdAt}::timestamptz`),
-          and(
-            sql`${exportJobs.createdAt} = ${cur.createdAt}::timestamptz`,
-            lt(exportJobs.id, cur.id),
-          ),
-        );
-        if (cw) conds.push(cw);
-      }
-    }
+    const after = keysetAfter(exportJobs, exportJobs.createdAt, exportJobs.id, q.cursor);
+    if (after) conds.push(after);
     const rows = await db
       .select()
       .from(exportJobs)
@@ -106,6 +94,15 @@ export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
         ? encodeCursor({ id: last.id, createdAt: last.createdAt.toISOString() })
         : null;
     reply.send({ items, nextCursor });
+  });
+
+  app.get('/counts', async (request) => {
+    const rows = await db
+      .select({ status: exportJobs.status, n: sql<number>`count(*)::int` })
+      .from(exportJobs)
+      .where(eq(exportJobs.requestedByUserId, request.authUser!.id))
+      .groupBy(exportJobs.status);
+    return { counts: Object.fromEntries(rows.map((r) => [r.status, r.n])) };
   });
 
   app.get('/:id', async (request, reply) => {

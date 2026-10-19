@@ -1,7 +1,19 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, asc, desc, eq, isNotNull, lt, or, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  ilike,
+  inArray,
+  isNotNull,
+  isNull,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 import { z } from 'zod';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { env } from '../../config/env.js';
 import { accessLevelOf, redactForViewer } from '../../lib/access.js';
 import { db } from '../../db/index.js';
@@ -10,6 +22,7 @@ import { linkCustomerByEmail } from '../../lib/customers.js';
 import {
   brandInfoFromCompany,
   brandSender,
+  isNonContactableEmail,
   isOwnDomainEmail,
   sendEmail,
 } from '../../email/service.js';
@@ -21,6 +34,7 @@ import {
 import { badRequest, notFound, parseIntId, tooManyRequests } from '../../lib/http-errors.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
 import { formatInquiryNumber } from './number.js';
+import { inquiryIdFromQuery, keysetAfterAsc, likePattern, NO_SOURCE } from './filters.js';
 import { routeCallback } from '../../lib/geo.js';
 import { metaEventContextSchema, sendMetaServerEvent } from '../../lib/meta-capi.js';
 import type { FastifyBaseLogger } from 'fastify';
@@ -39,23 +53,15 @@ const submitSchema = z.object({
   message: z.string().min(1).max(5000),
   locale: z.string().min(2).max(16).optional(),
   source: z.string().max(64).optional(),
-  /** Service PLZ (where the cleaning happens) — drives geo callback routing. */
+  /** Service PLZ; drives geo callback routing. */
   plz: z
     .string()
     .regex(/^\d{5}$/, 'plz must be exactly 5 digits')
     .optional(),
-  /** Free-text "Grund des Anrufs". */
   callReason: z.string().max(2000).optional(),
-  /**
-   * Brand-specific form fields. Each storefront defines its own keys
-   * (e.g. carpet material, square meters, pickup vs on-site).
-   */
+  /** Brand-specific form fields; each storefront defines its own keys. */
   metadata: z.record(z.string().max(120), z.unknown()).optional(),
-  /**
-   * S3 object references for files uploaded via /storefront/uploads/sign.
-   * Each entry holds the key (not a URL) — the admin dashboard signs a
-   * short-lived GET URL on demand to render the image.
-   */
+  /** S3 object keys (not URLs) from /storefront/uploads/sign; the dashboard signs short-lived GET URLs on demand. */
   attachments: z
     .array(
       z.object({
@@ -91,7 +97,6 @@ const updateSchema = z.object({
   metadata: z.record(z.unknown()).optional(),
 });
 
-/** Inquiry fields the post-create side-effects read. */
 export interface CreatedInquiry {
   id: number;
   name: string;
@@ -107,12 +112,8 @@ export interface CreatedInquiry {
   assignedTo: string | null;
 }
 
-/**
- * Geo-route a new inquiry by its service PLZ and return the columns to persist.
- * `human` leads are pinned to the configured default assignee (a plain user
- * pointer — reps can be added/distributed later without a schema change).
- * Geo provenance (distance, geocoded?) is stashed under metadata.geo.
- */
+// Geo-routes by service PLZ. `human` leads are pinned to the default assignee;
+// geo provenance goes under metadata.geo.
 export function buildCallbackFields(
   plz: string | null | undefined,
   callReason: string | null | undefined,
@@ -132,13 +133,8 @@ export function buildCallbackFields(
   };
 }
 
-/**
- * Per-email inquiry rate limit. Counts inquiries created by `email` in the
- * trailing hour and reports whether it has hit env.INQUIRY_MAX_PER_EMAIL_PER_HOUR.
- * A hard backstop against a feedback loop (e.g. inbound mail re-ingesting our
- * own notifications) that caps a single address regardless of where the
- * inquiries originate. Phone-only leads (no email) are never limited here.
- */
+// Per-email hourly cap (env.INQUIRY_MAX_PER_EMAIL_PER_HOUR): backstop against feedback loops such as
+// inbound mail re-ingesting our own notifications. Phone-only leads (no email) are never limited.
 export async function isInquiryRateLimited(
   serviceInquiries: TenantTables['serviceInquiries'],
   email: string | null | undefined,
@@ -158,24 +154,16 @@ export async function isInquiryRateLimited(
   return (agg?.count ?? 0) >= env.INQUIRY_MAX_PER_EMAIL_PER_HOUR;
 }
 
-/**
- * Fire-and-forget side-effects after an inquiry is created: customer ack email,
- * admin inbox email, push, and a dashboard task. Human (Hamburg-area) leads get
- * a flagged `human_callback` task assigned to their owner; everything else keeps
- * the standard `inquiry_review` task. Failures are logged, never thrown.
- */
+// Fire-and-forget side-effects: ack mail, admin mail, push, dashboard task. Human leads get a flagged
+// `human_callback` task, the rest `inquiry_review`. Failures are logged, never thrown.
 export async function notifyInquiryCreated(
   companySlug: string,
   row: CreatedInquiry,
   log: FastifyBaseLogger,
 ): Promise<void> {
   const isHuman = row.callbackOwner === 'human';
-  // Feedback-loop guard: if the inquiry's contact address is one of our own
-  // domains, it's almost certainly our own confirmation/notification mail
-  // re-ingested by the inbound-email workflow, not a real customer. Sending an
-  // ack or admin notification would feed the loop, so suppress all mail for it.
-  // (Defense in depth behind the n8n self-sender filter.) The dashboard task /
-  // push still fire so nothing is silently dropped from the operators' view.
+  // Feedback-loop guard: an inquiry from one of our own domains is our own mail re-ingested by the inbound
+  // workflow, so suppress all mail for it. The dashboard task and push still fire.
   const suppressMail = isOwnDomainEmail(row.email);
   if (suppressMail) {
     log.warn(
@@ -191,11 +179,16 @@ export async function notifyInquiryCreated(
       .limit(1);
     if (companyRow && !suppressMail) {
       const brand = brandInfoFromCompany(companyRow);
-      // No email (e.g. a voice-AI phone lead) → no customer acknowledgement to send.
       if (row.email) {
         await sendEmail({
           to: row.email,
           from: brandSender(companyRow),
+          log: {
+            companySlug: companyRow.slug,
+            kind: 'inquiry_ack',
+            refType: 'inquiry',
+            refId: row.id,
+          },
           apiKey: companyRow.resendApiKey ?? undefined,
           replyTo: companyRow.email ?? undefined,
           email: contactAckEmail({
@@ -216,10 +209,16 @@ export async function notifyInquiryCreated(
         if (row.phone) details.push({ label: 'Telefon', value: row.phone });
         if (row.plz) details.push({ label: 'PLZ', value: row.plz });
         if (row.callReason) details.push({ label: 'Grund des Anrufs', value: row.callReason });
-        const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/inquiries?id=${row.id}`;
+        const adminUrl = `${env.APP_BASE_URL.replace(/\/$/, '')}/inquiries/${companySlug}/${row.id}`;
         await sendEmail({
           to: companyRow.email,
           from: brandSender(companyRow),
+          log: {
+            companySlug: companyRow.slug,
+            kind: 'staff_notification',
+            refType: 'inquiry',
+            refId: row.id,
+          },
           apiKey: companyRow.resendApiKey ?? undefined,
           replyTo: row.email ?? undefined,
           email: adminInboxNotificationEmail({
@@ -247,7 +246,7 @@ export async function notifyInquiryCreated(
     await sendPushToBrandAdmins(companySlug, {
       title: isHuman ? `${companySlug} · Rückruf (Hamburg)` : `${companySlug} · Service-Anfrage`,
       body: `${row.name}${row.service ? ` · ${row.service}` : ''}: ${(row.callReason || row.message || '').slice(0, 120)}`,
-      url: `/inquiries?id=${row.id}`,
+      url: `/inquiries/${companySlug}/${row.id}`,
       tag: `inquiry:${row.id}`,
       brandSlug: companySlug,
     });
@@ -316,7 +315,6 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
         }
       }
       const { serviceInquiries, customers } = request.company!.tables;
-      // Per-email backstop against a runaway loop, independent of the n8n filter.
       if (await isInquiryRateLimited(serviceInquiries, body.email)) {
         request.log.warn(
           { email: body.email },
@@ -395,38 +393,71 @@ export const inquiriesPublicRoutes: FastifyPluginAsync = async (app) => {
 
 const redactPii = redactForViewer;
 
-/** Attach the customer-facing inquiry number derived from id + creation year. */
 function withNumber<T extends { id: number; createdAt: Date }>(row: T) {
   return { ...row, inquiryNumber: formatInquiryNumber(row.id, row.createdAt) };
+}
+
+// `open` = still needs the team (same definition as the dashboard tile).
+const INQUIRY_STATUS_FILTER = ['open', 'new', 'in_review', 'quoted', 'won', 'lost', 'all'] as const;
+type InquiryStatusFilter = (typeof INQUIRY_STATUS_FILTER)[number];
+
+function inquiryFilters(
+  si: TenantTables['serviceInquiries'],
+  opts: { status?: InquiryStatusFilter; q?: string; source?: string },
+): SQL[] {
+  const conds: SQL[] = [];
+  if (opts.status === 'open') conds.push(inArray(si.status, ['new', 'in_review']));
+  else if (opts.status && opts.status !== 'all') conds.push(eq(si.status, opts.status));
+  if (opts.source === NO_SOURCE) conds.push(isNull(si.source));
+  else if (opts.source) conds.push(eq(si.source, opts.source));
+  if (opts.q) {
+    const like = likePattern(opts.q);
+    const parts = [
+      ilike(si.name, like),
+      ilike(si.email, like),
+      ilike(si.phone, like),
+      ilike(si.service, like),
+      ilike(si.message, like),
+      ilike(si.plz, like),
+      ilike(si.callReason, like),
+    ];
+    const id = inquiryIdFromQuery(opts.q);
+    if (id) parts.push(eq(si.id, id));
+    const search = or(...parts);
+    if (search) conds.push(search);
+  }
+  return conds;
 }
 
 export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
-  // Quotes go out as priced customer mail — manager+ for writes.
   app.addHook('preHandler', app.requireWriteAccess);
 
-  const listQuerySchema = z.object({
+  const filterSchema = z.object({
+    status: z.enum(INQUIRY_STATUS_FILTER).optional(),
+    q: z.string().trim().min(1).max(200).optional(),
+    source: z.string().trim().min(1).max(64).optional(),
+  });
+  const listQuerySchema = filterSchema.extend({
     limit: z.coerce.number().int().min(1).max(200).default(50),
     cursor: z.string().min(1).max(500).optional(),
   });
   app.get('/', async (request) => {
-    const { limit, cursor } = listQuerySchema.parse(request.query);
+    const { limit, cursor, ...filters } = listQuerySchema.parse(request.query);
     const { serviceInquiries } = request.company!.tables;
-    const decoded = cursor ? decodeCursor(cursor) : null;
-    const where = decoded
-      ? or(
-          lt(serviceInquiries.createdAt, sql`${decoded.createdAt}::timestamptz`),
-          and(
-            sql`${serviceInquiries.createdAt} = ${decoded.createdAt}::timestamptz`,
-            lt(serviceInquiries.id, decoded.id),
-          ),
-        )
-      : undefined;
+    const conds = inquiryFilters(serviceInquiries, filters);
+    const after = keysetAfter(
+      serviceInquiries,
+      serviceInquiries.createdAt,
+      serviceInquiries.id,
+      cursor,
+    );
+    if (after) conds.push(after);
     const rows = await db
       .select()
       .from(serviceInquiries)
-      .where(where)
+      .where(conds.length ? and(...conds) : undefined)
       .orderBy(desc(serviceInquiries.createdAt), desc(serviceInquiries.id))
       .limit(limit + 1);
     const hasMore = rows.length > limit;
@@ -441,6 +472,29 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       inquiries: page.map((r) => withNumber(redactPii(r, accessLevel))),
       nextCursor,
     };
+  });
+
+  // Tab counts for the list: per status under the search, per source under search + status.
+  app.get('/counts', async (request) => {
+    const { status, q, source } = filterSchema.parse(request.query);
+    const { serviceInquiries: si } = request.company!.tables;
+    const statusConds = inquiryFilters(si, { q, source });
+    const sourceConds = inquiryFilters(si, { q, status });
+    const [byStatusRows, bySourceRows] = await Promise.all([
+      db
+        .select({ key: si.status, n: sql<number>`count(*)::int` })
+        .from(si)
+        .where(statusConds.length ? and(...statusConds) : undefined)
+        .groupBy(si.status),
+      db
+        .select({ key: si.source, n: sql<number>`count(*)::int` })
+        .from(si)
+        .where(sourceConds.length ? and(...sourceConds) : undefined)
+        .groupBy(si.source),
+    ]);
+    const byStatus = Object.fromEntries(byStatusRows.map((r) => [r.key, r.n]));
+    const bySource = Object.fromEntries(bySourceRows.map((r) => [r.key ?? NO_SOURCE, r.n]));
+    return { byStatus, bySource };
   });
 
   app.get('/:id', async (request) => {
@@ -507,15 +561,16 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(serviceInquiries.id, id))
       .limit(1);
     if (!inquiry) throw notFound('Inquiry not found');
-    // A quote is delivered by email; phone-only leads have nothing to send to.
-    if (!inquiry.email) throw badRequest('Inquiry has no email address to send a quote to');
+    if (!inquiry.email || isNonContactableEmail(inquiry.email)) {
+      throw badRequest('Inquiry has no email address to send a quote to');
+    }
 
     const [adminRow] = await db
       .select({ name: user.name })
       .from(user)
       .where(eq(user.id, adminId))
       .limit(1);
-    // Internal audit trail only — the mail itself signs as the brand.
+    // Internal audit trail only; the mail signs as the brand.
     const sentByName = adminRow?.name ?? null;
 
     const [companyRow] = await db
@@ -530,9 +585,7 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       : null;
 
     if (companyRow) {
-      // Render once so we can both send the mail and persist exactly what the
-      // customer received (the dashboard is the only record — Resend mail never
-      // lands a copy in the brand mailbox).
+      // Render once so the exact mail sent is also persisted: the dashboard is the only record (no copy lands in the brand mailbox).
       const rendered = inquiryQuoteEmail({
         recipientName: inquiry.name,
         brand: brandInfoFromCompany(companyRow),
@@ -542,6 +595,13 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       const result = await sendEmail({
         to: inquiry.email,
         from: brandSender(companyRow),
+        log: {
+          companySlug: companyRow.slug,
+          kind: 'quote',
+          refType: 'inquiry',
+          refId: id,
+          sentByUserId: adminId,
+        },
         apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
         email: rendered,
@@ -579,8 +639,6 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true, inquiry: updated ? withNumber(updated) : updated };
   });
 
-  // Email history for a lead (sent offers/quotes), newest first. Includes the
-  // rendered HTML so the dashboard can preview exactly what was delivered.
   app.get('/:id/emails', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { inquiryEmails } = request.company!.tables;
@@ -592,13 +650,9 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
     return { emails };
   });
 
-  // Inquiries due a follow-up call: still untouched, reachable by phone, privacy
-  // consent given, past the wait window but not stale, under the attempt cap and
-  // not opted out. Brand-scoped via the X-Company-Slug from requireCompany.
-  //
-  // The AI must never call a lead a human should handle, so this defaults to
-  // EXCLUDING human-owned leads (callback_owner ai, plus legacy NULLs that
-  // predate routing). Pass ?callbackOwner=ai|human to filter explicitly.
+  // Inquiries due a follow-up call: untouched, reachable by phone, privacy consent given, past the wait window
+  // but not stale, under the attempt cap, not opted out. The AI must never call a lead a human should handle,
+  // so this EXCLUDES human-owned leads by default (callback_owner ai, plus legacy NULLs); ?callbackOwner=ai|human filters.
   const callbackQueueSchema = z.object({
     minAgeHours: z.coerce.number().min(0).max(720).default(24),
     maxAgeDays: z.coerce.number().min(1).max(90).default(14),
@@ -660,12 +714,10 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
     return { inquiries };
   });
 
-  // Human (Hamburg-area) callbacks for the dashboard. Unlike the AI queue this
-  // has no wait window / attempt cap — a person works the list directly. Each
-  // entry carries everything the assignee needs and is flagged for the UI.
-  // The assignee marks it done via the existing PATCH /:id status change.
+  // Human callbacks: unlike the AI queue there is no wait window or attempt cap. The assignee marks one done via PATCH /:id.
   const humanCallbackSchema = z.object({
     limit: z.coerce.number().int().min(1).max(200).default(50),
+    cursor: z.string().min(1).max(500).optional(),
     assignedTo: z.string().min(1).max(64).optional(),
     // Not z.coerce.boolean() — "false" would coerce to true.
     includeClosed: z
@@ -674,13 +726,25 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .default('false'),
   });
   app.get('/human-callback-queue', async (request) => {
-    const { limit, assignedTo, includeClosed } = humanCallbackSchema.parse(request.query);
+    const { limit, cursor, assignedTo, includeClosed } = humanCallbackSchema.parse(request.query);
     const { serviceInquiries: si } = request.company!.tables;
     const brand = request.company!.slug;
 
-    const filters = [eq(si.callbackOwner, 'human')];
+    const filters: SQL[] = [eq(si.callbackOwner, 'human')];
     if (!includeClosed) filters.push(eq(si.status, 'new'));
     if (assignedTo) filters.push(eq(si.assignedTo, assignedTo));
+    const total = cursor
+      ? null
+      : ((
+          await db
+            .select({ n: sql<number>`count(*)::int` })
+            .from(si)
+            .where(and(...filters))
+        )[0]?.n ?? 0);
+
+    // Oldest first (longest waiting), so the keyset runs forwards.
+    const after = keysetAfterAsc(si, si.createdAt, si.id, cursor);
+    if (after) filters.push(after);
 
     const rows = await db
       .select({
@@ -700,15 +764,23 @@ export const inquiriesAdminRoutes: FastifyPluginAsync = async (app) => {
       .from(si)
       .where(and(...filters))
       .orderBy(asc(si.createdAt), asc(si.id))
-      .limit(limit);
+      .limit(limit + 1);
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
+        : null;
 
     return {
-      inquiries: rows.map((r) => ({ ...r, brand, flag: 'Human callback – Hamburg area' })),
+      inquiries: page.map((r) => ({ ...r, brand, flag: 'Human callback – Hamburg area' })),
+      nextCursor,
+      total,
     };
   });
 
-  // Records a call outcome: appends a timestamped note, bumps the attempt count,
-  // and advances a still-open inquiry (reached → in_review, opted_out → lost).
+  // Records a call outcome: appends a note, bumps the attempt count, advances a still-open inquiry (reached → in_review, opted_out → lost).
   const callbackOutcomeSchema = z.object({
     outcome: z.enum(['reached', 'no_answer', 'voicemail', 'opted_out']),
     summary: z.string().min(1).max(4000),

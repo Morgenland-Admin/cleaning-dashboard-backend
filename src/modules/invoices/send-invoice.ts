@@ -39,15 +39,15 @@ export interface InvoiceForEmail {
     unitPriceCents: number;
     isPackage?: boolean;
   }>;
-  /** Paketrechnung: positions without per-line prices (see invoices.package_mode). */
+  /** Paketrechnung: no per-line prices. */
   packageMode?: boolean | null;
   notes: string | null;
   paymentMethod?: string | null;
-  /** §35a EStG: invoice covers a Handwerkerleistung. */
+  /** §35a EStG Handwerkerleistung. */
   craftsmanService?: boolean | null;
   laborGrossCents?: number | null;
   laborVatCents?: number | null;
-  /** The §35a sentence as stored — falls back to composing it from the amounts. */
+  /** Stored §35a sentence; composed from the amounts when absent. */
   craftsmanNote?: string | null;
 }
 
@@ -55,12 +55,7 @@ interface MinimalLogger {
   error(obj: unknown, msg?: string): void;
 }
 
-/**
- * Download / attachment filename for an invoice PDF:
- *   "<number>-Rechnung-<Kundenname>.pdf"  →  "CL-1426-Rechnung-Hartmann-Leu.pdf"
- * Drafts (no number yet) fall back to "Entwurf-<id>". The recipient name is
- * slugified to filename-safe ASCII-ish (umlauts collapsed to a single word).
- */
+/** "<number>-Rechnung-<Kundenname>.pdf"; drafts use "Entwurf-<id>"; the name is slugified to filename-safe ASCII. */
 export function invoicePdfFilename(numberOrRef: string, recipientName: string): string {
   const namePart = recipientName
     .trim()
@@ -76,11 +71,52 @@ export function invoicePdfFilename(numberOrRef: string, recipientName: string): 
   return `${base.replace(/[^\w.-]+/g, '_')}.pdf`;
 }
 
-/**
- * Map a company + invoice row into the fully-formatted `InvoicePdfData` the
- * renderer expects. Single source of truth so the emailed PDF, the on-screen
- * preview and the download endpoint all render byte-for-byte the same document.
- */
+/** Brand letterhead (accent, claim, seller, bank) from the company row; shared with the receipt confirmation. */
+export function letterheadFromCompany(companyRow: CompanyFull): {
+  accentColor: string;
+  claim: string | undefined;
+  seller: InvoicePdfData['seller'];
+  bank: NonNullable<InvoicePdfData['bank']>;
+} {
+  const addressLines = [
+    companyRow.addressLine1,
+    companyRow.addressLine2,
+    [companyRow.postalCode, companyRow.city].filter(Boolean).join(' ') || null,
+  ].filter((x): x is string => Boolean(x));
+  return {
+    accentColor: companyRow.primaryColor ?? '#bd5b3e',
+    // Only used without a raster wordmark; strips the brand prefix ("CLEANILO – Einfach." → "Einfach.").
+    claim: (
+      companyRow.emailSignature?.slogan ??
+      companyRow.emailSignature?.tagline ??
+      null
+    )?.replace(new RegExp(`^${companyRow.name}\\s*[–—-]\\s*`, 'i'), ''),
+    seller: {
+      name: companyRow.legalName ?? companyRow.name,
+      addressLines,
+      vatId: companyRow.vatId,
+      registrationNumber: companyRow.registrationNumber,
+      email: companyRow.email,
+      phone: companyRow.phone,
+      mobile: companyRow.mobile,
+      website: companyRow.websiteUrl ? companyRow.websiteUrl.replace(/^https?:\/\//i, '') : null,
+      // No Steuernummer on invoices; only the USt-IdNr. is shown.
+      businessId: companyRow.businessId,
+      legalForm: companyRow.legalForm,
+      managingDirectors: companyRow.managingDirectors,
+      chamber: companyRow.chamber,
+    },
+    bank: {
+      accountHolder: companyRow.accountHolder ?? companyRow.legalName ?? companyRow.name,
+      iban: companyRow.iban,
+      bic: companyRow.bic,
+      bankName: companyRow.bankName,
+      bankAddress: companyRow.bankAddress,
+    },
+  };
+}
+
+/** Single source for the emailed PDF, the preview and the download, so all render the same document. */
 export function buildInvoicePdfData(
   companyRow: CompanyFull,
   invoice: InvoiceForEmail,
@@ -94,11 +130,6 @@ export function buildInvoicePdfData(
     return y && m && d ? `${d}.${m}.${y}` : s;
   };
   const taxRate = invoice.taxCents > 0 ? invoice.taxRatePercent : 0;
-  const addressLines = [
-    companyRow.addressLine1,
-    companyRow.addressLine2,
-    [companyRow.postalCode, companyRow.city].filter(Boolean).join(' ') || null,
-  ].filter((x): x is string => Boolean(x));
 
   const recipientAddressLines = [
     invoice.recipientAddressLine1,
@@ -114,12 +145,12 @@ export function buildInvoicePdfData(
     paymentTermsDays: invoice.paymentTermsDays,
     subject: invoice.subject,
     recipientName: invoice.recipientName,
-    // DIN 5008: the company line sits above the person in the address field.
+    // DIN 5008: company line above the person.
     recipientCompany: invoice.recipientCompany ?? null,
     recipientVatId: invoice.recipientVatId ?? null,
-    // Deliberately no recipient email in the address field — DIN lang window.
+    // No recipient email in the address field (DIN lang window).
     recipientAddressLines,
-    // Single date unless a genuinely different end date is set (never "X – X").
+    // Never "X – X".
     serviceDateLabel: invoice.serviceDate
       ? invoice.serviceDateEnd && invoice.serviceDateEnd !== invoice.serviceDate
         ? `${fmtDateStr(invoice.serviceDate)} – ${fmtDateStr(invoice.serviceDateEnd)}`
@@ -138,8 +169,7 @@ export function buildInvoicePdfData(
     tax: invoice.taxCents > 0 ? formatEurFromCents(invoice.taxCents) : null,
     taxRateLabel: taxRate > 0 ? `${taxRate} %` : null,
     total: formatEurFromCents(invoice.totalCents),
-    // Stored wording wins (GoBD: reissue must reproduce what was sent); the
-    // fallback only covers rows written before the sentence was persisted.
+    // Stored wording wins (GoBD: a reissue must reproduce what was sent).
     craftsmanNote: invoice.craftsmanService
       ? (invoice.craftsmanNote ??
         craftsmanNoteText(
@@ -153,36 +183,7 @@ export function buildInvoicePdfData(
       : null,
     notes: invoice.notes,
     paymentMethod: invoice.paymentMethod ?? 'transfer',
-    accentColor: companyRow.primaryColor ?? '#bd5b3e',
-    // Only used when no raster wordmark is available — the official logos carry
-    // their claim already. "CLEANILO – Einfach. Schnell." → "Einfach. Schnell.".
-    claim: (
-      companyRow.emailSignature?.slogan ??
-      companyRow.emailSignature?.tagline ??
-      null
-    )?.replace(new RegExp(`^${companyRow.name}\\s*[–—-]\\s*`, 'i'), ''),
-    seller: {
-      name: companyRow.legalName ?? companyRow.name,
-      addressLines,
-      vatId: companyRow.vatId,
-      registrationNumber: companyRow.registrationNumber,
-      email: companyRow.email,
-      phone: companyRow.phone,
-      mobile: companyRow.mobile,
-      website: companyRow.websiteUrl ? companyRow.websiteUrl.replace(/^https?:\/\//i, '') : null,
-      // No Steuernummer on invoices — the USt-IdNr. is the only tax id shown.
-      businessId: companyRow.businessId,
-      legalForm: companyRow.legalForm,
-      managingDirectors: companyRow.managingDirectors,
-      chamber: companyRow.chamber,
-    },
-    bank: {
-      accountHolder: companyRow.accountHolder ?? companyRow.legalName ?? companyRow.name,
-      iban: companyRow.iban,
-      bic: companyRow.bic,
-      bankName: companyRow.bankName,
-      bankAddress: companyRow.bankAddress,
-    },
+    ...letterheadFromCompany(companyRow),
   };
 }
 
@@ -193,12 +194,12 @@ export async function sendInvoiceEmail(
 ): Promise<{ ok: boolean; skipped: boolean }> {
   if (!invoice.recipientEmail) return { ok: false, skipped: true };
 
-  // Invoices use the wide wordmark (invoiceLogoUrl), not the square avatar.
+  // Wide wordmark, not the square avatar.
   const logoSrc = companyRow.invoiceLogoUrl ?? companyRow.logoUrl;
   const pdfData = buildInvoicePdfData(companyRow, invoice);
   pdfData.logo = await fetchInvoiceLogo(logoSrc);
 
-  // Render the PDF attachment (best-effort — fall back to HTML-only).
+  // Best-effort; falls back to HTML-only.
   let attachments: Array<{ filename: string; content: Buffer }> | undefined;
   try {
     const pdf = await renderInvoicePdf(pdfData);
@@ -215,6 +216,7 @@ export async function sendInvoiceEmail(
   const result = await sendEmail({
     to: invoice.recipientEmail,
     from: brandSender(companyRow),
+    log: { companySlug: companyRow.slug, kind: 'invoice', refType: 'invoice', refId: invoice.id },
     apiKey: companyRow.resendApiKey ?? undefined,
     replyTo: companyRow.email ?? undefined,
     attachments,

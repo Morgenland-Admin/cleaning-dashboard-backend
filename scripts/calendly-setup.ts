@@ -1,9 +1,5 @@
 /**
- * Calendly setup + smoke test for pickup appointments. Everything here talks to
- * the live CLEANILO Calendly account, so it is the tool for the one-time setup
- * (finding the event type, registering the webhook) and for proving the
- * integration end-to-end once the token exists.
- *
+ * Calendly setup + smoke test for pickup appointments, against the LIVE CLEANILO account.
  *   node --import tsx scripts/calendly-setup.ts <command> [options]
  *
  *     whoami                       token owner + organization URIs
@@ -16,8 +12,7 @@
  *                                  book a real appointment (Berlin wall clock)
  *     cancel --event <uri>         cancel a scheduled event
  *
- * `book` creates a REAL calendar entry and mails the invitee — use a test slot
- * and your own address. Clean up with `cancel`.
+ * `book` creates a REAL calendar entry and mails the invitee: use a test slot and your own address, then `cancel`.
  */
 import crypto from 'node:crypto';
 
@@ -144,7 +139,6 @@ switch (command) {
         '--url is required, e.g. --url https://api.example.com/storefront/orders/webhook/calendly',
       );
     const me = await whoami();
-    // We generate the signing key so it can be printed once and stored in .env.
     const signingKey = crypto.randomBytes(32).toString('hex');
     const created = await api<{ resource: { uri: string; callback_url: string } }>(
       '/webhook_subscriptions',

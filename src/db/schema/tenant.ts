@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import {
   boolean,
   date,
+  doublePrecision,
   index,
   integer,
   jsonb,
@@ -99,7 +100,7 @@ function buildTenantTables(schemaName: string) {
       id: serial('id').primaryKey(),
       customerId: integer('customer_id'),
       name: text('name').notNull(),
-      // Nullable: voice-AI phone leads often have no email (phone is the contact).
+      // Null for voice-AI phone leads (phone is the contact).
       email: text('email'),
       phone: varchar('phone', { length: 32 }),
       service: text('service'),
@@ -111,16 +112,15 @@ function buildTenantTables(schemaName: string) {
       source: varchar('source', { length: 64 }),
       status: varchar('status', { length: 16 }).notNull().default('new'),
       priority: varchar('priority', { length: 16 }).notNull().default('normal'),
-      // Service PLZ (where the cleaning happens) — drives geo callback routing.
+      // Service location PLZ; drives callback geo routing.
       plz: varchar('plz', { length: 5 }),
-      // Free-text "Grund des Anrufs" captured by the inbound voice-AI.
       callReason: text('call_reason'),
-      // Geo routing: 'human' (within radius of Hamburg) | 'ai' (warm-callback
-      // queue). Null on legacy rows created before routing existed.
+      // 'human' (within radius of Hamburg) | 'ai' (warm-callback queue); null on rows predating routing.
       callbackOwner: varchar('callback_owner', { length: 8 }),
-      // User who owns a human callback. A plain user pointer (not a "Kabir"
-      // flag) so leads can be distributed across reps without a schema change.
+      // User id of the human callback owner.
       assignedTo: text('assigned_to'),
+      // Partner who accepted the dispatch offer for this inquiry.
+      assignedPartnerId: integer('assigned_partner_id'),
       consentPrivacy: boolean('consent_privacy').notNull().default(false),
       consentMarketing: boolean('consent_marketing').notNull().default(false),
       handledByUserId: text('handled_by_user_id'),
@@ -145,10 +145,8 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  // Log of emails sent to a lead from the dashboard (currently quotes/offers).
-  // Mail goes out via Resend, which never lands a copy in the brand mailbox, so
-  // this table is the in-app system of record. We persist the rendered HTML so
-  // the operator can preview exactly what the customer received.
+  // Quotes/offers emailed to a lead from the dashboard. Resend leaves no copy in the brand
+  // mailbox, so the rendered HTML is stored here for preview.
   const inquiryEmails = s.table(
     'inquiry_emails',
     {
@@ -173,45 +171,61 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  const partners = s.table('partners', {
-    id: serial('id').primaryKey(),
-    userId: text('user_id').notNull(),
-    companyName: text('company_name'),
-    legalName: text('legal_name'),
-    taxId: varchar('tax_id', { length: 32 }),
-    vatId: varchar('vat_id', { length: 32 }),
-    registrationNumber: varchar('registration_number', { length: 64 }),
-    contactEmail: text('contact_email'),
-    contactPhone: varchar('contact_phone', { length: 32 }),
-    websiteUrl: text('website_url'),
-    addressLine1: text('address_line1'),
-    addressLine2: text('address_line2'),
-    city: text('city'),
-    region: text('region'),
-    postalCode: varchar('postal_code', { length: 20 }),
-    country: varchar('country', { length: 2 }).default('DE'),
-    serviceAreas: jsonb('service_areas').$type<string[]>().notNull().default([]),
-    services: jsonb('services').$type<string[]>().notNull().default([]),
-    iban: varchar('iban', { length: 34 }),
-    bic: varchar('bic', { length: 11 }),
-    commissionRate: numeric('commission_rate', { precision: 5, scale: 2 }),
-    stripeConnectId: text('stripe_connect_id'),
-    stripeConnectStatus: varchar('stripe_connect_status', { length: 16 }).notNull().default('none'),
-    chargesEnabled: boolean('charges_enabled').notNull().default(false),
-    payoutsEnabled: boolean('payouts_enabled').notNull().default(false),
-    tier: varchar('tier', { length: 16 }).notNull().default('basic'),
-    monthlyFeeCents: integer('monthly_fee_cents').notNull().default(0),
-    rating: numeric('rating', { precision: 3, scale: 2 }),
-    ratingCount: integer('rating_count').notNull().default(0),
-    score: integer('score'),
-    status: varchar('status', { length: 16 }).notNull().default('pending'),
-    approvedAt: timestamp('approved_at', { withTimezone: true }),
-    approvedByUserId: text('approved_by_user_id'),
-    suspendedAt: timestamp('suspended_at', { withTimezone: true }),
-    internalNotes: text('internal_notes'),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-  });
+  const partners = s.table(
+    'partners',
+    {
+      id: serial('id').primaryKey(),
+      userId: text('user_id').notNull(),
+      companyName: text('company_name'),
+      legalName: text('legal_name'),
+      taxId: varchar('tax_id', { length: 32 }),
+      vatId: varchar('vat_id', { length: 32 }),
+      registrationNumber: varchar('registration_number', { length: 64 }),
+      contactEmail: text('contact_email'),
+      contactPhone: varchar('contact_phone', { length: 32 }),
+      websiteUrl: text('website_url'),
+      addressLine1: text('address_line1'),
+      addressLine2: text('address_line2'),
+      city: text('city'),
+      region: text('region'),
+      postalCode: varchar('postal_code', { length: 20 }),
+      country: varchar('country', { length: 2 }).default('DE'),
+      // Base location from the postal code centroid; matching measures from here.
+      lat: doublePrecision('lat'),
+      lng: doublePrecision('lng'),
+      serviceRadiusKm: integer('service_radius_km').notNull().default(30),
+      serviceAreas: jsonb('service_areas').$type<string[]>().notNull().default([]),
+      // service_catalog slugs the partner offers.
+      services: jsonb('services').$type<string[]>().notNull().default([]),
+      iban: varchar('iban', { length: 34 }),
+      bic: varchar('bic', { length: 11 }),
+      commissionRate: numeric('commission_rate', { precision: 5, scale: 2 }),
+      stripeConnectId: text('stripe_connect_id'),
+      stripeConnectStatus: varchar('stripe_connect_status', { length: 16 })
+        .notNull()
+        .default('none'),
+      chargesEnabled: boolean('charges_enabled').notNull().default(false),
+      payoutsEnabled: boolean('payouts_enabled').notNull().default(false),
+      tier: varchar('tier', { length: 16 }).notNull().default('basic'),
+      monthlyFeeCents: integer('monthly_fee_cents').notNull().default(0),
+      rating: numeric('rating', { precision: 3, scale: 2 }),
+      ratingCount: integer('rating_count').notNull().default(0),
+      score: integer('score'),
+      status: varchar('status', { length: 16 }).notNull().default('pending'),
+      approvedAt: timestamp('approved_at', { withTimezone: true }),
+      approvedByUserId: text('approved_by_user_id'),
+      suspendedAt: timestamp('suspended_at', { withTimezone: true }),
+      contractVersion: varchar('contract_version', { length: 32 }),
+      contractAcceptedAt: timestamp('contract_accepted_at', { withTimezone: true }),
+      internalNotes: text('internal_notes'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      userIdUnique: uniqueIndex('partners_user_id_unique').on(table.userId),
+      statusIdx: index('partners_status_idx').on(table.status),
+    }),
+  );
 
   const chatConversations = s.table(
     'chat_conversations',
@@ -331,6 +345,20 @@ function buildTenantTables(schemaName: string) {
 
       metadata: jsonb('metadata').$type<Record<string, unknown>>().notNull().default({}),
 
+      partnerPhotos: jsonb('partner_photos')
+        .$type<
+          Array<{
+            key: string;
+            name: string;
+            size: number;
+            contentType?: string;
+            stage: 'before' | 'after' | 'other';
+            uploadedAt: string;
+          }>
+        >()
+        .notNull()
+        .default([]),
+
       ipAddress: text('ip_address'),
       userAgent: text('user_agent'),
 
@@ -394,10 +422,10 @@ function buildTenantTables(schemaName: string) {
     {
       id: serial('id').primaryKey(),
       email: text('email').notNull().unique(),
-      /** Display name — derived from first/last name, falling back to the company. */
+      /** Derived from first/last name, else the company. */
       name: text('name'),
       phone: varchar('phone', { length: 32 }),
-      /** 'private' | 'business' — drives which detail fields the UI asks for. */
+      /** 'private' | 'business' */
       customerType: varchar('customer_type', { length: 8 }).notNull().default('private'),
       /** 'herr' | 'frau' | 'divers' | 'firma' */
       salutation: varchar('salutation', { length: 16 }),
@@ -415,7 +443,6 @@ function buildTenantTables(schemaName: string) {
       taxNumber: varchar('tax_number', { length: 32 }),
       /** Operator-facing customer number (Kundennummer), unique per brand. */
       customerNumber: varchar('customer_number', { length: 32 }),
-      /** Number in a legacy/external system (Odoo, old Excel, …). */
       externalNumber: varchar('external_number', { length: 64 }),
       jobPosition: text('job_position'),
       department: text('department'),
@@ -431,7 +458,7 @@ function buildTenantTables(schemaName: string) {
       loyaltyTier: varchar('loyalty_tier', { length: 16 }).notNull().default('neukunde'),
       tags: jsonb('tags').$type<string[]>().notNull().default([]),
       internalNotes: text('internal_notes'),
-      /** Preferred invoice payment term (days) for this customer; null → brand default (7). */
+      /** Payment term in days; null → brand default (7). */
       defaultPaymentTermsDays: integer('default_payment_terms_days'),
       firstOrderAt: timestamp('first_order_at', { withTimezone: true }),
       lastOrderAt: timestamp('last_order_at', { withTimezone: true }),
@@ -448,12 +475,8 @@ function buildTenantTables(schemaName: string) {
   );
 
   /**
-   * Addresses of a customer — an ERP contact can have many (invoice address,
-   * pickup/service address, shipping address). `customerId` is a logical link
-   * (plain indexed integer, no cross-schema FK), matching the customer_id
-   * convention on orders/inquiries. Exactly one row per customer carries
-   * `isDefault`; the API mirrors that row onto the customers.address_* columns
-   * so invoices, exports and emails keep reading a single flat address.
+   * Many per customer; exactly one has `isDefault` and the API mirrors it onto customers.address_*.
+   * `customerId` is a logical link (no cross-schema FK).
    */
   const customerAddresses = s.table(
     'customer_addresses',
@@ -463,9 +486,7 @@ function buildTenantTables(schemaName: string) {
       /** 'billing' | 'service' | 'shipping' */
       kind: varchar('kind', { length: 16 }).notNull().default('billing'),
       isDefault: boolean('is_default').notNull().default(false),
-      /** Free label shown in the list, e.g. "Werkstatt Speicherstadt". */
       label: text('label'),
-      /** Recipient on this address — may differ from the customer name. */
       name: text('name'),
       company: text('company'),
       addressLine1: text('address_line1'),
@@ -540,18 +561,11 @@ function buildTenantTables(schemaName: string) {
       number: varchar('number', { length: 64 }),
       orderId: integer('order_id'),
       partnerId: integer('partner_id'),
-      /**
-       * Logical link to the billed customer (plain indexed integer, no
-       * cross-schema FK) — same convention as orders.customer_id. Lets the
-       * customer record show its invoices even when the invoice was written
-       * standalone, without an order.
-       */
+      /** Logical link (no cross-schema FK), like orders.customer_id; set on standalone invoices too. */
       customerId: integer('customer_id'),
       customerType: varchar('customer_type', { length: 8 }).notNull().default('b2c'),
       recipientName: text('recipient_name').notNull(),
-      /** B2B: company line printed above the recipient name in the address field. */
       recipientCompany: text('recipient_company'),
-      /** B2B: USt-IdNr. of the recipient, printed in the invoice info block. */
       recipientVatId: varchar('recipient_vat_id', { length: 32 }),
       recipientEmail: text('recipient_email'),
       // §14 UStG: recipient postal address is mandatory on invoices > 250 EUR.
@@ -560,7 +574,6 @@ function buildTenantTables(schemaName: string) {
       recipientPostalCode: varchar('recipient_postal_code', { length: 16 }),
       recipientCity: text('recipient_city'),
       recipientCountry: varchar('recipient_country', { length: 2 }).default('DE'),
-      /** Betreff line under the invoice headline, e.g. "Teppichbodenreinigung – Premiumreinigung". */
       subject: varchar('subject', { length: 200 }),
       // §14 UStG: Leistungsdatum / Leistungszeitraum.
       serviceDate: date('service_date'),
@@ -576,22 +589,18 @@ function buildTenantTables(schemaName: string) {
         .$type<
           Array<{
             label: string;
-            /** Second line under the label on the invoice, e.g. "Premiumreinigung". */
             note?: string | null;
             quantity: number;
             unitPriceCents: number;
-            /** Render as a package/section header line (bold) on the invoice. */
+            /** Bold package header line; distinct from the invoice-level packageMode. */
             isPackage?: boolean;
           }>
         >()
         .notNull()
         .default([]),
       /**
-       * Paketrechnung: the positions only describe the scope of work (label +
-       * note + Menge) and carry no per-line price — the agreed package price is
-       * `subtotal_cents`, entered once, and only the Netto/USt/Gesamt block shows
-       * money. Line `unit_price_cents` is forced to 0 on write in this mode, so
-       * nothing downstream can print a stale figure.
+       * Paketrechnung: lines only describe scope; the package price is `subtotal_cents`, entered once.
+       * Line `unit_price_cents` is forced to 0 on write so no stale figure can print.
        */
       packageMode: boolean('package_mode').notNull().default(false),
       paymentTermsDays: integer('payment_terms_days').notNull().default(7),
@@ -608,13 +617,9 @@ function buildTenantTables(schemaName: string) {
       craftsmanService: boolean('craftsman_service').notNull().default(false),
       /** Gross (VAT-inclusive) labour share of the total, in cents. */
       laborGrossCents: integer('labor_gross_cents'),
-      /** VAT contained in `laborGrossCents` — defaults to 19 %, operator-overridable. */
+      /** VAT part of `laborGrossCents`; defaults to 19 %, operator-overridable. */
       laborVatCents: integer('labor_vat_cents'),
-      /**
-       * The §35a sentence exactly as printed. Written whenever the labour figures
-       * change and frozen at issue, so a reissued PDF reproduces the wording the
-       * customer received even if the template text changes later.
-       */
+      /** The §35a sentence as printed; frozen at issue so a reissued PDF keeps the customer's wording. */
       craftsmanNote: text('craftsman_note'),
       createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
       updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -652,8 +657,7 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  // Gapless per-year invoice number sequence (one counter row per year, per
-  // tenant). Incremented at ISSUE time so abandoned drafts never burn a number.
+  // Legacy per-year counter; numbering now runs on company.invoice_number_next.
   const invoiceCounters = s.table('invoice_counters', {
     year: integer('year').primaryKey(),
     nextValue: integer('next_value').notNull().default(0),
@@ -717,6 +721,8 @@ function buildTenantTables(schemaName: string) {
       bodyHtml: text('body_html'),
       schemaJsonld: jsonb('schema_jsonld').$type<Record<string, unknown> | unknown[]>(),
       faq: jsonb('faq').$type<Array<{ question: string; answer: string }>>().notNull().default([]),
+      // Editorial/SEO settings (excerpt, noindex, canonical, social, image alt); shape in modules/seo/blog.ts.
+      meta: jsonb('meta').$type<Record<string, unknown>>().notNull().default({}),
       status: varchar('status', { length: 16 }).notNull().default('draft'), // draft | live | protected
       gscPosition: numeric('gsc_position', { precision: 5, scale: 2 }),
       source: varchar('source', { length: 64 }),
@@ -726,6 +732,174 @@ function buildTenantTables(schemaName: string) {
     (table) => ({
       pathUnique: uniqueIndex('seo_pages_path_unique').on(table.path),
       statusTypeIdx: index('seo_pages_status_type_idx').on(table.status, table.type),
+    }),
+  );
+
+  const serviceCatalog = s.table(
+    'service_catalog',
+    {
+      id: serial('id').primaryKey(),
+      // Stable public id: storefront URL slug and partner services value.
+      slug: varchar('slug', { length: 80 }).notNull(),
+      name: text('name').notNull(),
+      category: varchar('category', { length: 64 }),
+      // 'fixed' = bookable via quote/checkout (orderKind), 'inquiry' = Anfrage → offer.
+      pricingMode: varchar('pricing_mode', { length: 16 }).notNull().default('inquiry'),
+      orderKind: varchar('order_kind', { length: 32 }),
+      description: text('description'),
+      // Default commission % for this service; partner override wins.
+      commissionRate: numeric('commission_rate', { precision: 5, scale: 2 }),
+      isActive: boolean('is_active').notNull().default(true),
+      sortOrder: integer('sort_order').notNull().default(0),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      slugUnique: uniqueIndex('service_catalog_slug_unique').on(table.slug),
+    }),
+  );
+
+  const partnerDocuments = s.table(
+    'partner_documents',
+    {
+      id: serial('id').primaryKey(),
+      partnerId: integer('partner_id')
+        .notNull()
+        .references(() => partners.id, { onDelete: 'cascade' }),
+      kind: varchar('kind', { length: 32 }).notNull(),
+      // Private S3 key under <keyPrefix>/partners/<partnerId>/; served via presigned GET only.
+      fileKey: text('file_key').notNull(),
+      fileName: text('file_name'),
+      contentType: varchar('content_type', { length: 80 }),
+      sizeBytes: integer('size_bytes'),
+      status: varchar('status', { length: 16 }).notNull().default('pending'),
+      rejectionReason: text('rejection_reason'),
+      expiresAt: date('expires_at'),
+      uploadedByUserId: text('uploaded_by_user_id'),
+      reviewedByUserId: text('reviewed_by_user_id'),
+      reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      partnerIdx: index('partner_documents_partner_id_idx').on(table.partnerId),
+    }),
+  );
+
+  // Append-only proof of which contract version was accepted, when and from where.
+  const partnerContractAcceptances = s.table(
+    'partner_contract_acceptances',
+    {
+      id: serial('id').primaryKey(),
+      partnerId: integer('partner_id')
+        .notNull()
+        .references(() => partners.id, { onDelete: 'cascade' }),
+      version: varchar('version', { length: 32 }).notNull(),
+      acceptedByUserId: text('accepted_by_user_id').notNull(),
+      ipAddress: text('ip_address'),
+      userAgent: text('user_agent'),
+      acceptedAt: timestamp('accepted_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      partnerIdx: index('partner_contract_acceptances_partner_id_idx').on(table.partnerId),
+    }),
+  );
+
+  const partnerApplications = s.table(
+    'partner_applications',
+    {
+      id: serial('id').primaryKey(),
+      companyName: text('company_name').notNull(),
+      contactName: text('contact_name').notNull(),
+      email: text('email').notNull(),
+      phone: varchar('phone', { length: 32 }),
+      websiteUrl: text('website_url'),
+      legalForm: varchar('legal_form', { length: 64 }),
+      postalCode: varchar('postal_code', { length: 5 }).notNull(),
+      city: text('city'),
+      serviceRadiusKm: integer('service_radius_km').notNull().default(30),
+      services: jsonb('services').$type<string[]>().notNull().default([]),
+      employeeCount: varchar('employee_count', { length: 16 }),
+      message: text('message'),
+      // 'new' | 'invited' | 'rejected'
+      status: varchar('status', { length: 16 }).notNull().default('new'),
+      rejectionReason: text('rejection_reason'),
+      invitedAt: timestamp('invited_at', { withTimezone: true }),
+      handledByUserId: text('handled_by_user_id'),
+      consentPrivacy: boolean('consent_privacy').notNull().default(false),
+      source: varchar('source', { length: 64 }),
+      ipAddress: text('ip_address'),
+      userAgent: text('user_agent'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      statusIdx: index('partner_applications_status_idx').on(table.status, table.createdAt),
+    }),
+  );
+
+  // One partner, one job (order or inquiry). Customer contact data is released only on accept.
+  const partnerOffers = s.table(
+    'partner_offers',
+    {
+      id: serial('id').primaryKey(),
+      partnerId: integer('partner_id')
+        .notNull()
+        .references(() => partners.id, { onDelete: 'cascade' }),
+      orderId: integer('order_id'),
+      inquiryId: integer('inquiry_id'),
+      // 'offered' | 'accepted' | 'declined' | 'expired' | 'withdrawn'
+      status: varchar('status', { length: 16 }).notNull().default('offered'),
+      note: text('note'),
+      expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+      distanceKm: doublePrecision('distance_km'),
+      respondedAt: timestamp('responded_at', { withTimezone: true }),
+      declineReason: text('decline_reason'),
+      // Partner's price proposal (gross cents) for inquiry offers.
+      proposedPriceCents: integer('proposed_price_cents'),
+      partnerNote: text('partner_note'),
+      createdByUserId: text('created_by_user_id'),
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+      updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      partnerStatusIdx: index('partner_offers_partner_status_idx').on(
+        table.partnerId,
+        table.status,
+      ),
+      orderIdx: index('partner_offers_order_id_idx').on(table.orderId),
+      inquiryIdx: index('partner_offers_inquiry_id_idx').on(table.inquiryId),
+      statusExpiresIdx: index('partner_offers_status_expires_idx').on(
+        table.status,
+        table.expiresAt,
+      ),
+    }),
+  );
+
+  // Raw rows from a retired system, kept until an admin deletes them (one row per source record).
+  const legacyRecords = s.table(
+    'legacy_records',
+    {
+      id: serial('id').primaryKey(),
+      // e.g. 'cleanilo_ops' | 'cleanilo_cms'
+      source: varchar('source', { length: 32 }).notNull(),
+      legacyTable: varchar('legacy_table', { length: 96 }).notNull(),
+      legacyId: varchar('legacy_id', { length: 128 }).notNull(),
+      data: jsonb('data').$type<Record<string, unknown>>().notNull(),
+      legacyCreatedAt: timestamp('legacy_created_at', { withTimezone: true }),
+      importedAt: timestamp('imported_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => ({
+      sourceKeyUnique: uniqueIndex('legacy_records_source_key_unique').on(
+        table.source,
+        table.legacyTable,
+        table.legacyId,
+      ),
+      tableCreatedIdx: index('legacy_records_table_created_idx').on(
+        table.source,
+        table.legacyTable,
+        table.legacyCreatedAt,
+      ),
     }),
   );
 
@@ -752,12 +926,17 @@ function buildTenantTables(schemaName: string) {
     cityStatus,
     priceAdjustments,
     seoPages,
+    serviceCatalog,
+    partnerDocuments,
+    partnerContractAcceptances,
+    partnerApplications,
+    partnerOffers,
+    legacyRecords,
   };
 }
 
 export type TenantTables = ReturnType<typeof buildTenantTables>;
 
-/** Memoized accessor — admin-created companies resolve their tables at runtime. */
 const tenantCache = new Map<string, TenantTables>();
 export function getTenantTables(schemaName: string): TenantTables {
   let cached = tenantCache.get(schemaName);
@@ -1349,6 +1528,7 @@ CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
   "body_html" text,
   "schema_jsonld" jsonb,
   "faq" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "meta" jsonb DEFAULT '{}'::jsonb NOT NULL,
   "status" varchar(16) DEFAULT 'draft' NOT NULL,
   "gsc_position" numeric(5, 2),
   "source" varchar(64),
@@ -1359,6 +1539,7 @@ CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
 CREATE INDEX IF NOT EXISTS "seo_pages_status_type_idx" ON ${q}."seo_pages" ("status", "type");
 ALTER TABLE ${q}."seo_pages" ADD COLUMN IF NOT EXISTS "category" varchar(64);
 CREATE INDEX IF NOT EXISTS "seo_pages_category_idx" ON ${q}."seo_pages" ("category");
+ALTER TABLE ${q}."seo_pages" ADD COLUMN IF NOT EXISTS "meta" jsonb DEFAULT '{}'::jsonb NOT NULL;
 
 -- ── Customer 360: richer profile + customer_id links across source tables ──
 -- Self-healing for schemas predating these columns (idempotent).
@@ -1416,6 +1597,130 @@ ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "assigned_to" text
 ALTER TABLE ${q}."service_inquiries" ALTER COLUMN "email" DROP NOT NULL;
 -- Index AFTER the ALTER above or the batch aborts on legacy schemas.
 CREATE INDEX IF NOT EXISTS "service_inquiries_callback_owner_idx" ON ${q}."service_inquiries" ("callback_owner");
+
+-- ── Partner marketplace: geo matching, contract, documents, applications, dispatch offers ──
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "lat" double precision;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "lng" double precision;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "service_radius_km" integer DEFAULT 30 NOT NULL;
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "contract_version" varchar(32);
+ALTER TABLE ${q}."partners" ADD COLUMN IF NOT EXISTS "contract_accepted_at" timestamp with time zone;
+CREATE INDEX IF NOT EXISTS "partners_status_idx" ON ${q}."partners" ("status");
+-- Skipped (not failed) while duplicate rows exist, so boot never aborts on legacy data.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM ${q}."partners" GROUP BY "user_id" HAVING count(*) > 1) THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS "partners_user_id_unique" ON ${q}."partners" ("user_id");
+  END IF;
+END $$;
+ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "assigned_partner_id" integer;
+ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "partner_photos" jsonb DEFAULT '[]'::jsonb NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ${q}."service_catalog" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "slug" varchar(80) NOT NULL,
+  "name" text NOT NULL,
+  "category" varchar(64),
+  "pricing_mode" varchar(16) DEFAULT 'inquiry' NOT NULL,
+  "order_kind" varchar(32),
+  "description" text,
+  "commission_rate" numeric(5, 2),
+  "is_active" boolean DEFAULT true NOT NULL,
+  "sort_order" integer DEFAULT 0 NOT NULL,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "service_catalog_slug_unique" ON ${q}."service_catalog" ("slug");
+
+CREATE TABLE IF NOT EXISTS ${q}."partner_documents" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "partner_id" integer NOT NULL REFERENCES ${q}."partners"("id") ON DELETE CASCADE,
+  "kind" varchar(32) NOT NULL,
+  "file_key" text NOT NULL,
+  "file_name" text,
+  "content_type" varchar(80),
+  "size_bytes" integer,
+  "status" varchar(16) DEFAULT 'pending' NOT NULL,
+  "rejection_reason" text,
+  "expires_at" date,
+  "uploaded_by_user_id" text,
+  "reviewed_by_user_id" text,
+  "reviewed_at" timestamp with time zone,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "partner_documents_partner_id_idx" ON ${q}."partner_documents" ("partner_id");
+
+CREATE TABLE IF NOT EXISTS ${q}."partner_contract_acceptances" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "partner_id" integer NOT NULL REFERENCES ${q}."partners"("id") ON DELETE CASCADE,
+  "version" varchar(32) NOT NULL,
+  "accepted_by_user_id" text NOT NULL,
+  "ip_address" text,
+  "user_agent" text,
+  "accepted_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "partner_contract_acceptances_partner_id_idx" ON ${q}."partner_contract_acceptances" ("partner_id");
+
+CREATE TABLE IF NOT EXISTS ${q}."partner_applications" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "company_name" text NOT NULL,
+  "contact_name" text NOT NULL,
+  "email" text NOT NULL,
+  "phone" varchar(32),
+  "website_url" text,
+  "legal_form" varchar(64),
+  "postal_code" varchar(5) NOT NULL,
+  "city" text,
+  "service_radius_km" integer DEFAULT 30 NOT NULL,
+  "services" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "employee_count" varchar(16),
+  "message" text,
+  "status" varchar(16) DEFAULT 'new' NOT NULL,
+  "rejection_reason" text,
+  "invited_at" timestamp with time zone,
+  "handled_by_user_id" text,
+  "consent_privacy" boolean DEFAULT false NOT NULL,
+  "source" varchar(64),
+  "ip_address" text,
+  "user_agent" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "partner_applications_status_idx" ON ${q}."partner_applications" ("status", "created_at");
+
+CREATE TABLE IF NOT EXISTS ${q}."partner_offers" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "partner_id" integer NOT NULL REFERENCES ${q}."partners"("id") ON DELETE CASCADE,
+  "order_id" integer,
+  "inquiry_id" integer,
+  "status" varchar(16) DEFAULT 'offered' NOT NULL,
+  "note" text,
+  "expires_at" timestamp with time zone NOT NULL,
+  "distance_km" double precision,
+  "responded_at" timestamp with time zone,
+  "decline_reason" text,
+  "proposed_price_cents" integer,
+  "partner_note" text,
+  "created_by_user_id" text,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+  CONSTRAINT "partner_offers_one_target" CHECK (("order_id" IS NULL) <> ("inquiry_id" IS NULL))
+);
+CREATE INDEX IF NOT EXISTS "partner_offers_partner_status_idx" ON ${q}."partner_offers" ("partner_id", "status");
+CREATE INDEX IF NOT EXISTS "partner_offers_order_id_idx" ON ${q}."partner_offers" ("order_id");
+CREATE INDEX IF NOT EXISTS "partner_offers_inquiry_id_idx" ON ${q}."partner_offers" ("inquiry_id");
+CREATE INDEX IF NOT EXISTS "partner_offers_status_expires_idx" ON ${q}."partner_offers" ("status", "expires_at");
+
+CREATE TABLE IF NOT EXISTS ${q}."legacy_records" (
+  "id" serial PRIMARY KEY NOT NULL,
+  "source" varchar(32) NOT NULL,
+  "legacy_table" varchar(96) NOT NULL,
+  "legacy_id" varchar(128) NOT NULL,
+  "data" jsonb NOT NULL,
+  "legacy_created_at" timestamp with time zone,
+  "imported_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "legacy_records_source_key_unique" ON ${q}."legacy_records" ("source", "legacy_table", "legacy_id");
+CREATE INDEX IF NOT EXISTS "legacy_records_table_created_idx" ON ${q}."legacy_records" ("source", "legacy_table", "legacy_created_at");
 
 -- Backfill: every email across the source tables becomes a customer (lower-cased,
 -- de-duplicated). ON CONFLICT keeps the existing row — never overwrites manual edits.

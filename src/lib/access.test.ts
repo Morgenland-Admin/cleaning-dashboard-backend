@@ -10,7 +10,6 @@ test('isPrivileged: manager and up, nothing else', () => {
   assert.equal(isPrivileged('viewer'), false);
   assert.equal(isPrivileged('none'), false);
   assert.equal(isPrivileged(undefined), false);
-  // Not a level we issue — must not be treated as privileged by accident.
   assert.equal(isPrivileged('owner'), false);
 });
 
@@ -41,7 +40,6 @@ test('redactForViewer: a viewer loses notes, forensics and processor ids', () =>
   assert.equal(out.stripePaymentIntentId, null);
   assert.equal(out.paypalOrderId, null);
   assert.equal(out.paypalCaptureId, null);
-  // The operational record survives — a viewer still has to do the job.
   assert.equal(out.customerName, 'Anna');
   assert.equal(out.customerEmail, 'anna@example.com');
 });
@@ -66,7 +64,6 @@ test('redactListForViewer: redacts every row for a viewer', () => {
   const rows = [{ internalNotes: 'a' }, { internalNotes: 'b' }];
   const out = redactListForViewer(rows, 'viewer');
   assert.deepEqual(out, [{ internalNotes: null }, { internalNotes: null }]);
-  // input untouched
   assert.deepEqual(rows, [{ internalNotes: 'a' }, { internalNotes: 'b' }]);
 });
 

@@ -2,14 +2,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { LEGACY_BOOTSTRAP, type LegacyConfig } from '../db/bootstrap-companies.js';
 import { brandInfoFromCompany } from './service.js';
-import { contactReplyEmail, inquiryQuoteEmail, orderMessageEmail } from './templates.js';
+import {
+  contactReplyEmail,
+  customerMessageEmail,
+  formalGreeting,
+  inquiryQuoteEmail,
+  orderMessageEmail,
+} from './templates.js';
 
-// Guards the rule Kabir asked for: mail an operator sends from the dashboard
-// (contact reply, offer, order message) signs as the BRAND — the signatory
-// configured on the company row — and never as the logged-in dashboard user
-// ("Admin"). The operator's name stays in the internal audit log only.
+// Operator-sent mail signs as the brand's configured signatory, never as the dashboard user ("Admin").
 
-/** The subset of the company row the brand templates read, from the boot seed. */
 function brandFromSeed(cfg: LegacyConfig) {
   return brandInfoFromCompany({
     name: cfg.name,
@@ -29,7 +31,6 @@ function brandFromSeed(cfg: LegacyConfig) {
   });
 }
 
-/** The three operator-composed customer mails, rendered for one brand. */
 function operatorMails(cfg: LegacyConfig): Record<string, string> {
   const brand = brandFromSeed(cfg);
   return {
@@ -51,13 +52,18 @@ function operatorMails(cfg: LegacyConfig): Record<string, string> {
       quoteBody: 'Reinigung von 2 Teppichen.',
       quotedAmount: '180,00 €',
     }).html,
+    customer_message: customerMessageEmail({
+      brand,
+      recipient: { salutation: 'frau', lastName: 'Beispiel' },
+      subject: 'Ihr Termin',
+      messageBody: 'Wir melden uns morgen.',
+    }).html,
   };
 }
 
 for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
   test(`${cfg.slug}: operator mail signs with the brand signature`, () => {
-    // Every brand must carry a seeded sign-off — the derived fallback exists for
-    // brands created later, not for the three legacy ones.
+    // The derived fallback is for later-created brands; the three legacy ones must be seeded.
     const sig = cfg.emailSignature;
     assert.ok(sig, `${cfg.slug} has no emailSignature in the boot seed`);
     const signatory = sig.signatory;
@@ -69,8 +75,7 @@ for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
         html.includes(sig.signOff ?? 'Mit freundlichen Grüßen'),
         `${kind} has no closing line`,
       );
-      // The brand's own name and the GbR's legal name still appear (header /
-      // Pflichtangaben footer), but no dashboard login name may show up.
+      // Brand and GbR legal names may appear; operator login names may not.
       for (const operator of ['Admin', 'Rohan']) {
         assert.ok(!html.includes(operator), `${kind} leaks the operator name "${operator}"`);
       }
@@ -79,8 +84,7 @@ for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
 }
 
 test('a brand with no configured signature signs as its own team, not the operator', () => {
-  // Simulates a company created via POST /admin/companies before anyone seeded
-  // an email_signature for it.
+  // Company created via POST /admin/companies before any email_signature was seeded.
   const brand = brandInfoFromCompany({
     name: 'Neue Marke',
     senderEmail: 'info@neue-marke.de',
@@ -106,4 +110,21 @@ test('a brand with no configured signature signs as its own team, not the operat
   assert.ok(html.includes('www.neue-marke.de'));
   assert.ok(html.includes('Zentrale: Brook 9, 20457 Hamburg'));
   assert.ok(!html.includes('Admin'));
+});
+
+test('customer mail greets formally and never invents a name', () => {
+  assert.equal(
+    formalGreeting({ salutation: 'herr', lastName: 'Muster' }),
+    'Sehr geehrter Herr Muster,',
+  );
+  assert.equal(
+    formalGreeting({ salutation: 'frau', lastName: 'Muster' }),
+    'Sehr geehrte Frau Muster,',
+  );
+  assert.equal(
+    formalGreeting({ salutation: 'firma', name: 'ACME GmbH' }),
+    'Sehr geehrte Damen und Herren,',
+  );
+  assert.equal(formalGreeting({ firstName: 'Anna', lastName: 'Muster' }), 'Guten Tag Anna Muster,');
+  assert.equal(formalGreeting({ name: null }), 'Guten Tag,');
 });

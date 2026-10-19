@@ -115,40 +115,42 @@ export const company = pgTable('company', {
   country: varchar('country', { length: 2 }).default('DE'),
   vatId: varchar('vat_id', { length: 32 }),
   registrationNumber: varchar('registration_number', { length: 64 }),
-  // German invoice Pflichtangaben shown in the PDF header/footer.
-  taxNumber: varchar('tax_number', { length: 32 }), // Steuernummer
+  taxNumber: varchar('tax_number', { length: 32 }), // Steuernummer; not printed on invoices
   businessId: varchar('business_id', { length: 32 }), // Betriebsnummer
   legalForm: varchar('legal_form', { length: 64 }), // Rechtsform, e.g. GbR
   managingDirectors: text('managing_directors'), // Geschäftsführer / Inhaber
-  chamber: text('chamber'), // e.g. "Handwerkskammer Hamburg"
+  chamber: text('chamber'),
   mobile: varchar('mobile', { length: 32 }),
-  // Bank details for the seller's own invoicing (Bankverbindung on Rechnungen +
-  // Mahnungen). Per-brand so each legal entity can carry its own account.
   accountHolder: text('account_holder'),
   iban: varchar('iban', { length: 34 }),
   bic: varchar('bic', { length: 11 }),
   bankName: text('bank_name'),
   bankAddress: text('bank_address'),
-  // Per-brand invoice number series "<prefix>-<n>" (e.g. "CL-1426"), a continuous
-  // counter bumped atomically at issue time (see modules/invoices/number.ts).
+  // Per-brand counter "<prefix>-<n>" (e.g. "CL-1426"), bumped atomically at issue (modules/invoices/number.ts).
   // Nullable so the boot seed can coalesce a start value without resetting a live counter.
   invoiceNumberPrefix: varchar('invoice_number_prefix', { length: 8 }),
   invoiceNumberNext: integer('invoice_number_next'),
-  // Rich per-brand email sign-off (support hours, HQ, tagline, review CTA, …).
   emailSignature: jsonb('email_signature').$type<EmailSignature>(),
   logoUrl: text('logo_url'),
-  // Wide wordmark for invoices/dunning (PDF + email header). Falls back to
-  // logoUrl (the square dashboard avatar) when unset.
+  // Wide wordmark for invoice PDF + email header; falls back to logoUrl (square avatar).
   invoiceLogoUrl: text('invoice_logo_url'),
   primaryColor: varchar('primary_color', { length: 9 }),
   senderEmail: text('sender_email'),
   senderName: text('sender_name'),
   resendApiKey: text('resend_api_key'),
+  // Signing secret of this brand's Resend webhook; never returned over the API.
+  resendWebhookSecret: text('resend_webhook_secret'),
   keyPrefix: varchar('key_prefix', { length: 64 }),
   storefrontOrigin: text('storefront_origin'),
-  // Whether a paid order's automatic invoice issues + emails itself right away.
-  // Off = it stays a draft, so an operator can add positions agreed after the
-  // booking (a repair, say) and finalise once. See modules/invoices/from-order.ts.
+  // Extra storefront origins (e.g. apex next to the canonical www) allowed in CORS; links use storefrontOrigin.
+  storefrontAliases: jsonb('storefront_aliases').$type<string[]>().notNull().default([]),
+  // Partner portal origin (e.g. https://partner.cleanilo.de): CORS, auth trusted origin, partner mail/push links.
+  partnerPortalOrigin: text('partner_portal_origin'),
+  // Contract version partners must accept before they are verified; null = no contract step.
+  partnerContractVersion: varchar('partner_contract_version', { length: 32 }),
+  partnerContractUrl: text('partner_contract_url'),
+  // Off = a paid order's automatic invoice stays a draft so an operator can add positions
+  // agreed after booking, then finalise (modules/invoices/from-order.ts).
   autoIssueInvoices: boolean('auto_issue_invoices').notNull().default(true),
   isActive: boolean('is_active').notNull().default(true),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -280,12 +282,7 @@ export const exportJobs = pgTable(
   }),
 );
 
-/**
- * Per-brand overrides for the "✦ Claude" assistant prompts. A row exists only
- * when an operator edited that kind — absent means the code default is used, so
- * resetting is a delete. Only the instruction text is stored; the output-format
- * rules are appended server-side and are not editable.
- */
+/** Per-brand "✦ Claude" prompt overrides; no row = code default. Output-format rules are appended server-side, not stored. */
 export const aiPrompts = pgTable(
   'ai_prompts',
   {
@@ -303,5 +300,63 @@ export const aiPrompts = pgTable(
   },
   (t) => ({
     brandKindUnique: uniqueIndex('ai_prompts_brand_kind_unique_idx').on(t.companySlug, t.kind),
+  }),
+);
+
+/** One Resend webhook event as kept on an `email_log` row. */
+export interface EmailLogEvent {
+  /** Resend event type without the "email." prefix, e.g. "delivered". */
+  type: string;
+  /** ISO 8601, as reported by Resend. */
+  at: string;
+  /** Bounce / failure / suppression reason, or the clicked link. */
+  detail?: string;
+}
+
+/**
+ * One row per send, written by `sendEmail`; delivery columns come from the Resend webhook
+ * (modules/emails/webhook.ts). Permanent record: Resend keeps only 30 days, per brand account.
+ */
+export const emailLog = pgTable(
+  'email_log',
+  {
+    id: serial('id').primaryKey(),
+    // Null = platform mail that belongs to no brand (password reset).
+    companySlug: varchar('company_slug', { length: 63 }).references(() => company.slug, {
+      onDelete: 'set null',
+    }),
+    kind: varchar('kind', { length: 32 }).notNull(),
+    toAddress: text('to_address').notNull(),
+    fromAddress: text('from_address').notNull(),
+    replyTo: text('reply_to'),
+    subject: text('subject').notNull(),
+    // Body as sent; null for mail carrying a live secret (reset, invite, opt-in link), see email/log.ts.
+    html: text('html'),
+    attachments: jsonb('attachments')
+      .$type<Array<{ filename: string; size: number }>>()
+      .notNull()
+      .default([]),
+    // 'sending' | 'sent' | 'failed' | 'skipped' (no Resend key) | 'blocked' (placeholder address).
+    status: varchar('status', { length: 16 }).notNull().default('sending'),
+    error: text('error'),
+    resendId: text('resend_id'),
+    // Latest Resend state: 'sent' | 'delivered' | 'delivery_delayed' | 'bounced' | 'complained' | 'failed' | 'suppressed'.
+    deliveryStatus: varchar('delivery_status', { length: 24 }),
+    deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+    openedAt: timestamp('opened_at', { withTimezone: true }),
+    clickedAt: timestamp('clicked_at', { withTimezone: true }),
+    events: jsonb('events').$type<EmailLogEvent[]>().notNull().default([]),
+    // Subject row in the brand's tenant schema: 'order' | 'invoice' | 'inquiry' | 'contact' | 'task'.
+    refType: varchar('ref_type', { length: 16 }),
+    refId: integer('ref_id'),
+    sentByUserId: text('sent_by_user_id').references(() => user.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    brandCreatedIdx: index('email_log_brand_created_idx').on(t.companySlug, t.createdAt),
+    createdIdx: index('email_log_created_idx').on(t.createdAt),
+    resendIdUnique: uniqueIndex('email_log_resend_id_unique_idx').on(t.resendId),
+    refIdx: index('email_log_ref_idx').on(t.companySlug, t.refType, t.refId),
   }),
 );

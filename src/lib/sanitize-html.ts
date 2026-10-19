@@ -1,8 +1,7 @@
 import sanitize from 'sanitize-html';
 
-// Allowlist sanitizer for stored SEO/blog bodyHtml (served raw to public
-// storefronts). Anything not explicitly permitted is dropped, which closes the
-// entity-encoded-scheme and novel-vector bypasses a blocklist can't.
+// Allowlist sanitizer for stored SEO/blog bodyHtml (served raw to public storefronts): anything not permitted is dropped,
+// which closes the entity-encoded-scheme bypasses a blocklist misses.
 export function sanitizeHtml(input: string): string {
   return sanitize(input, {
     allowedTags: [
@@ -49,8 +48,7 @@ export function sanitizeHtml(input: string): string {
       img: ['src', 'alt', 'title', 'width', 'height', 'loading'],
       th: ['colspan', 'rowspan', 'scope'],
       td: ['colspan', 'rowspan'],
-      // `style` survives only as text-align (see allowedStyles) — the dashboard
-      // editor's alignment buttons. Every other declaration is dropped.
+      // `style` survives only as text-align (editor alignment buttons); other declarations are dropped.
       '*': ['id', 'class', 'style'],
     },
     allowedStyles: {
@@ -58,9 +56,7 @@ export function sanitizeHtml(input: string): string {
     },
     allowedSchemes: ['http', 'https', 'mailto', 'tel'],
     allowedSchemesByTag: { img: ['http', 'https'] },
-    // Force a safe rel on links that leave the site. Site-relative links (the
-    // internal linking SEO pages exist for) keep their equity — a blanket
-    // nofollow here would silently defeat it.
+    // Safe rel on external links only: internal links keep their link equity, so no blanket nofollow.
     transformTags: {
       a: (tagName, attribs) => {
         const href = attribs.href ?? '';

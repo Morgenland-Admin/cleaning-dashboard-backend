@@ -6,21 +6,14 @@ import { db } from '../../db/index.js';
 import { company, membership } from '../../db/schema/shared.js';
 import { getTenantTables } from '../../db/schema/tenant.js';
 import { accessLevelOf } from '../../lib/access.js';
+import { isImportedSource, senderLabel } from '../../lib/inbox.js';
+import { isNonContactableEmail } from '../../email/service.js';
 
-/**
- * Cross-brand, cross-entity lookup for the dashboard's ⌘K palette.
- *
- * Deliberately read-only and deliberately shallow: it returns just enough to
- * render a row and route to it. The palette is for "find that order" — the
- * per-page filters remain the tool for working a list.
- *
- * Scope is the caller's own brands (all active brands for a super_admin), so this
- * cannot become a way to read across a tenant boundary.
- */
+// Cross-brand lookup for the ⌘K palette: read-only and shallow (enough to render a row and route to it).
+// Scope is the caller's own brands (all active for a super_admin), so it cannot read across a tenant boundary.
 
 const querySchema = z.object({
   q: z.string().trim().min(2).max(120),
-  /** Cap per entity kind, per brand. Small on purpose — this is a picker. */
   limit: z.coerce.number().int().min(1).max(10).default(5),
 });
 
@@ -31,25 +24,31 @@ interface SearchHit {
   companySlug: string;
   companyName: string;
   id: number;
-  /** Primary line, e.g. an order number or a customer name. */
+  /** May be '' when a row has no usable name; the client shows its own label then. */
   title: string;
-  /** Secondary line — who or what it concerns. */
   subtitle: string | null;
-  /** Right-aligned meta, e.g. a status or an amount. */
   meta: string | null;
-  /** Dashboard path the palette navigates to. */
   href: string;
+  /** Raw status slug; the client translates it. */
+  status: string | null;
+  /** Order kind slug (service-catalog slugs on imported orders). */
+  orderKind?: string | null;
+  /** Written by a data import (old system history). */
+  imported: boolean;
 }
 
-/** Escape LIKE metacharacters so a literal "%" doesn't match everything. */
+/** Real e-mail address, or null for the import placeholders. */
+function contactable(email: string | null | undefined): string | null {
+  const e = email?.trim();
+  return e && !isNonContactableEmail(e) ? e : null;
+}
+
 function likeTerm(q: string): string {
   return `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
 }
 
-/** Largest value a Postgres int4 id can hold — longer digit runs can't be an id. */
 const MAX_INT4 = 2147483647;
 
-/** "3734" and "#3734" both mean "the row with this id". */
 function asId(q: string): number | null {
   const m = /^#?(\d{1,10})$/.exec(q);
   if (!m) return null;
@@ -57,12 +56,8 @@ function asId(q: string): number | null {
   return n <= MAX_INT4 ? n : null;
 }
 
-/**
- * Orders display `YYYY/NNNNNN`, and for rows without a persisted `order_number`
- * that string is *derived* from the id — so it cannot be matched with a LIKE.
- * Parse it back to the id instead, otherwise searching for the number printed on
- * the screen finds nothing.
- */
+// Orders without a stored order_number display a number (YYYY/NNNNNN) derived from the id, so LIKE can't match it:
+// parse it back to the id.
 function orderNumberToId(q: string): number | null {
   const m = /^(\d{4})\s*\/\s*(\d{1,6})$/.exec(q.trim());
   if (!m) return null;
@@ -70,7 +65,19 @@ function orderNumberToId(q: string): number | null {
   return n > 0 && n <= MAX_INT4 ? n : null;
 }
 
-/** Same display format the orders module uses, for rows with no stored number. */
+// "ANF-2026-000123" (the inquiry number on screen) addresses the row id.
+function inquiryNumberToId(q: string): number | null {
+  const m = /^ANF-\d{4}-0*(\d{1,10})$/i.exec(q.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n > 0 && n <= MAX_INT4 ? n : null;
+}
+
+function formatInquiryNumber(id: number, createdAt: Date): string {
+  return `ANF-${createdAt.getUTCFullYear()}-${String(id).padStart(6, '0')}`;
+}
+
+// Same display format the orders module uses for rows with no stored number.
 function displayOrderNumber(row: { id: number; orderNumber: string | null; createdAt: Date }) {
   return row.orderNumber ?? `${row.createdAt.getUTCFullYear()}/${String(row.id).padStart(6, '0')}`;
 }
@@ -90,7 +97,6 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
       const userId = request.authUser!.id;
       const level = accessLevelOf(request);
 
-      // A super_admin sees every active brand; everyone else only their own.
       const brands =
         level === 'super_admin'
           ? await db
@@ -108,10 +114,9 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
       const like = likeTerm(q);
       const id = asId(q);
       const derivedOrderId = orderNumberToId(q);
+      const inquiryId = inquiryNumberToId(q);
 
-      // Per brand: five small, independent lookups. Every one is indexed on the
-      // columns it filters, and each is capped at `limit`, so the total work is
-      // bounded by brands × 5 × limit regardless of table size.
+      // Five small indexed lookups per brand, each capped at `limit`: work is bounded by brands × 5 × limit.
       const perBrand = await Promise.all(
         brands.map(async (brand): Promise<SearchHit[]> => {
           const t = getTenantTables(brand.schemaName);
@@ -124,8 +129,11 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 orderNumber: t.orders.orderNumber,
                 customerName: t.orders.customerName,
                 customerEmail: t.orders.customerEmail,
+                customerPhone: t.orders.customerPhone,
+                kind: t.orders.kind,
                 status: t.orders.status,
                 totalCents: t.orders.totalCents,
+                source: t.orders.source,
                 createdAt: t.orders.createdAt,
               })
               .from(t.orders)
@@ -134,6 +142,7 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                   ilike(t.orders.orderNumber, like),
                   ilike(t.orders.customerName, like),
                   ilike(t.orders.customerEmail, like),
+                  ilike(t.orders.customerPhone, like),
                   ...(id ? [eq(t.orders.id, id)] : []),
                   ...(derivedOrderId ? [eq(t.orders.id, derivedOrderId)] : []),
                 ),
@@ -148,6 +157,7 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 companyName: t.customers.companyName,
                 customerNumber: t.customers.customerNumber,
                 phone: t.customers.phone,
+                tags: t.customers.tags,
               })
               .from(t.customers)
               .where(
@@ -167,8 +177,11 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 id: t.serviceInquiries.id,
                 name: t.serviceInquiries.name,
                 email: t.serviceInquiries.email,
+                phone: t.serviceInquiries.phone,
                 service: t.serviceInquiries.service,
+                callReason: t.serviceInquiries.callReason,
                 status: t.serviceInquiries.status,
+                source: t.serviceInquiries.source,
                 createdAt: t.serviceInquiries.createdAt,
               })
               .from(t.serviceInquiries)
@@ -176,8 +189,10 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 or(
                   ilike(t.serviceInquiries.name, like),
                   ilike(t.serviceInquiries.email, like),
+                  ilike(t.serviceInquiries.phone, like),
                   ilike(t.serviceInquiries.service, like),
                   ...(id ? [eq(t.serviceInquiries.id, id)] : []),
+                  ...(inquiryId ? [eq(t.serviceInquiries.id, inquiryId)] : []),
                 ),
               )
               .orderBy(desc(t.serviceInquiries.createdAt))
@@ -187,8 +202,10 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 id: t.contactMessages.id,
                 name: t.contactMessages.name,
                 email: t.contactMessages.email,
+                phone: t.contactMessages.phone,
                 subject: t.contactMessages.subject,
                 status: t.contactMessages.status,
+                source: t.contactMessages.source,
               })
               .from(t.contactMessages)
               .where(
@@ -196,6 +213,7 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                   ilike(t.contactMessages.name, like),
                   ilike(t.contactMessages.email, like),
                   ilike(t.contactMessages.subject, like),
+                  ilike(t.contactMessages.phone, like),
                   ...(id ? [eq(t.contactMessages.id, id)] : []),
                 ),
               )
@@ -250,9 +268,12 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 kind: 'order',
                 id: o.id,
                 title: displayOrderNumber(o),
-                subtitle: o.customerName || o.customerEmail || null,
-                meta: centsToEuro(o.totalCents) ?? o.status,
-                href: `/auftraege?order=${o.id}`,
+                subtitle: senderLabel(o.customerName, o.customerPhone, o.customerEmail) || null,
+                meta: centsToEuro(o.totalCents),
+                href: `/auftraege/${o.id}`,
+                status: o.status,
+                orderKind: o.kind,
+                imported: isImportedSource(o.source),
               }),
             ),
             ...customers.map(
@@ -260,10 +281,17 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 ...base,
                 kind: 'customer',
                 id: c.id,
-                title: c.name || c.companyName || c.email,
-                subtitle: c.email,
+                title:
+                  c.name?.trim() ||
+                  c.companyName?.trim() ||
+                  c.phone?.trim() ||
+                  contactable(c.email) ||
+                  '',
+                subtitle: contactable(c.email) ?? c.phone,
                 meta: c.customerNumber,
                 href: `/customers/${c.id}`,
+                status: null,
+                imported: (c.tags ?? []).includes('altsystem'),
               }),
             ),
             ...inquiries.map(
@@ -271,10 +299,12 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 ...base,
                 kind: 'inquiry',
                 id: i.id,
-                title: i.name,
-                subtitle: i.service || i.email,
-                meta: i.status,
-                href: `/inquiries?inquiry=${brand.slug}:${i.id}`,
+                title: senderLabel(i.name, i.phone, i.email),
+                subtitle: i.service?.trim() || i.callReason?.trim() || contactable(i.email),
+                meta: formatInquiryNumber(i.id, i.createdAt),
+                href: `/inquiries/${brand.slug}/${i.id}`,
+                status: i.status,
+                imported: isImportedSource(i.source),
               }),
             ),
             ...contacts.map(
@@ -282,10 +312,12 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 ...base,
                 kind: 'contact',
                 id: c.id,
-                title: c.name,
-                subtitle: c.subject || c.email,
-                meta: c.status,
-                href: `/contacts?contact=${brand.slug}:${c.id}`,
+                title: senderLabel(c.name, c.phone, c.email),
+                subtitle: c.subject?.trim() || contactable(c.email),
+                meta: null,
+                href: `/contacts/${brand.slug}/${c.id}`,
+                status: c.status,
+                imported: isImportedSource(c.source),
               }),
             ),
             ...invoices.map(
@@ -293,10 +325,12 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 ...base,
                 kind: 'invoice',
                 id: inv.id,
-                title: inv.number ?? `Entwurf #${inv.id}`,
+                title: inv.number ?? '',
                 subtitle: inv.recipientName,
-                meta: centsToEuro(inv.totalCents) ?? inv.status,
+                meta: centsToEuro(inv.totalCents),
                 href: `/rechnungen/${inv.id}`,
+                status: inv.status,
+                imported: false,
               }),
             ),
             ...partners.map(
@@ -304,26 +338,26 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
                 ...base,
                 kind: 'partner',
                 id: pt.id,
-                title: pt.companyName ?? `Partner #${pt.id}`,
-                subtitle: pt.contactEmail || pt.city,
-                meta: pt.status,
-                href: `/partner`,
+                title: pt.companyName ?? '',
+                subtitle: contactable(pt.contactEmail) ?? pt.city,
+                meta: pt.city && contactable(pt.contactEmail) ? pt.city : null,
+                href: `/partner/${pt.id}?brand=${brand.slug}`,
+                status: pt.status,
+                imported: false,
               }),
             ),
           ];
         }),
       );
 
-      // An exact id or number match should not sit below a fuzzy one.
+      // Exact title, then prefix match, then live records before imported history.
       const needle = q.toLowerCase();
-      const hits = perBrand.flat().sort((a, b) => {
-        const aExact = a.title.toLowerCase() === needle ? 0 : 1;
-        const bExact = b.title.toLowerCase() === needle ? 0 : 1;
-        if (aExact !== bExact) return aExact - bExact;
-        const aStarts = a.title.toLowerCase().startsWith(needle) ? 0 : 1;
-        const bStarts = b.title.toLowerCase().startsWith(needle) ? 0 : 1;
-        return aStarts - bStarts;
-      });
+      const rank = (h: SearchHit) => {
+        const title = h.title.toLowerCase();
+        const match = title === needle ? 0 : title.startsWith(needle) ? 1 : 2;
+        return match * 2 + (h.imported ? 1 : 0);
+      };
+      const hits = perBrand.flat().sort((a, b) => rank(a) - rank(b));
 
       return { hits, query: q };
     },

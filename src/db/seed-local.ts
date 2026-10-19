@@ -146,15 +146,8 @@ async function ensureMemberships(userId: string, memberships: Record<string, Rol
 }
 
 /**
- * Partner workshops for a brand.
- *
- * Each row needs a real `user` behind it: the partner portal signs in as that
- * user, and the admin chat list joins `user` on `partners.user_id`. Without these
- * the Partner-Werkstätten page and the chat page both render an empty state, so
- * neither could be exercised locally.
- *
- * One `active` and one `pending` partner per brand, which is what the status
- * tabs and the approve/suspend actions need to be meaningful.
+ * One active and one pending partner per brand. Each needs a real `user` (partner portal sign-in;
+ * the admin chat list joins `user` on `partners.user_id`).
  */
 const PARTNER_SEEDS = [
   {
@@ -186,7 +179,7 @@ const PARTNER_SEEDS = [
 async function seedBrandPartners(slug: string, schemaName: string) {
   const t = getTenantTables(schemaName);
   const [{ n } = { n: 0 }] = await db.select({ n: sql<number>`count(*)::int` }).from(t.partners);
-  if (Number(n) > 0) return; // already seeded
+  if (Number(n) > 0) return;
 
   for (const seed of PARTNER_SEEDS) {
     const email = `${seed.slugSuffix}@partner.example.com`;
@@ -195,7 +188,6 @@ async function seedBrandPartners(slug: string, schemaName: string) {
       firstName: seed.firstName,
       lastName: seed.lastName,
     });
-    // Partners are members of the brand they serve, with the partner audience.
     await db
       .insert(membership)
       .values({ userId, companySlug: slug, role: 'viewer', acceptedAt: new Date() })
@@ -223,7 +215,6 @@ async function seedBrandPartners(slug: string, schemaName: string) {
   }
 }
 
-/** A partner-audience user. Same credential flow as the admin seeds. */
 async function ensurePartnerUser(u: {
   email: string;
   firstName: string;
@@ -260,7 +251,7 @@ async function seedBrandSamples(schemaName: string, name: string) {
   const [{ n } = { n: 0 }] = await db
     .select({ n: sql<number>`count(*)::int` })
     .from(t.newsletterSubscribers);
-  if (Number(n) > 0) return; // already seeded
+  if (Number(n) > 0) return;
 
   await db.insert(t.newsletterSubscribers).values([
     {
@@ -308,7 +299,7 @@ async function seedBrandTestFlows(schemaName: string) {
     .select({ n: sql<number>`count(*)::int` })
     .from(t.orders)
     .where(eq(t.orders.source, 'n8n-test'));
-  if (Number(n) > 0) return; // already seeded
+  if (Number(n) > 0) return;
 
   const now = new Date();
   const baseOrder = {

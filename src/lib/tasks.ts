@@ -15,6 +15,7 @@ export type TaskKind =
   | 'order_cancellation'
   | 'bad_review_followup'
   | 'partner_application'
+  | 'partner_report'
   | 'ad_hoc';
 
 export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
@@ -131,6 +132,12 @@ export async function notifyTaskAssigned(input: NotifyAssignedInput): Promise<vo
     await sendEmail({
       to: assignee.email,
       from: adminSender(),
+      log: {
+        companySlug: input.task.companySlug,
+        kind: 'task_assigned',
+        refType: 'task',
+        refId: input.task.id,
+      },
       email: taskAssignedEmail({
         recipientName: assignee.name,
         brandName,
@@ -195,6 +202,13 @@ export async function notifyTaskComment(input: NotifyCommentInput): Promise<void
     await sendEmail({
       to: assignee.email,
       from: adminSender(),
+      log: {
+        companySlug: input.task.companySlug,
+        kind: 'task_comment',
+        refType: 'task',
+        refId: input.task.id,
+        sentByUserId: input.triggeredByUserId,
+      },
       email: taskCommentEmail({
         recipientName: assignee.name,
         authorName,

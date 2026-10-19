@@ -5,7 +5,7 @@ import { eq } from 'drizzle-orm';
 import { auth } from '../../auth/index.js';
 import { env } from '../../config/env.js';
 import { db } from '../../db/index.js';
-import { loadCompany } from '../../lib/company-loader.js';
+import { companySlugForOrigin, loadCompany } from '../../lib/company-loader.js';
 import { getTenantTables } from '../../db/schema/tenant.js';
 import { join, roomKey } from './hub.js';
 
@@ -17,14 +17,16 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
   });
 
   app.get('/chat', { websocket: true }, async (connection, req) => {
-    // CSWSH guard: browsers always send Origin on the WS handshake, and SOP does
-    // not block cross-origin WS the way it does fetch — so reject any browser
-    // origin not in our CORS allowlist. A missing Origin (non-browser) is allowed,
-    // matching the HTTP CORS policy.
+    // CSWSH guard: SOP doesn't block cross-origin WS, so reject browser origins outside the CORS
+    // allowlist. A missing Origin (non-browser client) is allowed, as in the HTTP CORS policy.
+    // A brand's own sites (partner portal behind its /api proxy) may join that brand's rooms only.
     const origin = req.headers.origin;
     if (origin && !env.CORS_ORIGINS.includes(origin)) {
-      connection.close(4403, 'Origin not allowed');
-      return;
+      const owner = await companySlugForOrigin(origin);
+      if (!owner || owner !== (req.query as { slug?: string }).slug) {
+        connection.close(4403, 'Origin not allowed');
+        return;
+      }
     }
 
     const headers = new Headers();
@@ -90,7 +92,7 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
         connection.close(4403, 'Not a member of this brand');
         return;
       }
-      // Partner chat is outside the blog/SEO scope (see seoMayAccess).
+      // Partner chat is outside the SEO-only scope.
       if (accessLevel === 'seo') {
         connection.close(4403, 'Insufficient access level');
         return;

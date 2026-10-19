@@ -1,23 +1,29 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, asc, desc, eq, inArray, lt } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, or, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db } from '../../db/index.js';
-import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
+import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { parseIntId } from '../../lib/http-errors.js';
 import { membership, taskComments, tasks, user } from '../../db/schema/shared.js';
 import { notifyTaskAssigned, notifyTaskComment, spawnTask } from '../../lib/tasks.js';
+import { likePattern } from '../inquiries/filters.js';
 
-const listQuerySchema = z.object({
-  status: z.enum(['open', 'in_progress', 'done', 'dismissed', 'all']).default('open'),
+const scopeSchema = z.object({
   brand: z.string().min(1).max(63).optional(),
-  /** When true, only the tasks assigned to me. Not z.coerce.boolean() — "false" would coerce to true. */
+  q: z.string().trim().min(1).max(200).optional(),
+  /** Only tasks assigned to me. Not z.coerce.boolean(): "false" would coerce to true. */
   mine: z
     .enum(['true', 'false'])
     .transform((v) => v === 'true')
     .default('false'),
+});
+
+// `active` = open + in_progress: everything somebody still has to finish.
+const listQuerySchema = scopeSchema.extend({
+  status: z.enum(['active', 'open', 'in_progress', 'done', 'dismissed', 'all']).default('open'),
   limit: z.coerce.number().int().min(1).max(100).default(20),
-  cursor: z.string().optional(),
+  cursor: z.string().max(500).optional(),
 });
 
 const createSchema = z.object({
@@ -34,9 +40,7 @@ const editSchema = z.object({
   title: z.string().min(1).max(500).optional(),
   body: z.string().max(8000).nullable().optional(),
   priority: z.enum(['low', 'normal', 'high', 'urgent']).optional(),
-  /** Set to null to clear. */
   dueAt: z.string().datetime().nullable().optional(),
-  /** Set to null to unassign. */
   assigneeUserId: z.string().nullable().optional(),
 });
 
@@ -44,7 +48,7 @@ const commentSchema = z.object({
   body: z.string().trim().min(1).max(4000),
 });
 
-/** Brands the user is a member of — gates every list / mutation. */
+// Brands the user is a member of; gates every list and mutation.
 async function userBrandSlugs(userId: string): Promise<string[]> {
   const rows = await db
     .select({ slug: membership.companySlug })
@@ -53,7 +57,25 @@ async function userBrandSlugs(userId: string): Promise<string[]> {
   return rows.map((r) => r.slug);
 }
 
+function scopeConditions(
+  brands: string[],
+  scope: { mine: boolean; q?: string },
+  userId: string,
+): SQL[] {
+  const conds: SQL[] = [inArray(tasks.companySlug, brands)];
+  if (scope.mine) conds.push(eq(tasks.assigneeUserId, userId));
+  if (scope.q) {
+    const like = likePattern(scope.q);
+    const search = or(ilike(tasks.title, like), ilike(tasks.body, like));
+    if (search) conds.push(search);
+  }
+  return conds;
+}
+
 export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
+  // Viewers read tasks; creating, completing and commenting need manager+.
+  app.addHook('preHandler', app.requireWriteAccess);
+
   app.get('/', async (request, reply) => {
     const q = listQuerySchema.parse(request.query);
     const userId = request.authUser!.id;
@@ -65,12 +87,12 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
 
     const brandFilter = q.brand && userBrands.includes(q.brand) ? [q.brand] : userBrands;
 
-    const conds = [inArray(tasks.companySlug, brandFilter)];
-    if (q.status !== 'all') conds.push(eq(tasks.status, q.status));
-    if (q.mine) conds.push(eq(tasks.assigneeUserId, userId));
+    const conds = scopeConditions(brandFilter, q, userId);
+    if (q.status === 'active') conds.push(inArray(tasks.status, ['open', 'in_progress']));
+    else if (q.status !== 'all') conds.push(eq(tasks.status, q.status));
 
-    const cursor = q.cursor ? decodeCursor(q.cursor) : null;
-    if (cursor) conds.push(lt(tasks.id, cursor.id));
+    const after = keysetAfter(tasks, tasks.createdAt, tasks.id, q.cursor);
+    if (after) conds.push(after);
 
     const rows = await db
       .select()
@@ -118,6 +140,24 @@ export const tasksAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     reply.code(201).send({ task: created, created: result.created });
+  });
+
+  app.get('/counts', async (request, reply) => {
+    const q = scopeSchema.parse(request.query);
+    const userId = request.authUser!.id;
+    const userBrands = await userBrandSlugs(userId);
+    if (userBrands.length === 0) {
+      reply.send({ byStatus: {} });
+      return;
+    }
+    const brandFilter = q.brand && userBrands.includes(q.brand) ? [q.brand] : userBrands;
+    const conds = scopeConditions(brandFilter, q, userId);
+    const rows = await db
+      .select({ status: tasks.status, n: sql<number>`count(*)::int` })
+      .from(tasks)
+      .where(and(...conds))
+      .groupBy(tasks.status);
+    reply.send({ byStatus: Object.fromEntries(rows.map((r) => [r.status, r.n])) });
   });
 
   app.get('/summary', async (request, reply) => {

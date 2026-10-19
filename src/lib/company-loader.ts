@@ -8,6 +8,10 @@ export interface CompanyRow {
   schemaName: string;
   keyPrefix: string;
   storefrontOrigin: string | null;
+  storefrontAliases: string[];
+  partnerPortalOrigin: string | null;
+  partnerContractVersion: string | null;
+  partnerContractUrl: string | null;
   senderEmail: string | null;
   senderName: string | null;
   resendApiKey: string | null;
@@ -18,11 +22,8 @@ export interface CompanyRow {
 }
 
 /**
- * In-memory cache of the active company registry. Keyed by slug. Each entry
- * has a short TTL so a new row added by another instance (e.g. behind a load
- * balancer) eventually shows up without a redeploy. Hot paths can also call
- * `invalidateCompany()` directly after writes so the same instance sees its
- * own changes immediately.
+ * In-memory registry of active companies by slug. Short TTL so rows added by another instance appear
+ * without a redeploy; call `invalidateCompany()` after writes for immediate same-instance reads.
  */
 const TTL_MS = 60_000;
 
@@ -41,6 +42,10 @@ function normalize(row: typeof company.$inferSelect): CompanyRow {
     schemaName: row.schemaName,
     keyPrefix: row.keyPrefix ?? row.slug,
     storefrontOrigin: row.storefrontOrigin ?? null,
+    storefrontAliases: row.storefrontAliases ?? [],
+    partnerPortalOrigin: row.partnerPortalOrigin ?? null,
+    partnerContractVersion: row.partnerContractVersion ?? null,
+    partnerContractUrl: row.partnerContractUrl ?? null,
     senderEmail: row.senderEmail ?? null,
     senderName: row.senderName ?? null,
     resendApiKey: row.resendApiKey ?? null,
@@ -75,4 +80,24 @@ export function invalidateCompany(slug?: string) {
   if (slug) cache.delete(slug);
   else cache.clear();
   allCache = null;
+}
+
+/** Every browser origin a brand serves from: canonical storefront, aliases, partner portal. */
+export function companyOrigins(c: CompanyRow): string[] {
+  return [c.storefrontOrigin, ...c.storefrontAliases, c.partnerPortalOrigin].filter(
+    (o): o is string => !!o,
+  );
+}
+
+/** Slug of the brand that owns `origin`, or null when no brand claims it (admin, n8n, SSR). */
+export async function companySlugForOrigin(origin: string): Promise<string | null> {
+  const all = await loadAllActiveCompanies();
+  return all.find((c) => companyOrigins(c).includes(origin))?.slug ?? null;
+}
+
+/** Base URL for partner-facing links; falls back to the storefront for brands without a portal. */
+export function partnerPortalBase(
+  c: Pick<CompanyRow, 'partnerPortalOrigin' | 'storefrontOrigin'>,
+): string | null {
+  return (c.partnerPortalOrigin ?? c.storefrontOrigin)?.replace(/\/$/, '') ?? null;
 }

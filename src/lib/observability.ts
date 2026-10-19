@@ -24,8 +24,7 @@ export async function initObservability(): Promise<boolean> {
     sentry = mod;
     return true;
   } catch (err) {
-    // A DSN is configured but the SDK couldn't load — surface it loudly instead
-    // of silently running with no error tracking on a payments backend.
+    // DSN set but the SDK failed to load: surface it instead of silently running without error tracking.
     console.error(
       '[observability] SENTRY_DSN is set but @sentry/node failed to load — ' +
         'error tracking is DISABLED. Run `pnpm add @sentry/node` or unset SENTRY_DSN.',
@@ -35,7 +34,6 @@ export async function initObservability(): Promise<boolean> {
   }
 }
 
-/** Report an exception to Sentry if configured; otherwise a no-op. */
 export function captureException(err: unknown, extra?: Record<string, unknown>): void {
   if (sentry) sentry.captureException(err, extra ? { extra } : undefined);
 }

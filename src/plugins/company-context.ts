@@ -5,13 +5,12 @@ import { isValidCompanySlug, type CompanySlug } from '../config/companies.js';
 import { db } from '../db/index.js';
 import { membership } from '../db/schema/shared.js';
 import { getTenantTables, type TenantTables } from '../db/schema/tenant.js';
-import { loadCompany } from '../lib/company-loader.js';
+import { companySlugForOrigin, loadCompany } from '../lib/company-loader.js';
 
 export interface CompanyContext {
   slug: CompanySlug;
   name: string;
   schema: string;
-  /** S3 top-level folder for this brand. */
   keyPrefix: string;
   tables: TenantTables;
 }
@@ -26,6 +25,14 @@ function readSlug(request: FastifyRequest): string | null {
   return null;
 }
 
+// A brand's own sites (storefront, partner portal) may only act as that brand.
+async function originOfOtherBrand(request: FastifyRequest, slug: string): Promise<boolean> {
+  const origin = request.headers.origin;
+  if (!origin) return false;
+  const owner = await companySlugForOrigin(origin);
+  return !!owner && owner !== slug;
+}
+
 const companyContext: FastifyPluginAsync = async (app) => {
   app.decorateRequest('company', null);
 
@@ -38,6 +45,10 @@ const companyContext: FastifyPluginAsync = async (app) => {
     const row = await loadCompany(slug);
     if (!row || !row.isActive) {
       reply.code(400).send({ error: 'Unknown company slug' });
+      return;
+    }
+    if (await originOfOtherBrand(request, row.slug)) {
+      reply.code(403).send({ error: 'Origin does not belong to this brand' });
       return;
     }
     request.company = {
@@ -63,6 +74,10 @@ const companyContext: FastifyPluginAsync = async (app) => {
     const row = await loadCompany(slug);
     if (!row || !row.isActive) {
       reply.code(400).send({ error: 'Unknown company slug' });
+      return;
+    }
+    if (await originOfOtherBrand(request, row.slug)) {
+      reply.code(403).send({ error: 'Origin does not belong to this brand' });
       return;
     }
     const memberships = await db

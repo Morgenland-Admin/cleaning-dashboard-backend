@@ -1,72 +1,45 @@
-/**
- * Plain HTML email templates. Kept inline (no react-email dep) so we can ship
- * fast. Each template returns `{ subject, html }`. Brand-themed templates take
- * a `brand` parameter for naming and accent color; system templates are
- * unbranded "Reinigungs-Portal" mail.
- */
+/** Inline HTML templates, each returning `{ subject, html }`; system templates are unbranded "Reinigungs-Portal" mail. */
 import { INVOICE_THANK_YOU } from '../lib/invoice-text.js';
 
 export interface BrandInfo {
-  /** Human-readable brand name shown in the email header + signature. */
   name: string;
-  /** Public-facing domain shown in the footer. */
   domain: string;
-  /** Optional accent colour for the header bar. Defaults to rust. */
+  /** Header accent; defaults to rust. */
   primaryColor?: string;
-  /** Optional absolute logo URL shown in the header. */
   logoUrl?: string | null;
-  /** Public contact email for the signature block (company.email). */
   email?: string | null;
-  /** Public phone for the signature block (company.phone). */
   phone?: string | null;
-  /** Public website for the signature block (company.websiteUrl). */
   websiteUrl?: string | null;
-  /** Registered legal entity for the formal footer (company.legalName). */
+  /** Registered legal entity for the formal footer. */
   legalName?: string | null;
-  /** Postal address lines for the formal footer (street, "PLZ Ort"). */
+  /** Street, "PLZ Ort". */
   addressLines?: string[];
-  /** USt-IdNr. shown in the formal footer. */
   vatId?: string | null;
-  /** Handelsregister / registration number shown in the formal footer. */
   registrationNumber?: string | null;
-  /** Rich, per-brand email sign-off (support hours, HQ, review CTA, …). */
   signature?: EmailSignature | null;
 }
 
-/**
- * Rich per-brand email signature rendered under operator-sent / customer-facing
- * mail. Every field is optional so a brand can fill in as much as it wants; an
- * unset field is simply skipped. Stored as JSONB on the company row.
- */
+/** Stored as JSONB on the company row; every field is optional and unset ones are skipped. */
 export interface EmailSignature {
-  /** Closing line, e.g. "Mit freundlichen Grüßen". */
   signOff?: string | null;
-  /** Person signing off, e.g. "M. Amiri". Shown instead of the operator name. */
+  /** Shown instead of the operator's name. */
   signatory?: string | null;
-  /** Heading above the opening hours, e.g. "Supportzeiten" / "Support:". */
   supportLabel?: string | null;
-  /** Opening-hours lines, e.g. ["Mo. – Fr.: 09:00 – 17:00 Uhr", "Sa.: …"]. */
   supportHours?: string[];
   phone?: string | null;
   whatsapp?: string | null;
-  /** Display text for the web/contact line, e.g. "www.cleanilo.de". */
+  /** Display text of the web line. */
   web?: string | null;
-  /** Optional href for `web` (else auto-linked if it looks like a URL). */
+  /** href for `web`; auto-linked when `web` looks like a URL. */
   webUrl?: string | null;
-  /** Head-office line, e.g. "Zentrale: Brook 9, 20457 Hamburg-Speicherstadt". */
   hq?: string | null;
-  /** Warm tagline, e.g. "Frische Teppiche, frisches Zuhause!". */
   tagline?: string | null;
-  /** Brand slogan in caps, e.g. "CLEANILO – EINFACH. SCHNELL. ZUVERLÄSSIG". */
   slogan?: string | null;
-  /** Secondary drop-off point ("Weitere Annahmestelle"). */
   secondaryLocation?: { name?: string | null; lines?: string[]; phone?: string | null } | null;
-  /** Review call-to-action link. */
   reviewUrl?: string | null;
   reviewLabel?: string | null;
 }
 
-/** Seller bank details rendered as the "Bankverbindung" block on payment mail. */
 export interface BankInfo {
   accountHolder?: string | null;
   iban?: string | null;
@@ -75,7 +48,7 @@ export interface BankInfo {
   bankAddress?: string | null;
 }
 
-/** Email clients (Gmail, Outlook) don't render SVG — only allow raster logos. */
+/** Gmail and Outlook don't render SVG; allow raster logos only. */
 function emailSafeLogo(url?: string | null): string | null {
   if (!url) return null;
   return /^https?:\/\/.+\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(url) ? url : null;
@@ -164,12 +137,10 @@ function button(href: string, label: string, accent = '#bd5b3e'): string {
   </table>`;
 }
 
-/** Strip scheme + trailing slash for a clean, clickable website label. */
 function displayHost(url: string): string {
   return url.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
 }
 
-/** Group an IBAN into readable blocks of four ("DE91 2022 0800 0043 …"). */
 function formatIban(iban: string): string {
   return iban
     .replace(/\s+/g, '')
@@ -178,13 +149,7 @@ function formatIban(iban: string): string {
     .trim();
 }
 
-/**
- * Formal company footer shown on every branded email. Renders the registered
- * legal entity, postal address, VAT / registration number and public contact —
- * the identity a business email is expected to carry. Falls back gracefully to
- * just "Name · domain" when the extended fields aren't set (e.g. system mail or
- * a brand an admin hasn't fully filled in yet).
- */
+/** Formal footer on every branded mail; degrades to "Name · domain" when the extended fields are unset. */
 function legalFooter(brand: BrandInfo, accent: string): string {
   const identity = brand.legalName && brand.legalName !== brand.name ? brand.legalName : brand.name;
   const addr = (brand.addressLines ?? []).filter(Boolean).join(' · ');
@@ -211,19 +176,13 @@ function legalFooter(brand: BrandInfo, accent: string): string {
     <div style="margin-top:8px;">${brandLine}</div>`;
 }
 
-/**
- * "Bankverbindung" payment card for invoice + dunning mail — the seller's bank
- * account with a monospace IBAN, plus the invoice number as Verwendungszweck so
- * the customer can pay by transfer without hunting for the details. Renders
- * nothing when no account is configured.
- */
+/** "Bankverbindung" card for invoice + dunning mail, with the invoice number as Verwendungszweck; empty without an IBAN. */
 function bankTransferBlock(opts: {
   accent: string;
   bank: BankInfo;
   reference?: string | null;
   amount?: string | null;
 }): string {
-  // No IBAN → nothing to pay into; skip the block entirely.
   if (!opts.bank.iban) return '';
   const accent = opts.accent;
   const MONO = "font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;";
@@ -288,12 +247,7 @@ function bankTransferBlock(opts: {
     </table>`;
 }
 
-/**
- * Sign-off for a brand that has no `email_signature` configured yet, derived
- * from its own public company fields. Exists so a newly created company still
- * signs as itself — the dashboard operator's login name must never end up in
- * customer-facing mail.
- */
+/** Fallback for brands without `email_signature`: the operator's login name must never reach customer mail. */
 function derivedSignature(brand: BrandInfo): EmailSignature {
   const site = brand.websiteUrl || (brand.domain ? `https://${brand.domain}` : null);
   const address = brand.addressLines?.length ? brand.addressLines.join(', ') : null;
@@ -307,14 +261,7 @@ function derivedSignature(brand: BrandInfo): EmailSignature {
   };
 }
 
-/**
- * Shared branded sign-off for operator-sent / conversational mail (contact
- * reply, quote, order message). Renders the brand's configured `signature`
- * (closing, signatory, support hours, contacts, HQ, tagline, secondary
- * drop-off, review CTA); a brand without one gets the same block derived from
- * its company fields. The operator who hit send is never named — the mail
- * speaks for the brand, signed by its configured signatory (e.g. "M. Amiri").
- */
+/** Sign-off for operator-sent mail; names the brand's signatory, never the operator who hit send. */
 function signatureBlock(brand: BrandInfo): string {
   const accent = brand.primaryColor ?? '#bd5b3e';
   const sig = brand.signature ?? derivedSignature(brand);
@@ -329,7 +276,6 @@ function signatureBlock(brand: BrandInfo): string {
     )}</div>`,
   );
 
-  // Support hours + contact channels + HQ, one muted block.
   const contact: string[] = [];
   if (sig.supportLabel)
     contact.push(
@@ -484,11 +430,7 @@ export function inviteEmail(opts: {
   };
 }
 
-/**
- * Double-opt-in confirmation request. Sent immediately after the user submits
- * the signup form. Until they click "Bestätigen", the row stays in confirmed:false
- * state and we never send them marketing. Required under §7 UWG for DE.
- */
+/** Double opt-in: no marketing until "Bestätigen" is clicked (§7 UWG). */
 export function newsletterConfirmEmail(opts: {
   firstName?: string | null;
   brand: BrandInfo;
@@ -526,18 +468,14 @@ export function newsletterConfirmEmail(opts: {
   };
 }
 
-/** Internal admin notification when a new contact / inquiry comes in. */
 export function adminInboxNotificationEmail(opts: {
   brand: BrandInfo;
   kind: 'contact' | 'inquiry';
-  /** Submitter name/email so the admin can react without opening the dashboard. */
   fromName: string;
   fromEmail: string;
   subject?: string | null;
   message: string;
-  /** Deep-link into the admin dashboard for the new row. */
   adminUrl: string;
-  /** Optional extras shown as a key/value list (used for inquiry-specific fields). */
   details?: Array<{ label: string; value: string }>;
 }): RenderedEmail {
   const kindLabel = opts.kind === 'contact' ? 'Kontaktanfrage' : 'Service-Anfrage';
@@ -581,13 +519,11 @@ export function adminInboxNotificationEmail(opts: {
   };
 }
 
-/** Sent when the admin marks an inquiry "quoted" and chooses to email the quote. */
 export function inquiryQuoteEmail(opts: {
   recipientName: string;
   brand: BrandInfo;
-  /** Free-text quote body the admin typed. */
   quoteBody: string;
-  /** Amount as already-formatted EUR string ("980,00 €"). */
+  /** Already formatted, e.g. "980,00 €". */
   quotedAmount?: string | null;
 }): RenderedEmail {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
@@ -614,9 +550,8 @@ export function inquiryQuoteEmail(opts: {
 
 export function contactReplyEmail(opts: {
   recipientName: string;
-  /** Body the admin typed — plain text; newlines are preserved as <br>. */
+  /** Plain text; newlines become <br>. */
   replyBody: string;
-  /** Optional reference to the original message to quote at the bottom. */
   originalMessage?: string | null;
   originalSubject?: string | null;
   brand: BrandInfo;
@@ -653,11 +588,6 @@ export function contactReplyEmail(opts: {
   };
 }
 
-/**
- * Customer-facing order confirmation email. Triggered by the Stripe webhook
- * after payment_intent.succeeded — at that point the order is paid and the
- * customer expects a receipt + status link.
- */
 export function orderConfirmationEmail(opts: {
   brand: BrandInfo;
   customerName: string;
@@ -667,7 +597,6 @@ export function orderConfirmationEmail(opts: {
   lines: Array<{ label: string; quantityLabel: string; subtotalFormatted: string }>;
   pickupLabel?: string | null;
   pickupFeeFormatted?: string | null;
-  /** "Wir holen Ihren Teppich ab" vs "Selbst-Abgabe in der Werkstatt". */
   fulfillmentNote: string;
 }): RenderedEmail {
   const itemRowsHtml = opts.lines
@@ -733,6 +662,167 @@ export function orderConfirmationEmail(opts: {
   };
 }
 
+/**
+ * Eingangsbestätigung, sent by the operator; same content as the attached PDF, which carries the
+ * intake photos (never linked from mail). Transactional, so no conversational signature.
+ */
+export function orderReceiptEmail(opts: {
+  brand: BrandInfo;
+  customerName: string;
+  orderNumber: string;
+  trackerUrl: string;
+  confirmation: string;
+  isUpdate: boolean;
+  handoverLabel: string;
+  receivedDate: string;
+  receivedTime: string;
+  positions: Array<{
+    pos: number;
+    label: string;
+    details: string[];
+    condition: string | null;
+    quantityLabel: string;
+    lineTotal: string;
+    addons: Array<{ label: string; quantityLabel: string; lineTotal: string }>;
+  }>;
+  summary: Array<{ label: string; value: string }>;
+  totalLabel: string;
+  total: string;
+  payment: Array<{ label: string; value: string; emphasis: boolean }>;
+  note: string | null;
+  photoCount: number;
+  invoiceFollows: boolean;
+}): RenderedEmail {
+  const accent = opts.brand.primaryColor ?? '#bd5b3e';
+  const CELL = 'padding:10px 12px;border-bottom:1px solid #e2d3b6;vertical-align:top;';
+  const rows = opts.positions
+    .map((p) => {
+      const sub = [
+        ...p.details.map((d) => escapeHtml(d)),
+        p.condition ? `Zustand: ${escapeHtml(p.condition)}` : '',
+      ].filter(Boolean);
+      const addons = p.addons
+        .map(
+          (a) => `<tr>
+        <td style="${CELL}"></td>
+        <td style="${CELL}font-size:13px;color:#4a3c2c;">+ ${escapeHtml(a.label)}</td>
+        <td style="${CELL}font-size:13px;color:#6b5b48;white-space:nowrap;">${escapeHtml(a.quantityLabel)}</td>
+        <td style="${CELL}font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(a.lineTotal)}</td>
+      </tr>`,
+        )
+        .join('');
+      return `<tr>
+        <td style="${CELL}font-size:13px;color:#6b5b48;">${p.pos}</td>
+        <td style="${CELL}font-size:14px;">
+          <div style="font-weight:600;">${escapeHtml(p.label)}</div>
+          ${sub.length ? `<div style="margin-top:3px;font-size:12px;color:#6b5b48;line-height:1.5;">${sub.join('<br />')}</div>` : ''}
+        </td>
+        <td style="${CELL}font-size:13px;color:#6b5b48;white-space:nowrap;">${escapeHtml(p.quantityLabel)}</td>
+        <td style="${CELL}font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(p.lineTotal)}</td>
+      </tr>${addons}`;
+    })
+    .join('');
+
+  const summaryRows = opts.summary
+    .map(
+      (s) => `<tr>
+        <td colspan="3" style="padding:6px 12px;font-size:13px;color:#6b5b48;">${escapeHtml(s.label)}</td>
+        <td style="padding:6px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(s.value)}</td>
+      </tr>`,
+    )
+    .join('');
+  const paymentRows = opts.payment
+    .map(
+      (p) => `<tr>
+        <td colspan="3" style="padding:6px 12px;font-size:13px;${p.emphasis ? `font-weight:700;color:${accent};` : 'color:#6b5b48;'}">${escapeHtml(p.label)}</td>
+        <td style="padding:6px 12px;font-size:13px;text-align:right;white-space:nowrap;${p.emphasis ? `font-weight:700;color:${accent};` : ''}">${escapeHtml(p.value)}</td>
+      </tr>`,
+    )
+    .join('');
+
+  const TH =
+    'padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;';
+  const when = opts.receivedTime
+    ? `${opts.receivedDate} · ${opts.receivedTime} Uhr`
+    : opts.receivedDate;
+  const attachmentLine =
+    opts.photoCount > 0
+      ? `Die Eingangsbestätigung mit der Fotodokumentation (${opts.photoCount} ${opts.photoCount === 1 ? 'Foto' : 'Fotos'}) finden Sie als PDF im Anhang.`
+      : 'Die Eingangsbestätigung finden Sie zusätzlich als PDF im Anhang.';
+
+  return {
+    subject: `${opts.isUpdate ? 'Aktualisierte ' : ''}Eingangsbestätigung ${opts.orderNumber} · ${opts.brand.name}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: opts.confirmation,
+      contentHtml: `
+        <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
+        <p style="margin:0 0 8px;">vielen Dank für Ihr Vertrauen. ${escapeHtml(opts.confirmation)}</p>
+        ${opts.isUpdate ? `<p style="margin:0 0 8px;font-weight:600;color:${accent};">Diese Fassung ersetzt die zuvor gesendete Eingangsbestätigung.</p>` : ''}
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0 4px;">
+          <tr>
+            <td style="padding:0 16px 0 0;vertical-align:top;">
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Auftragsnummer</div>
+              <div style="margin-top:2px;font-weight:600;font-family:monospace;">${escapeHtml(opts.orderNumber)}</div>
+            </td>
+            <td style="padding:0 16px 0 0;vertical-align:top;">
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Übergabe</div>
+              <div style="margin-top:2px;font-weight:600;">${escapeHtml(opts.handoverLabel)}</div>
+            </td>
+            <td style="vertical-align:top;">
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Datum</div>
+              <div style="margin-top:2px;font-weight:600;white-space:nowrap;">${escapeHtml(when)}</div>
+            </td>
+          </tr>
+        </table>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border:1px solid #e2d3b6;border-radius:8px;overflow:hidden;">
+          <thead>
+            <tr style="background:#f4ebdc;">
+              <th align="left" style="${TH}">Pos.</th>
+              <th align="left" style="${TH}">Bezeichnung</th>
+              <th align="left" style="${TH}">Menge</th>
+              <th align="right" style="${TH}">Betrag</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows}
+            ${summaryRows}
+            <tr>
+              <td colspan="3" style="padding:12px;font-size:14px;font-weight:700;border-top:1px solid #e2d3b6;">${escapeHtml(opts.totalLabel)}</td>
+              <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:1px solid #e2d3b6;color:${accent};">${escapeHtml(opts.total)}</td>
+            </tr>
+            ${paymentRows}
+          </tbody>
+        </table>
+
+        ${
+          opts.note
+            ? `<div style="margin:16px 0;padding:12px 16px;background:#f4ebdc;border-left:3px solid ${accent};border-radius:6px;font-size:14px;">
+                 <div style="font-weight:600;margin-bottom:4px;">Hinweis</div>
+                 <div>${nl2br(opts.note)}</div>
+               </div>`
+            : ''
+        }
+
+        <p style="margin:16px 0 8px;font-size:14px;">
+          Bitte prüfen Sie die Angaben. Sollte etwas nicht stimmen, antworten Sie einfach auf diese E-Mail.
+          ${opts.invoiceFollows ? 'Die Rechnung erhalten Sie nach Abschluss der Arbeiten.' : ''}
+        </p>
+        <p style="margin:0 0 8px;font-size:14px;">${escapeHtml(attachmentLine)}</p>
+
+        ${button(opts.trackerUrl, 'Auftrag verfolgen', accent)}
+
+        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+          Bitte heben Sie diese Bestätigung als Beleg auf.
+        </p>
+      `,
+      footerNote: `Eingangsbestätigung zu Ihrem Auftrag bei ${opts.brand.domain} · ${opts.brand.name}.`,
+    }),
+  };
+}
+
 export function invoiceEmail(opts: {
   brand: BrandInfo;
   recipientName: string;
@@ -740,26 +830,21 @@ export function invoiceEmail(opts: {
   invoiceDateFormatted: string;
   dueDateFormatted: string | null;
   paymentTermsDays: number;
-  /** Betreff line, mirrors the PDF headline subject. */
   subject?: string | null;
   lineItems: Array<{
     label: string;
-    /** Second line under the label, mirrors the PDF. */
     note?: string | null;
     quantityLabel: string;
     unitPriceFormatted: string;
     lineTotalFormatted: string;
   }>;
-  /**
-   * Paketrechnung: mirror the PDF and drop the Einzelpreis/Betrag columns — the
-   * positions are scope of work, the price is the totals block.
-   */
+  /** Paketrechnung: drops the Einzelpreis/Betrag columns, like the PDF. */
   packageMode?: boolean;
   subtotalFormatted: string;
   taxFormatted: string | null;
   taxRateLabel: string | null;
   totalFormatted: string;
-  /** §35a EStG block — mirrors the PDF, printed above the closing line. */
+  /** §35a EStG sentence, same as the PDF; printed above the closing line. */
   craftsmanNote?: string | null;
   notes?: string | null;
   seller: {
@@ -770,7 +855,6 @@ export function invoiceEmail(opts: {
     email?: string | null;
     phone?: string | null;
   };
-  /** Seller bank details for the Bankverbindung / payment-by-transfer block. */
   bank?: BankInfo;
   /** 'transfer' (default) shows bank + due date; 'card'/'cash' show "paid". */
   paymentMethod?: string | null;
@@ -778,8 +862,7 @@ export function invoiceEmail(opts: {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
   const paid = opts.paymentMethod === 'card' || opts.paymentMethod === 'cash';
   const pkg = opts.packageMode === true;
-  // Totals span every column left of the amount — 4-column table normally, 2 in
-  // package mode.
+  // Totals label spans every column left of the amount (4-column table, 2 in package mode).
   const sumSpan = pkg ? 1 : 3;
   const itemRowsHtml = opts.lineItems
     .map(
@@ -819,7 +902,7 @@ export function invoiceEmail(opts: {
             <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>`;
 
-  // Paid by card/cash → no bank block, a "paid" acknowledgement instead.
+  // Card/cash: no bank block, a "paid" acknowledgement instead.
   const bankHtml =
     !paid && opts.bank
       ? bankTransferBlock({
@@ -838,7 +921,7 @@ export function invoiceEmail(opts: {
       ? `Bitte überweisen Sie den Gesamtbetrag bis zum <strong>${escapeHtml(opts.dueDateFormatted)}</strong> (Zahlungsziel ${opts.paymentTermsDays} Tage)${toAccount}.`
       : `Bitte überweisen Sie den Gesamtbetrag innerhalb von <strong>${opts.paymentTermsDays} Tagen</strong>${toAccount}.`;
 
-  // §35a EStG: same wording as the attached PDF (frozen on the invoice row).
+  // §35a EStG: same wording as the PDF (frozen on the invoice row).
   const craftsmanHtml = opts.craftsmanNote
     ? `<p style="margin:16px 0 0;font-size:14px;">${escapeHtml(opts.craftsmanNote)}</p>`
     : '';
@@ -937,11 +1020,8 @@ export function invoiceEmail(opts: {
 }
 
 /**
- * Payment reminder / dunning notice. The tone escalates with `dunningLevel`:
- *   1 → freundliche Zahlungserinnerung
- *   2 → 1. Mahnung
- *   3+ → 2. Mahnung (letzte außergerichtliche Aufforderung)
- * Sent from the brand's own sender; references the already-issued invoice.
+ * Tone escalates with `dunningLevel`: 1 freundliche Zahlungserinnerung, 2 → 1. Mahnung,
+ * 3+ → 2. Mahnung (letzte außergerichtliche Aufforderung).
  */
 export function dunningEmail(opts: {
   brand: BrandInfo;
@@ -959,7 +1039,6 @@ export function dunningEmail(opts: {
     email?: string | null;
     phone?: string | null;
   };
-  /** Seller bank details for the Bankverbindung block. */
   bank?: BankInfo;
 }): RenderedEmail {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
@@ -1057,11 +1136,6 @@ export function dunningEmail(opts: {
   };
 }
 
-/**
- * Internal admin notification — fires alongside the customer confirmation so
- * the operations inbox sees a new paid order without having to refresh the
- * dashboard. Mirrors adminInboxNotificationEmail for contact / inquiry.
- */
 export function newOrderAdminEmail(opts: {
   brand: BrandInfo;
   orderNumber: string;
@@ -1232,7 +1306,7 @@ export function orderStatusUpdateEmail(opts: {
   orderNumber: string;
   trackerUrl: string;
   toStatus: StatusKey;
-  /** Only for cancelled / refunded — when > 0 we add a refund line. */
+  /** Cancelled / refunded only; > 0 adds a refund line. */
   refundFormatted?: string | null;
 }): RenderedEmail {
   const copy = STATUS_COPY[opts.toStatus];
@@ -1293,18 +1367,12 @@ export function appointmentConfirmedEmail(opts: {
   };
 }
 
-/**
- * Free-form operator message about an order — the "✦ Claude compose + send" box
- * on the Aufträge panel. Body is whatever the operator typed (Claude-drafted or
- * not); goes out under the order's own brand, per Sie like the other order mail.
- */
 export function orderMessageEmail(opts: {
   brand: BrandInfo;
   customerName: string;
   orderNumber: string;
-  /** Body the operator typed — plain text; newlines preserved as <br>. */
+  /** Plain text; newlines become <br>. */
   messageBody: string;
-  /** Optional order-tracker link surfaced as a button. */
   trackerUrl?: string | null;
 }): RenderedEmail {
   const signature = signatureBlock(opts.brand);
@@ -1328,11 +1396,54 @@ export function orderMessageEmail(opts: {
   };
 }
 
+export interface CustomerGreeting {
+  salutation?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  name?: string | null;
+}
+
+/** Formal German salutation line ("Sehr geehrte Frau …,"); falls back to a neutral greeting. */
+export function formalGreeting(r: CustomerGreeting): string {
+  const last = r.lastName?.trim();
+  if (r.salutation === 'herr' && last) return `Sehr geehrter Herr ${last},`;
+  if (r.salutation === 'frau' && last) return `Sehr geehrte Frau ${last},`;
+  if (r.salutation === 'firma') return 'Sehr geehrte Damen und Herren,';
+  const person = [r.firstName, r.lastName]
+    .map((s) => s?.trim())
+    .filter(Boolean)
+    .join(' ');
+  const name = person || r.name?.trim();
+  return name ? `Guten Tag ${name},` : 'Guten Tag,';
+}
+
+/** Free-form operator mail to a customer (customer page); signs as the brand. */
+export function customerMessageEmail(opts: {
+  brand: BrandInfo;
+  recipient: CustomerGreeting;
+  subject: string;
+  /** Plain text; newlines become <br>. */
+  messageBody: string;
+}): RenderedEmail {
+  const signature = signatureBlock(opts.brand);
+  return {
+    subject: opts.subject,
+    html: layout({
+      brand: opts.brand,
+      preheader: opts.subject,
+      contentHtml: `
+        <p style="margin:0 0 12px;">${escapeHtml(formalGreeting(opts.recipient))}</p>
+        <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.messageBody)}</div>
+        ${signature}
+      `,
+      footerNote: `Sie können direkt auf diese E-Mail antworten.`,
+    }),
+  };
+}
+
 /**
- * Single-use Calendly link so the customer picks their own pickup/on-site time.
- * Sent under the order's own brand; only the booking page behind the link is
- * CLEANILO-hosted (one shared scheduling calendar across the brands), which is
- * why the copy stays neutral about who runs the page.
+ * Single-use Calendly link. Sent under the order's brand, but the booking page is CLEANILO-hosted
+ * (shared calendar), so the copy stays neutral about who runs it.
  */
 export function pickupSchedulingLinkEmail(opts: {
   brand: BrandInfo;
@@ -1464,6 +1575,237 @@ export function taskCommentEmail(opts: {
         ${button(opts.taskUrl, 'Im Portal antworten', ADMIN_BRAND.primaryColor)}
       `,
       footerNote: `Du erhältst diese E-Mail als zugewiesener Bearbeiter der Aufgabe.`,
+    }),
+  };
+}
+
+// ── Partner portal mail: brand-branded, formal "Sie" ──
+
+function partnerGreeting(name?: string | null): string {
+  return name ? `Guten Tag ${escapeHtml(name)},` : 'Guten Tag,';
+}
+
+function linkFallback(url: string): string {
+  return `<p style="margin:0 0 6px;font-size:12px;color:#6b5b48;">
+          Funktioniert der Button nicht? Kopieren Sie diesen Link in Ihren Browser:
+        </p>
+        <p style="margin:0;font-size:12px;color:#6b5b48;word-break:break-all;">
+          <a href="${escapeHtml(url)}" style="color:#6b5b48;">${escapeHtml(url)}</a>
+        </p>`;
+}
+
+export function partnerInviteEmail(opts: {
+  brand: BrandInfo;
+  companyName?: string | null;
+  inviteUrl: string;
+}): RenderedEmail {
+  return {
+    subject: `Ihr Zugang zum ${opts.brand.name} Partnerportal`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `Richten Sie Ihren Zugang zum ${opts.brand.name} Partnerportal ein.`,
+      contentHtml: `
+        <p style="margin:0 0 16px;">${partnerGreeting(opts.companyName)}</p>
+        <p style="margin:0 0 8px;">
+          Sie wurden als Partnerbetrieb zum <strong>${escapeHtml(opts.brand.name)} Partnerportal</strong> eingeladen.
+          Dort vervollständigen Sie Ihr Profil, laden Ihre Nachweise hoch und erhalten Aufträge.
+        </p>
+        <p style="margin:0 0 8px;">Die Einladung ist 7&nbsp;Tage gültig.</p>
+        ${button(opts.inviteUrl, 'Zugang einrichten', opts.brand.primaryColor)}
+        ${linkFallback(opts.inviteUrl)}
+        ${signatureBlock(opts.brand)}
+      `,
+    }),
+  };
+}
+
+export function partnerResetPasswordEmail(opts: {
+  brand: BrandInfo;
+  name?: string | null;
+  resetUrl: string;
+}): RenderedEmail {
+  return {
+    subject: `Passwort zurücksetzen · ${opts.brand.name} Partnerportal`,
+    html: layout({
+      brand: opts.brand,
+      preheader: 'Setzen Sie Ihr Passwort über den Link in dieser E-Mail neu.',
+      contentHtml: `
+        <p style="margin:0 0 16px;">${partnerGreeting(opts.name)}</p>
+        <p style="margin:0 0 8px;">
+          Sie haben eine Passwort-Zurücksetzung für das ${escapeHtml(opts.brand.name)} Partnerportal angefordert.
+          Der Link ist aus Sicherheitsgründen 1&nbsp;Stunde gültig.
+        </p>
+        ${button(opts.resetUrl, 'Passwort zurücksetzen', opts.brand.primaryColor)}
+        ${linkFallback(opts.resetUrl)}
+        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+          Haben Sie diese E-Mail nicht angefordert, können Sie sie ignorieren — Ihr Passwort bleibt unverändert.
+        </p>
+      `,
+      footerNote: 'Diese E-Mail wurde automatisch versendet.',
+    }),
+  };
+}
+
+function jobFacts(rows: Array<[string, string | null | undefined]>): string {
+  const cells = rows
+    .filter((r): r is [string, string] => !!r[1])
+    .map(
+      ([k, v]) =>
+        `<tr><td style="padding:4px 12px 4px 0;font-size:12px;color:#6b5b48;white-space:nowrap;vertical-align:top;width:120px;">${escapeHtml(k)}</td><td style="padding:4px 0;font-size:14px;">${escapeHtml(v)}</td></tr>`,
+    )
+    .join('');
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 8px;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;width:100%;">${cells}</table>`;
+}
+
+export function partnerOfferEmail(opts: {
+  brand: BrandInfo;
+  partnerName?: string | null;
+  jobLabel: string;
+  location: string;
+  dateLine?: string | null;
+  payoutLine?: string | null;
+  needsPrice: boolean;
+  expiresAtLabel: string;
+  offerUrl: string;
+}): RenderedEmail {
+  return {
+    subject: `Neue Auftragsanfrage: ${opts.jobLabel} in ${opts.location}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `Bitte bis ${opts.expiresAtLabel} annehmen oder ablehnen.`,
+      contentHtml: `
+        <p style="margin:0 0 16px;">${partnerGreeting(opts.partnerName)}</p>
+        <p style="margin:0 0 12px;">wir haben eine passende Anfrage für Ihren Betrieb:</p>
+        ${jobFacts([
+          ['Leistung', opts.jobLabel],
+          ['Ort', opts.location],
+          ['Termin', opts.dateLine],
+          ['Ihre Auszahlung', opts.payoutLine],
+        ])}
+        <p style="margin:12px 0 0;">
+          ${opts.needsPrice ? 'Bitte prüfen Sie die Angaben und Fotos und nennen Sie Ihren Preis.' : 'Bitte nehmen Sie den Auftrag an oder lehnen Sie ihn ab.'}
+          Die Anfrage gilt bis <strong>${escapeHtml(opts.expiresAtLabel)}</strong>.
+          Die Kontaktdaten der Kundin oder des Kunden sehen Sie nach der Annahme.
+        </p>
+        ${button(opts.offerUrl, 'Anfrage ansehen', opts.brand.primaryColor)}
+        ${signatureBlock(opts.brand)}
+      `,
+      footerNote: `Sie erhalten diese E-Mail als Partnerbetrieb von ${opts.brand.name}.`,
+    }),
+  };
+}
+
+export function partnerAssignedEmail(opts: {
+  brand: BrandInfo;
+  partnerName?: string | null;
+  orderNumber: string;
+  jobLabel: string;
+  location?: string | null;
+  payoutLine?: string | null;
+  orderUrl: string;
+}): RenderedEmail {
+  return {
+    subject: `Auftrag ${opts.orderNumber} ist Ihnen zugewiesen`,
+    html: layout({
+      brand: opts.brand,
+      preheader: `${opts.jobLabel} · ${opts.orderNumber}`,
+      contentHtml: `
+        <p style="margin:0 0 16px;">${partnerGreeting(opts.partnerName)}</p>
+        <p style="margin:0 0 12px;">der folgende Auftrag ist Ihnen zugewiesen:</p>
+        ${jobFacts([
+          ['Auftrag', opts.orderNumber],
+          ['Leistung', opts.jobLabel],
+          ['Ort', opts.location],
+          ['Ihre Auszahlung', opts.payoutLine],
+        ])}
+        <p style="margin:12px 0 0;">Alle Details und die Kontaktdaten finden Sie im Partnerportal.</p>
+        ${button(opts.orderUrl, 'Auftrag öffnen', opts.brand.primaryColor)}
+        ${signatureBlock(opts.brand)}
+      `,
+      footerNote: `Sie erhalten diese E-Mail als Partnerbetrieb von ${opts.brand.name}.`,
+    }),
+  };
+}
+
+export function partnerDocumentReviewedEmail(opts: {
+  brand: BrandInfo;
+  partnerName?: string | null;
+  documentLabel: string;
+  approved: boolean;
+  reason?: string | null;
+  documentsUrl: string;
+}): RenderedEmail {
+  const body = opts.approved
+    ? `<p style="margin:0 0 12px;">Ihr Nachweis <strong>${escapeHtml(opts.documentLabel)}</strong> wurde geprüft und freigegeben.</p>`
+    : `<p style="margin:0 0 12px;">Ihr Nachweis <strong>${escapeHtml(opts.documentLabel)}</strong> konnte leider nicht freigegeben werden.</p>
+       ${opts.reason ? `<div style="margin:0 0 12px;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;white-space:pre-wrap;">${nl2br(opts.reason)}</div>` : ''}
+       <p style="margin:0 0 12px;">Bitte laden Sie im Partnerportal ein neues Dokument hoch.</p>`;
+  return {
+    subject: opts.approved
+      ? `Nachweis freigegeben: ${opts.documentLabel}`
+      : `Nachweis bitte erneut hochladen: ${opts.documentLabel}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: opts.approved
+        ? 'Ihr Nachweis wurde freigegeben.'
+        : 'Ihr Nachweis wurde abgelehnt.',
+      contentHtml: `
+        <p style="margin:0 0 16px;">${partnerGreeting(opts.partnerName)}</p>
+        ${body}
+        ${button(opts.documentsUrl, 'Zu meinen Dokumenten', opts.brand.primaryColor)}
+        ${signatureBlock(opts.brand)}
+      `,
+      footerNote: `Sie erhalten diese E-Mail als Partnerbetrieb von ${opts.brand.name}.`,
+    }),
+  };
+}
+
+export function partnerApplicationAckEmail(opts: {
+  brand: BrandInfo;
+  contactName: string;
+}): RenderedEmail {
+  return {
+    subject: `Ihre Partnerbewerbung bei ${opts.brand.name}`,
+    html: layout({
+      brand: opts.brand,
+      preheader: 'Vielen Dank für Ihr Interesse an einer Partnerschaft.',
+      contentHtml: `
+        <p style="margin:0 0 16px;">Guten Tag ${escapeHtml(opts.contactName)},</p>
+        <p style="margin:0 0 8px;">
+          vielen Dank für Ihre Bewerbung als Partnerbetrieb bei ${escapeHtml(opts.brand.name)}.
+          Wir prüfen Ihre Angaben und melden uns bei Ihnen.
+        </p>
+        ${signatureBlock(opts.brand)}
+      `,
+      footerNote: `Eingangsbestätigung Ihrer Bewerbung bei ${opts.brand.domain}.`,
+    }),
+  };
+}
+
+export function partnerActivatedEmail(opts: {
+  brand: BrandInfo;
+  partnerName?: string | null;
+  portalUrl: string;
+}): RenderedEmail {
+  return {
+    subject: `Ihr Partnerkonto bei ${opts.brand.name} ist freigeschaltet`,
+    html: layout({
+      brand: opts.brand,
+      preheader: 'Ab jetzt erhalten Sie Auftragsanfragen.',
+      contentHtml: `
+        <p style="margin:0 0 16px;">${partnerGreeting(opts.partnerName)}</p>
+        <p style="margin:0 0 8px;">
+          Ihr Partnerkonto bei ${escapeHtml(opts.brand.name)} ist freigeschaltet. Ab jetzt erhalten Sie
+          passende Auftragsanfragen per E-Mail und im Partnerportal.
+        </p>
+        <p style="margin:0 0 8px;">
+          Damit Auszahlungen ankommen, richten Sie bitte im Portal unter „Auszahlungen" Ihr Auszahlungskonto ein,
+          falls noch nicht geschehen.
+        </p>
+        ${button(opts.portalUrl, 'Zum Partnerportal', opts.brand.primaryColor)}
+        ${signatureBlock(opts.brand)}
+      `,
+      footerNote: `Sie erhalten diese E-Mail als Partnerbetrieb von ${opts.brand.name}.`,
     }),
   };
 }

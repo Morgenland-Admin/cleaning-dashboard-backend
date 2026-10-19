@@ -4,7 +4,7 @@ Multi-tenant backend for Cleanilo, Hamburg Teppichreinigung, and Teppichreinigen
 
 ## Requirements
 
-- Node.js >= 20
+- Node.js 24 (`nvm use` reads `.nvmrc`); the git hooks (lint-staged 17) need >= 22.22
 - pnpm >= 10 (`corepack enable` will provision the pinned version)
 - PostgreSQL 14+
 - (Optional) Docker + Docker Compose
@@ -78,14 +78,54 @@ Partner-fulfilled orders use **Stripe Connect (Express)** with **separate transf
 3. Admin triggers payout: `POST /admin/orders/:id/payout` → creates a transfer
    funded by the original charge (`source_transaction`), so it never draws on
    platform float. Idempotent.
-4. Partner sees only their assigned orders (`/partner/orders`) with the
-   customer email + internal/Stripe fields redacted, and can advance the
-   fulfilment status (`picked_up → … → delivered`).
+4. Partner sees only their assigned orders (`/partner/orders`) as an allowlisted view
+   (no customer email, order token, payment/tracking ids or internal metadata) and can set
+   the one next step (`paid → accepted → picked_up → … → delivered`, `partnerNextStatus`);
+   `?scope=active|done` splits the list.
 
 **Before this works in production you must:** enable Connect on the Stripe
 dashboard, add the connected-account + transfer webhook events
 (`account.updated`, `transfer.reversed`) to the same webhook endpoint, and
 test payouts end-to-end in Stripe **test mode** with a real test transfer.
+
+## Partner portal & dispatch
+
+The white-label partner portal (e.g. `partner.cleanilo.de`) calls this API through a
+**same-origin proxy** (`/api/*` → this backend), so better-auth's httpOnly cookie stays
+first-party. Per brand, the `company` row holds `partner_portal_origin` (CORS + auth
+trusted origin + every partner link), `storefront_aliases` (extra CORS origins, e.g. the
+apex next to a `www` canonical) and `partner_contract_version` / `partner_contract_url`.
+A request whose `Origin` belongs to brand A but sends `X-Company-Slug: B` is refused.
+
+**Flow:** `POST /storefront/partner-applications` → admin `POST /admin/partner-applications/:id/invite`
+→ partner accepts on the portal → profile, services, documents, contract, Stripe Express
+→ admin activates (`PATCH /admin/partners/:id { status: 'active' }`). Dispatch:
+`GET /admin/{orders,inquiries}/:id/partner-matches` (PLZ centroid × partner radius ×
+`service_catalog` slug, with reasons) → `POST /admin/{orders,inquiries}/:id/offers` →
+partner `POST /partner/offers/:id/{accept,decline}`. Accepting an order offer assigns it
+(CAS, commission = partner override › catalog default › 12 %) and withdraws sibling offers.
+Offers expire via an in-process sweep (5 min). Before acceptance a partner sees the job,
+never the customer's name, address or contact data.
+
+| Area      | Partner (`/partner/*`, active partners only for offers/orders)                                                                                 | Admin (`/admin/*`)                                                                  |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Profile   | `GET/PATCH /partners/me` (incl. verification checklist) · `POST /partners/onboard` · `GET /partners/me/contract` · `POST …/contract/accept`    | `GET /partners/:id` · `PATCH /partners/:id` (master data, `commissionRate`, status) |
+| Documents | `GET/POST /partners/me/documents` · `POST …/sign-upload` · `GET …/:docId/download` · `DELETE …/:docId`                                         | `GET /partners/:id/documents` · `GET …/:docId/download` · `POST …/:docId/review`    |
+| Offers    | `GET /offers?scope=open\|history` · `GET /offers/:id` · `POST /offers/:id/{accept,decline}`                                                    | `GET/POST /{orders,inquiries}/:id/offers` · `POST /partner-offers/:id/withdraw`     |
+| Orders    | `GET /orders` · `GET /orders/:id` · `POST /orders/:id/transition` · `GET /orders/earnings` · `…/:id/photos` (+ `sign-upload`) · `…/:id/report` | `POST /orders/:id/{assign,unassign,payout}`                                         |
+| Payouts   | `POST /partners/connect/onboard` · `GET /partners/connect/status` · `POST /partners/connect/dashboard-link`                                    | —                                                                                   |
+| Chat      | `GET/POST /chat/messages` · `POST /chat/read` · `POST /chat/sign-upload` · `GET /chat/attachment?key=`                                         | `/chat/conversations/*`                                                             |
+| Reviews   | `GET /reviews` · `POST /reviews/:id/response` (once)                                                                                           | `/reviews/*`                                                                        |
+| Catalog   | —                                                                                                                                              | `GET/POST /service-catalog` · `PATCH /service-catalog/:id` (slug immutable)         |
+| Public    | `GET /storefront/services` · `GET /storefront/brand` · `GET /storefront/reviews` · `POST /storefront/partner-applications`                     | `GET /partner-applications` · `GET …/:id` · `POST …/:id/{invite,reject}`            |
+
+**Portal URL contract** (links in partner mail, push and Stripe return URLs):
+`/einladung?token=` · `/passwort-zuruecksetzen?token=` · `/angebote/:id` · `/auftraege/:id` ·
+`/dokumente` · `/auszahlungen?connect=return|refresh` · `/nachrichten`.
+
+Partner files live under `<keyPrefix>/partners/<partnerId>/{documents,photos,chat}/` and are
+only ever served through short-lived presigned GETs. The CLEANILO `service_catalog` is seeded
+at boot with the live cleanilo.de URL slugs (`src/db/service-catalog-seed.ts`, insert-only).
 
 ## API surface for n8n workflows
 
