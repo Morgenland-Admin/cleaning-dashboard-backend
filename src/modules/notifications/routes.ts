@@ -18,10 +18,7 @@ type Notification = {
   createdAt: string;
 };
 
-/**
- * Resolve which brands the calling admin can see notifications from.
- * Super-admins see every active brand; everyone else sees their memberships.
- */
+// Super-admins see every active brand; everyone else only their memberships.
 async function accessibleBrands(userId: string, isSuperAdmin: boolean) {
   if (isSuperAdmin) {
     return db
@@ -37,13 +34,7 @@ async function accessibleBrands(userId: string, isSuperAdmin: boolean) {
 }
 
 const notificationsRoutes: FastifyPluginAsync = async (app) => {
-  /**
-   * Header bell badge count. "Unread" today means:
-   *   - contact_messages with status='new'
-   *   - service_inquiries with status='new' or 'in_review'
-   * Aggregated across every brand the user can see. Future per-user dismissal
-   * state would live on a separate `notification_reads` table.
-   */
+  // "Unread" = contact_messages with status 'new' + service_inquiries 'new' or 'in_review', across all visible brands.
   app.get('/unread-count', async (request) => {
     const userId = request.authUser!.id;
     const inviterMeta = request.authUser as unknown as { accessLevel?: string };
@@ -74,12 +65,6 @@ const notificationsRoutes: FastifyPluginAsync = async (app) => {
     return { count: total, byBrand: counts };
   });
 
-  /**
-   * Notification feed for the bell dropdown. Lists the most-recent
-   * "actionable" rows (new contacts, new/in_review inquiries) across every
-   * accessible brand, merged + sorted. Each item carries enough info to
-   * route the user to the right detail page on click.
-   */
   const listQuerySchema = z.object({
     limit: z.coerce.number().int().min(1).max(50).default(20),
   });

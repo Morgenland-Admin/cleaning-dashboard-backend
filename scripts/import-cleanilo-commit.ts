@@ -1,16 +1,6 @@
 /**
- * Real writer for the CLEANILO historical import. Loaded only when the runner
- * is invoked with --commit. Writes DIRECTLY to the cleanilo tenant schema —
- * never through the live API/webhook paths — so no automation fires:
- *
- *   - orders  → status 'completed', paid/completed timestamps = invoice date,
- *               source tag `import_cleanilo_2021_26`, consentMarketing = false.
- *   - invoices→ status 'paid' (outside the dunning sweep's sent/overdue filter),
- *               original number preserved, dunningLevel 0.
- *   - customers→ no-marketing flag, tier pre-computed, b2b tag where applicable.
- *
- * Idempotent: an invoice whose original number already exists in the tenant is
- * skipped, so a re-run tops up rather than duplicating.
+ * Writer for the CLEANILO historical import (--commit only). Writes DIRECTLY to the cleanilo tenant, never via the
+ * API/webhook paths, so no automation fires: orders 'completed', invoices 'paid' (outside the dunning sweep), no marketing.
  */
 import { and, eq } from 'drizzle-orm';
 
@@ -57,7 +47,6 @@ export async function commitImport(plan: ImportPlan): Promise<CommitResult> {
 
   for (const c of plan.customers) {
     await db.transaction(async (tx) => {
-      // Upsert the customer by its unique email; keep the richest fields.
       const [cust] = await tx
         .insert(t.customers)
         .values({
@@ -93,9 +82,8 @@ export async function commitImport(plan: ImportPlan): Promise<CommitResult> {
       result.customersWritten += 1;
 
       for (const inv of c.sourceInvoices) {
-        // Idempotency: skip only an exact prior landing. Keyed on number +
-        // total + recipient because the source reuses some invoice numbers for
-        // different customers — number alone would wrongly drop the second one.
+        // Idempotency: keyed on number + total + recipient, because the source reuses invoice numbers
+        // for different customers (number alone would drop the second one).
         const existing = await tx
           .select({ id: t.invoices.id })
           .from(t.invoices)
@@ -112,9 +100,7 @@ export async function commitImport(plan: ImportPlan): Promise<CommitResult> {
           continue;
         }
         await writeOrderAndInvoice(tx, t, inv, c.isB2B, customerId, {
-          // Order carries the customer's email (placeholder or verified) so all
-          // of a customer's orders share it; the invoice recipient stays empty
-          // for placeholders — we never store a fake address on an invoice.
+          // The invoice recipient stays empty for placeholders: never a fake address on an invoice.
           customerEmail: c.email,
           invoiceRecipientEmail: c.emailIsPlaceholder ? null : c.email,
         });
@@ -153,7 +139,7 @@ async function writeOrderAndInvoice(
     .values({
       publicToken: generateOrderToken(),
       customerId,
-      // Leave orderNumber null → derives "YYYY/000123" from id + createdAt year.
+      // orderNumber stays null; derived from id + createdAt year.
       kind: 'teppichreinigung',
       status: 'completed',
       currency: 'EUR',
@@ -197,7 +183,7 @@ async function writeOrderAndInvoice(
   });
 
   await tx.insert(t.invoices).values({
-    number: inv.invoiceNumber, // original, or "<orig>-N" for a de-duped collision
+    number: inv.invoiceNumber,
     orderId,
     customerId,
     customerType: isB2B ? 'b2b' : 'b2c',
@@ -208,7 +194,7 @@ async function writeOrderAndInvoice(
     recipientCity: inv.city,
     recipientCountry: inv.country,
     serviceDate: inv.dateEstimated ? null : inv.date, // no false Leistungsdatum
-    status: 'paid', // NOT sent/overdue → dunning never touches it
+    status: 'paid', // not sent/overdue: dunning must never touch it
     currency: 'EUR',
     subtotalCents: net,
     taxRatePercent: VAT_RATE,

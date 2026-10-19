@@ -116,8 +116,7 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // Sending to a partner workshop is a real outbound action — manager+.
-  // Read/typing receipts stay open so a `viewer` can follow a thread.
+  // Manager+ to send; read/typing receipts stay open so a `viewer` can follow a thread.
   app.post(
     '/conversations/:partnerUserId/messages',
     { preHandler: app.requireAccess('super_admin', 'admin', 'manager') },
@@ -191,7 +190,6 @@ export const chatAdminRoutes: FastifyPluginAsync = async (app) => {
         adminId,
       );
 
-      // PWA push for the partner — the WS broadcast only reaches open tabs.
       try {
         const { sendPushToUser } = await import('../../lib/push.js');
         await sendPushToUser(partnerUserId, {

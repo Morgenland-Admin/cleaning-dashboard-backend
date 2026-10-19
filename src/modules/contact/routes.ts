@@ -119,6 +119,12 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
             await sendEmail({
               to: row.email,
               from: brandSender(companyRow),
+              log: {
+                companySlug: companyRow.slug,
+                kind: 'contact_ack',
+                refType: 'contact',
+                refId: row.id,
+              },
               apiKey: companyRow.resendApiKey ?? undefined,
               replyTo: companyRow.email ?? undefined,
               email: contactAckEmail({
@@ -133,6 +139,12 @@ export const contactPublicRoutes: FastifyPluginAsync = async (app) => {
               await sendEmail({
                 to: companyRow.email,
                 from: brandSender(companyRow),
+                log: {
+                  companySlug: companyRow.slug,
+                  kind: 'staff_notification',
+                  refType: 'contact',
+                  refId: row.id,
+                },
                 apiKey: companyRow.resendApiKey ?? undefined,
                 replyTo: row.email,
                 email: adminInboxNotificationEmail({
@@ -214,7 +226,6 @@ const redactPii = redactForViewer;
 export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
-  // Replies leave the building as customer mail — manager+ for writes.
   app.addHook('preHandler', app.requireWriteAccess);
 
   const listQuerySchema = z.object({
@@ -305,7 +316,7 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!adminRow) {
       request.log.warn({ adminId }, 'Admin user row missing during contact reply');
     }
-    // Internal audit trail only — the mail itself signs as the brand.
+    // Internal audit trail only; the mail signs as the brand.
     const sentByName = adminRow?.name ?? null;
 
     const [companyRow] = await db
@@ -319,6 +330,13 @@ export const contactAdminRoutes: FastifyPluginAsync = async (app) => {
       const result = await sendEmail({
         to: msg.email,
         from: brandSender(companyRow),
+        log: {
+          companySlug: companyRow.slug,
+          kind: 'contact_reply',
+          refType: 'contact',
+          refId: msg.id,
+          sentByUserId: adminId,
+        },
         apiKey: companyRow.resendApiKey ?? undefined,
         replyTo: companyRow.email ?? undefined,
         email: contactReplyEmail({

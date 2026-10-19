@@ -11,6 +11,7 @@ import adminRoutes from './routes/admin.js';
 import internalRoutes from './routes/internal.js';
 import partnerRoutes from './routes/partner.js';
 import storefrontRoutes from './routes/storefront.js';
+import { resendWebhookRoutes } from './modules/emails/webhook.js';
 import { loadAllActiveCompanies } from './lib/company-loader.js';
 import { db } from './db/index.js';
 import { sql } from 'drizzle-orm';
@@ -120,6 +121,7 @@ export async function buildApp(opts: FastifyServerOptions = {}) {
   await app.register(partnerRoutes, { prefix: '/partner' });
   await app.register(storefrontRoutes, { prefix: '/storefront' });
   await app.register(internalRoutes, { prefix: '/internal' });
+  await app.register(resendWebhookRoutes, { prefix: '/webhooks' });
 
   const chatWsPlugin = (await import('./modules/chat/ws.js')).default;
   await app.register(chatWsPlugin, { prefix: '/ws' });

@@ -33,7 +33,7 @@ const createInviteSchema = z.object({
   partner: partnerPrefillSchema.optional(),
 });
 
-const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 function inviteIdentifier(token: string): string {
   return `invite:${token}`;
@@ -79,9 +79,8 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
         reply.code(403).send({ error: 'Forbidden — must be owner/admin on this company' });
         return;
       }
-      // Privilege ceiling: only a super_admin may mint a global super_admin.
-      // accessLevel is a platform-wide field, so a tenant owner/admin must not
-      // be able to grant it (would bypass every membership check).
+      // Privilege ceiling: accessLevel is platform-wide, so only a super_admin may mint a super_admin
+      // (a tenant owner/admin granting it would bypass every membership check).
       if (body.accessLevel === 'super_admin') {
         reply
           .code(403)
@@ -134,6 +133,7 @@ export const invitesAdminRoutes: FastifyPluginAsync = async (app) => {
       await sendEmail({
         to: body.email,
         from: adminSender(),
+        log: { companySlug: companyRow.slug, kind: 'invite', sentByUserId: request.authUser?.id },
         email: inviteEmail({
           inviterName: payload.invitedByName,
           inviteUrl,

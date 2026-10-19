@@ -27,8 +27,7 @@ const createCompanySchema = z.object({
   logoUrl: z.string().url().optional(),
 });
 
-// Column allowlist for any company row returned over the API. Deliberately
-// EXCLUDES secrets (resendApiKey) — never `.returning()` the raw row.
+// Public column allowlist: excludes secrets (resendApiKey); never `.returning()` the raw row.
 const companyPublicColumns = {
   slug: company.slug,
   name: company.name,
@@ -58,8 +57,7 @@ const companyPublicColumns = {
   bankAddress: company.bankAddress,
   logoUrl: company.logoUrl,
   primaryColor: company.primaryColor,
-  // Read-only here (seed-owned brand content, no PATCH field): the dashboard
-  // uses it to show the operator the sign-off their mail will actually carry.
+  // Read-only (seed-owned brand content, no PATCH field).
   emailSignature: company.emailSignature,
   senderEmail: company.senderEmail,
   senderName: company.senderName,
@@ -182,8 +180,7 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
     senderEmail: z.string().email().nullable().optional(),
     senderName: z.string().max(200).nullable().optional(),
     storefrontOrigin: z.string().url().nullable().optional(),
-    // Off = a paid order's automatic invoice stops at the draft, so positions
-    // agreed after the booking can still be added before it is finalised.
+    // Off: a paid order's automatic invoice stays a draft so later positions can be added before finalising.
     autoIssueInvoices: z.boolean().optional(),
     isActive: z.boolean().optional(),
   });
@@ -204,8 +201,7 @@ const companiesRoutes: FastifyPluginAsync = async (app) => {
         return;
       }
     }
-    // storefrontOrigin is folded into the process-wide credentialed CORS allowlist,
-    // so a tenant admin must not be able to set it — super_admin only.
+    // storefrontOrigin feeds the global credentialed CORS allowlist: super_admin only.
     if (body.storefrontOrigin !== undefined && inviterMeta.accessLevel !== 'super_admin') {
       reply.code(403).send({ error: 'Nur ein super_admin darf die storefrontOrigin ändern.' });
       return;

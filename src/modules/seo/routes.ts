@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { and, asc, desc, eq, inArray, isNull, lt, ne, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ilike, inArray, isNull, lt, ne, or, sql, type SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 
@@ -7,9 +7,21 @@ import { db } from '../../db/index.js';
 import { env } from '../../config/env.js';
 import { loadCompany } from '../../lib/company-loader.js';
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
-import { badRequest, conflict, notFound, parseIntId } from '../../lib/http-errors.js';
+import { badRequest, conflict, HttpError, notFound, parseIntId } from '../../lib/http-errors.js';
 import { sanitizeHtml } from '../../lib/sanitize-html.js';
 import { publicPathsFor, revalidateStorefront } from '../../lib/storefront-revalidate.js';
+import type { TenantTables } from '../../db/schema/tenant.js';
+import {
+  blogMetaSchema,
+  copyPath,
+  escapeLike,
+  likeTerm,
+  missingForPublish,
+  normalizeMeta,
+  publicMeta,
+  suggestPath,
+  withoutPublishDates,
+} from './blog.js';
 import { ensureJsonLdDatePublished, setJsonLdImage, type JsonLd } from './jsonld.js';
 
 const PATH_RE = /^[a-z0-9][a-z0-9/_-]{0,299}$/;
@@ -33,12 +45,16 @@ const createSchema = z.object({
   bodyHtml: z.string().max(200_000).optional(),
   schemaJsonld: jsonldSchema,
   faq: faqSchema,
+  meta: blogMetaSchema.optional(),
   status: z.enum(['draft', 'live', 'protected']).default('draft'),
   gscPosition: z.number().min(0).max(1000).optional(),
   source: z.string().max(64).optional(),
 });
 
-const updateSchema = createSchema.partial();
+const updateSchema = createSchema.partial().extend({
+  // Optimistic concurrency: the updatedAt the client last saw; a mismatch is refused with 409 STALE.
+  expectedUpdatedAt: z.string().datetime({ offset: true }).optional(),
+});
 
 const CONTENT_FIELDS = [
   'type',
@@ -52,12 +68,64 @@ const CONTENT_FIELDS = [
   'bodyHtml',
   'schemaJsonld',
   'faq',
+  'meta',
 ] as const;
 
 const PUBLIC_STATUSES = ['live', 'protected'] as const;
 
 function isPublicStatus(status: string): boolean {
   return (PUBLIC_STATUSES as readonly string[]).includes(status);
+}
+
+function assertPublishable(row: { title?: string | null; bodyHtml?: string | null }) {
+  const missing = missingForPublish({ title: row.title, bodyHtml: row.bodyHtml });
+  if (missing.length > 0) {
+    throw new HttpError(
+      400,
+      `A blog post needs ${missing.join(' and ')} before it can be published`,
+      'NOT_READY',
+    );
+  }
+}
+
+type SeoPagesTable = TenantTables['seoPages'];
+
+// Derived blog facts in SQL; JSON-LD may be one node or a @graph-style array, `lax` unwraps both.
+function blogFacts(seoPages: SeoPagesTable) {
+  const image = sql<string | null>`coalesce(
+    jsonb_path_query_first(${seoPages.schemaJsonld}, 'lax $.image ? (@.type() == "string")') #>> '{}',
+    jsonb_path_query_first(${seoPages.schemaJsonld}, 'lax $.image.url ? (@.type() == "string")') #>> '{}'
+  )`;
+  const datePublished = sql<
+    string | null
+  >`jsonb_path_query_first(${seoPages.schemaJsonld}, 'lax $.datePublished ? (@.type() == "string")') #>> '{}'`;
+  const hasTitle = sql<boolean>`(coalesce(btrim(${seoPages.title}), '') <> '')`;
+  const hasBody = sql<boolean>`(coalesce(btrim(regexp_replace(${seoPages.bodyHtml}, '<[^>]*>|&nbsp;', '', 'gi')), '') <> '')`;
+  const needsAttention = sql<boolean>`(not ${hasTitle} or not ${hasBody} or ${image} is null)`;
+  const noindex = sql<boolean>`coalesce((${seoPages.meta}->>'noindex')::boolean, false)`;
+  return { image, datePublished, hasTitle, hasBody, needsAttention, noindex };
+}
+
+const postsQuerySchema = z.object({
+  q: z.string().trim().max(200).optional(),
+  status: z.enum(['draft', 'live', 'protected']).optional(),
+  attention: z.enum(['1', 'true']).optional(),
+  sort: z.enum(['updated', 'created', 'published', 'title']).default('updated'),
+  offset: z.coerce.number().int().min(0).max(100_000).default(0),
+  limit: z.coerce.number().int().min(1).max(100).default(25),
+});
+
+const checkPathSchema = z.object({
+  path: z.string().trim().max(300),
+  excludeId: z.coerce.number().int().positive().optional(),
+});
+
+async function pathsLike(seoPages: SeoPagesTable, path: string): Promise<Set<string>> {
+  const rows = await db
+    .select({ path: seoPages.path })
+    .from(seoPages)
+    .where(or(eq(seoPages.path, path), ilike(seoPages.path, `${escapeLike(path)}-%`)));
+  return new Set(rows.map((r) => r.path));
 }
 
 const listQuerySchema = z.object({
@@ -105,6 +173,104 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { pages: page, nextCursor };
   });
 
+  // Blog index: lean rows, search, sort, status/attention filters and tab counts in one call.
+  app.get('/posts', async (request) => {
+    const { q, status, attention, sort, offset, limit } = postsQuerySchema.parse(request.query);
+    const { seoPages } = request.company!.tables;
+    const facts = blogFacts(seoPages);
+
+    const base: SQL[] = [eq(seoPages.type, 'blog')];
+    if (q) {
+      const like = likeTerm(q);
+      base.push(
+        or(
+          ilike(seoPages.title, like),
+          ilike(seoPages.path, like),
+          ilike(seoPages.metaTitle, like),
+          ilike(seoPages.metaDescription, like),
+        )!,
+      );
+    }
+    const filtered = [...base];
+    if (status) filtered.push(eq(seoPages.status, status));
+    if (attention) filtered.push(facts.needsAttention);
+
+    const order =
+      sort === 'title'
+        ? [
+            sql`lower(coalesce(nullif(btrim(${seoPages.title}), ''), ${seoPages.path})) asc`,
+            asc(seoPages.id),
+          ]
+        : sort === 'created'
+          ? [desc(seoPages.createdAt), desc(seoPages.id)]
+          : sort === 'published'
+            ? [sql`${facts.datePublished} desc nulls last`, desc(seoPages.id)]
+            : [desc(seoPages.updatedAt), desc(seoPages.id)];
+
+    const [rows, [totals], [counts]] = await Promise.all([
+      db
+        .select({
+          id: seoPages.id,
+          path: seoPages.path,
+          title: seoPages.title,
+          metaTitle: seoPages.metaTitle,
+          metaDescription: seoPages.metaDescription,
+          status: seoPages.status,
+          gscPosition: seoPages.gscPosition,
+          source: seoPages.source,
+          createdAt: seoPages.createdAt,
+          updatedAt: seoPages.updatedAt,
+          image: facts.image,
+          datePublished: facts.datePublished,
+          hasTitle: facts.hasTitle,
+          hasBody: facts.hasBody,
+          noindex: facts.noindex,
+        })
+        .from(seoPages)
+        .where(and(...filtered))
+        .orderBy(...order)
+        .limit(limit)
+        .offset(offset),
+      db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(seoPages)
+        .where(and(...filtered)),
+      db
+        .select({
+          all: sql<number>`count(*)::int`,
+          draft: sql<number>`(count(*) filter (where ${seoPages.status} = 'draft'))::int`,
+          live: sql<number>`(count(*) filter (where ${seoPages.status} = 'live'))::int`,
+          protected: sql<number>`(count(*) filter (where ${seoPages.status} = 'protected'))::int`,
+          attention: sql<number>`(count(*) filter (where ${facts.needsAttention}))::int`,
+        })
+        .from(seoPages)
+        .where(and(...base)),
+    ]);
+    return { posts: rows, total: totals?.total ?? 0, counts };
+  });
+
+  // Live duplicate-slug check for the editor; suggests the next free "-2", "-3", ….
+  app.get('/check-path', async (request) => {
+    const { path, excludeId } = checkPathSchema.parse(request.query);
+    if (!PATH_RE.test(path)) return { valid: false, available: false, suggestion: null };
+    const { seoPages } = request.company!.tables;
+    const [clash] = await db
+      .select({ id: seoPages.id })
+      .from(seoPages)
+      .where(
+        excludeId
+          ? and(eq(seoPages.path, path), ne(seoPages.id, excludeId))
+          : eq(seoPages.path, path),
+      )
+      .limit(1);
+    if (!clash) return { valid: true, available: true, suggestion: null };
+    return {
+      valid: true,
+      available: false,
+      suggestion: suggestPath(path, await pathsLike(seoPages, path)),
+    };
+  });
+
   app.get('/:id', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { seoPages } = request.company!.tables;
@@ -113,13 +279,13 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { page: row };
   });
 
-  // Mutations need at least manager level, or the dedicated `seo` level (blog
-  // writers) — viewers stay read-only.
+  // Mutations: manager+ or the dedicated `seo` level (blog writers); viewers stay read-only.
   const canEdit = { preHandler: app.requireAccess('super_admin', 'admin', 'manager', 'seo') };
 
   app.post('/', canEdit, async (request, reply) => {
     const body = createSchema.parse(request.body);
     const { seoPages } = request.company!.tables;
+    if (body.type === 'blog' && isPublicStatus(body.status)) assertPublishable(body);
     const [existing] = await db
       .select({ id: seoPages.id })
       .from(seoPages)
@@ -141,6 +307,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
         bodyHtml: body.bodyHtml != null ? sanitizeHtml(body.bodyHtml) : body.bodyHtml,
         schemaJsonld: body.schemaJsonld ?? null,
         faq: body.faq ?? [],
+        meta: body.meta ? normalizeMeta(body.meta) : {},
         status: body.status,
         gscPosition: body.gscPosition != null ? body.gscPosition.toFixed(2) : null,
         source: body.source,
@@ -169,7 +336,8 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
       bodyHtml: p.bodyHtml != null ? sanitizeHtml(p.bodyHtml) : p.bodyHtml,
       schemaJsonld: p.schemaJsonld ?? null,
       faq: p.faq ?? [],
-      status: p.status, // defaults to 'draft'
+      meta: p.meta ? normalizeMeta(p.meta) : {},
+      status: p.status,
       gscPosition: p.gscPosition != null ? p.gscPosition.toFixed(2) : null,
       source: p.source,
     }));
@@ -187,11 +355,8 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(201).send({ total: pages.length, inserted, skipped: pages.length - inserted });
   });
 
-  /**
-   * PUBLISHING RULE: refuse content overwrites on a protected page (status=protected
-   * or gsc_position <= 5). status / gscPosition / source may still change (so a human
-   * can un-protect). Automated jobs get a 409 and should file a suggestion instead.
-   */
+  // PUBLISHING RULE: content overwrites are refused (409) on a protected page (status=protected or gsc_position <= 5);
+  // status / gscPosition / source may still change so a human can un-protect.
   app.patch('/:id', canEdit, async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const body = updateSchema.parse(request.body);
@@ -199,6 +364,20 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
 
     const [current] = await db.select().from(seoPages).where(eq(seoPages.id, id)).limit(1);
     if (!current) throw notFound('SEO page not found');
+
+    const stale = () =>
+      reply.code(409).send({
+        error: 'This post was changed elsewhere since it was opened.',
+        code: 'STALE',
+        updatedAt: current.updatedAt,
+      });
+    if (
+      body.expectedUpdatedAt &&
+      new Date(body.expectedUpdatedAt).getTime() !== current.updatedAt.getTime()
+    ) {
+      stale();
+      return;
+    }
 
     const isProtected =
       current.status === 'protected' ||
@@ -243,21 +422,48 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     if (typeof patch.bodyHtml === 'string') patch.bodyHtml = sanitizeHtml(patch.bodyHtml);
     if (body.schemaJsonld !== undefined) patch.schemaJsonld = body.schemaJsonld;
     if (body.faq !== undefined) patch.faq = body.faq;
+    if (body.meta !== undefined) patch.meta = normalizeMeta(body.meta);
     if (body.gscPosition !== undefined) patch.gscPosition = body.gscPosition.toFixed(2);
 
-    // First publish of a blog post without a date: stamp it now, so the article
-    // and the /blog index show the real publication date, not the draft's insert time.
+    // First publish of a blog post without a date stamps it now, not the draft's insert time.
     const wasPublic = isPublicStatus(current.status);
     const nextType = body.type ?? current.type;
+    const willBePublic = isPublicStatus(body.status ?? current.status);
+    if (
+      nextType === 'blog' &&
+      willBePublic &&
+      (body.status !== undefined || body.title !== undefined || body.bodyHtml !== undefined)
+    ) {
+      assertPublishable({
+        title: body.title ?? current.title,
+        bodyHtml: body.bodyHtml ?? current.bodyHtml,
+      });
+    }
     if (nextType === 'blog' && body.status && isPublicStatus(body.status) && !wasPublic) {
       const base = (patch.schemaJsonld as JsonLd | null | undefined) ?? current.schemaJsonld;
       const stamped = ensureJsonLdDatePublished(base ?? null, new Date().toISOString());
       if (stamped) patch.schemaJsonld = stamped;
     }
 
-    const [row] = await db.update(seoPages).set(patch).where(eq(seoPages.id, id)).returning();
-    if (row && (wasPublic || isPublicStatus(row.status))) {
-      // Old paths too: a slug change or an unpublish must drop the previous URL.
+    // Conditional on the version the client saw, so a concurrent save between read and write still loses.
+    const [row] = await db
+      .update(seoPages)
+      .set(patch)
+      .where(
+        body.expectedUpdatedAt
+          ? and(
+              eq(seoPages.id, id),
+              sql`date_trunc('milliseconds', ${seoPages.updatedAt}) = ${body.expectedUpdatedAt}::timestamptz`,
+            )
+          : eq(seoPages.id, id),
+      )
+      .returning();
+    if (!row) {
+      stale();
+      return;
+    }
+    if (wasPublic || isPublicStatus(row.status)) {
+      // Old paths too: a slug change or unpublish must drop the previous URL.
       void revalidateStorefront(
         request.company!.slug,
         [...publicPathsFor(current), ...publicPathsFor(row)],
@@ -267,9 +473,7 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { page: row };
   });
 
-  // Set the featured image: merge a public image URL into the page's JSON-LD so
-  // the storefront renders it as the article hero. Additive (no content overwrite),
-  // so it's allowed even on protected pages.
+  // Merges a public image URL into the page's JSON-LD (article hero). Additive, so allowed on protected pages.
   const featuredImageSchema = z.object({ imageUrl: z.string().url().max(2000) });
   app.patch('/:id/featured-image', canEdit, async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
@@ -289,6 +493,43 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
     return { page: row };
   });
 
+  // Copies a post into a new draft ("… (Kopie)" at the next free "-kopie" path).
+  app.post('/:id/duplicate', canEdit, async (request, reply) => {
+    const id = parseIntId((request.params as { id: string }).id);
+    const { seoPages } = request.company!.tables;
+    const [src] = await db.select().from(seoPages).where(eq(seoPages.id, id)).limit(1);
+    if (!src) throw notFound('SEO page not found');
+    const base = src.path.replace(/-kopie(?:-\d+)?$/, '');
+    const path = copyPath(src.path, await pathsLike(seoPages, `${base}-kopie`));
+    try {
+      const [row] = await db
+        .insert(seoPages)
+        .values({
+          type: src.type,
+          path,
+          category: src.category,
+          city: src.city,
+          region: src.region,
+          title: src.title ? `${src.title} (Kopie)`.slice(0, 300) : null,
+          metaTitle: src.metaTitle,
+          metaDescription: src.metaDescription,
+          h1: src.h1,
+          bodyHtml: src.bodyHtml,
+          schemaJsonld: withoutPublishDates(src.schemaJsonld ?? null),
+          faq: src.faq,
+          meta: src.meta,
+          status: 'draft',
+          source: 'dashboard',
+        })
+        .returning();
+      reply.code(201).send({ page: row });
+    } catch (err) {
+      if ((err as { code?: string }).code === '23505')
+        throw conflict('Copy path already taken, try again');
+      throw err;
+    }
+  });
+
   app.delete('/:id', canEdit, async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { seoPages } = request.company!.tables;
@@ -301,15 +542,11 @@ export const seoAdminRoutes: FastifyPluginAsync = async (app) => {
   });
 };
 
-/**
- * Overlay rows: the page already exists as a fixed storefront route (e.g. HTR's
- * /leistungen/<slug>) and the seo_pages row only supplies its patchable text.
- * They must never be published under /seo/<path> as a second URL — the
- * storefront owns the canonical URL and lists it in its own sitemap.
- */
+// Overlay rows: the page already exists as a fixed storefront route (e.g. HTR /leistungen/<slug>) and the
+// seo_pages row only supplies patchable text. Never publish them under /seo/<path>: the storefront owns
+// the canonical URL and sitemap.
 const OVERLAY_CATEGORY = 'leistung';
 
-/** SQL predicate: everything except overlay rows (NULL category included). */
 function notOverlay(seoPages: { category: PgColumn }) {
   return or(isNull(seoPages.category), ne(seoPages.category, OVERLAY_CATEGORY))!;
 }
@@ -333,8 +570,7 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
   app.get('/', async (request) => {
     const { type } = publicListQuerySchema.parse(request.query);
     const { seoPages } = request.company!.tables;
-    // Overlay rows are deliberately absent: they are not standalone /seo/ URLs,
-    // so they must not be prerendered or listed in a sitemap.
+    // Overlay rows are excluded: not standalone /seo/ URLs, so never prerendered or listed in a sitemap.
     const conds = [inArray(seoPages.status, [...PUBLIC_STATUSES]), notOverlay(seoPages)];
     if (type) conds.push(eq(seoPages.type, type));
 
@@ -348,13 +584,14 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
           metaDescription: seoPages.metaDescription,
           h1: seoPages.h1,
           schemaJsonld: seoPages.schemaJsonld,
+          meta: seoPages.meta,
           createdAt: seoPages.createdAt,
           updatedAt: seoPages.updatedAt,
         })
         .from(seoPages)
         .where(and(...conds))
         .orderBy(desc(seoPages.createdAt), desc(seoPages.id));
-      return { pages: rows };
+      return { pages: rows.map((r) => ({ ...r, meta: publicMeta(r.meta) })) };
     }
     const rows = await db
       .select({ path: seoPages.path, type: seoPages.type, updatedAt: seoPages.updatedAt })
@@ -364,23 +601,23 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
     return { pages: rows };
   });
 
-  /**
-   * Brand-aware XML sitemap of every published page, ready for the storefront to
-   * serve at /sitemap.xml (proxy or rewrite). Absolute URLs are built from the
-   * brand's storefrontOrigin so each tenant gets its own canonical host. The
-   * storefront renders these at /seo/<path>, so that's the URL shape emitted.
-   */
+  // Brand-aware sitemap for the storefront's /sitemap.xml; absolute URLs use the brand's storefrontOrigin.
   app.get('/sitemap.xml', async (request, reply) => {
     const { seoPages } = request.company!.tables;
     const companyRow = await loadCompany(request.company!.slug);
     const origin = (companyRow?.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '');
-    // Sitemaps cap at 50k URLs per the spec. Cap the query and log if we hit it
-    // (a future split into a sitemap index would be the next step).
+    // Sitemaps cap at 50k URLs: cap the query and log when hit.
     const SITEMAP_MAX = 50_000;
     const rows = await db
       .select({ path: seoPages.path, type: seoPages.type, updatedAt: seoPages.updatedAt })
       .from(seoPages)
-      .where(and(inArray(seoPages.status, [...PUBLIC_STATUSES]), notOverlay(seoPages)))
+      .where(
+        and(
+          inArray(seoPages.status, [...PUBLIC_STATUSES]),
+          notOverlay(seoPages),
+          sql`not ${blogFacts(seoPages).noindex}`,
+        ),
+      )
       .orderBy(asc(seoPages.path))
       .limit(SITEMAP_MAX + 1);
     if (rows.length > SITEMAP_MAX) {
@@ -429,6 +666,8 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
         bodyHtml: seoPages.bodyHtml,
         schemaJsonld: seoPages.schemaJsonld,
         faq: seoPages.faq,
+        meta: seoPages.meta,
+        createdAt: seoPages.createdAt,
         updatedAt: seoPages.updatedAt,
       })
       .from(seoPages)
@@ -438,6 +677,6 @@ export const seoPublicRoutes: FastifyPluginAsync = async (app) => {
       reply.code(404).send({ error: 'Page not found' });
       return;
     }
-    reply.send({ page });
+    reply.send({ page: { ...page, meta: publicMeta(page.meta) } });
   });
 };

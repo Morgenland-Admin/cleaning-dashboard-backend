@@ -18,11 +18,8 @@ export interface CompanyRow {
 }
 
 /**
- * In-memory cache of the active company registry. Keyed by slug. Each entry
- * has a short TTL so a new row added by another instance (e.g. behind a load
- * balancer) eventually shows up without a redeploy. Hot paths can also call
- * `invalidateCompany()` directly after writes so the same instance sees its
- * own changes immediately.
+ * In-memory registry of active companies by slug. Short TTL so rows added by another instance appear
+ * without a redeploy; call `invalidateCompany()` after writes for immediate same-instance reads.
  */
 const TTL_MS = 60_000;
 

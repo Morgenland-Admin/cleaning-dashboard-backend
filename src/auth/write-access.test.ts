@@ -1,25 +1,4 @@
-/**
- * HTTP-level tests for the write-access role gate.
- *
- * What is under test is the *wiring*, not the predicate: that every admin route
- * group which mutates state actually has `requireWriteAccess` in front of it, and
- * that reads are still open to a `viewer`. A unit test of the decorator would
- * keep passing if someone registered a new write route without the hook — which
- * is precisely the regression this file exists to catch.
- *
- * Two design notes:
- *
- * 1. **Writes are probed with a deliberately invalid body.** A blocked request
- *    answers 403 before the handler runs; an allowed one reaches Zod and answers
- *    400. So "not 403" proves the gate opened *without mutating a single row* —
- *    no fixtures to restore, no test data leaking into a dev database.
- *
- * 2. **The session is stubbed, the routes are real.** Signing in through
- *    better-auth would drag password hashing and user seeding into a test about
- *    authorization. Instead `app.getSession` is replaced and the caller picks an
- *    identity per request via a header. Everything after that — the audience
- *    check, the membership lookup, the write gate, the route — is the real thing.
- */
+/** Tests the wiring, not the predicate: every state-changing admin route group must sit behind `requireWriteAccess`. */
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
@@ -31,7 +10,6 @@ import { company, membership, user } from '../db/schema/shared.js';
 
 type AccessLevel = 'super_admin' | 'admin' | 'manager' | 'seo' | 'viewer';
 
-/** Identity the stubbed session returns, chosen per request by `x-test-user`. */
 interface TestIdentity {
   id: string;
   accessLevel: AccessLevel;
@@ -47,7 +25,6 @@ const IDENTITIES: Record<AccessLevel, TestIdentity> = {
   viewer: { id: `${TEST_USER_PREFIX}viewer`, accessLevel: 'viewer', audience: 'admin' },
 };
 
-/** Reachable database? Without one this whole file is meaningless, so it skips. */
 async function databaseReachable(): Promise<boolean> {
   try {
     const client = await pool.connect();
@@ -76,8 +53,7 @@ describe(
       assert.ok(activeCompany, 'expected at least one active company — run pnpm db:seed:local');
       slug = activeCompany.slug;
 
-      // Fixtures: one user per access level, each a member of the same brand, so
-      // the only variable between them is `accessLevel`.
+      // One user per access level in the same brand, so `accessLevel` is the only variable.
       for (const identity of Object.values(IDENTITIES)) {
         await db
           .insert(user)
@@ -100,8 +76,8 @@ describe(
       app = await buildApp({ logger: false });
       await app.ready();
 
-      // Replace the real session lookup. `getSession` is read off the instance at
-      // call time, so overwriting it here reaches every guard.
+      // Stubbed session, real routes: keeps password hashing out of an authorization test.
+      // Guards read `getSession` off the instance at call time, so this reaches all of them.
       const identityFor = (value: unknown): TestIdentity | null => {
         const key = Array.isArray(value) ? value[0] : value;
         return typeof key === 'string' && key in IDENTITIES ? IDENTITIES[key as AccessLevel] : null;
@@ -142,17 +118,13 @@ describe(
             ? {}
             : { 'content-type': 'application/json' }),
         },
-        // Deliberately invalid: a request that clears the gate dies in Zod (400),
-        // which distinguishes "allowed" from "blocked" without writing anything.
+        // Deliberately invalid: a request that clears the gate fails in Zod (400), a blocked one
+        // gets 403, and nothing is written.
         ...(method === 'GET' || method === 'DELETE'
           ? {}
           : { payload: { __invalid_probe__: true } }),
       });
 
-    // --- reads: a viewer must keep full read access -------------------------
-    //
-    // A viewer that cannot read is a broken role, not a safe one — they work the
-    // same queues as everyone else, they just may not change anything.
     const READS = [
       '/admin/orders',
       '/admin/contact',
@@ -166,6 +138,7 @@ describe(
       '/admin/seo-pages',
       '/admin/ai/prompts',
       '/admin/chat/conversations',
+      '/admin/emails',
     ];
 
     for (const url of READS) {
@@ -179,10 +152,7 @@ describe(
       });
     }
 
-    // --- reads: `seo` sees the blog/SEO allowlist and nothing else ----------
-    //
-    // The scope is an allowlist (lib/access.ts `seoMayAccess`), so the refused
-    // side is every operational read plus the global surfaces the shell polls.
+    // `seo` is an allowlist (lib/access.ts `seoMayAccess`); every other read, incl. the shell's polls, is refused.
     const SEO_READS = ['/admin/seo-pages', '/admin/reviews', '/admin/companies', '/admin/users/me'];
 
     for (const url of SEO_READS) {
@@ -221,9 +191,6 @@ describe(
       assert.equal(res.statusCode, 403);
     });
 
-    // --- writes: a viewer must be refused ----------------------------------
-    //
-    // Every entry moves an order, moves money, or sends customer mail.
     const WRITES: Array<[method: 'POST' | 'PATCH' | 'DELETE', url: string]> = [
       ['POST', '/admin/orders'],
       ['PATCH', '/admin/orders/1/notes'],
@@ -234,6 +201,9 @@ describe(
       ['POST', '/admin/orders/1/message'],
       ['POST', '/admin/orders/1/adjust'],
       ['POST', '/admin/orders/1/upsell'],
+      ['POST', '/admin/orders/1/receipt'],
+      ['POST', '/admin/orders/1/receipt/preview'],
+      ['POST', '/admin/orders/1/receipt/send'],
       ['PATCH', '/admin/contact/1'],
       ['POST', '/admin/contact/1/reply'],
       ['PATCH', '/admin/inquiries/1'],
@@ -266,10 +236,8 @@ describe(
       });
     }
 
-    // --- writes: `seo` writes blog/SEO pages and their images only ----------
-    //
-    // Only POST probes: an invalid PATCH body can pass a schema of all-optional
-    // fields, and a DELETE has no body to fail on — both would touch a real row.
+    // POST probes only: an invalid PATCH body can pass an all-optional schema and DELETE has no
+    // body to fail on, so both would touch a real row.
     const SEO_WRITES: Array<[method: 'POST', url: string]> = [
       ['POST', '/admin/seo-pages'],
       ['POST', '/admin/uploads/sign-public-image'],
@@ -295,10 +263,7 @@ describe(
       });
     }
 
-    // --- writes: manager+ must not be over-blocked -------------------------
-    //
-    // The mirror of the block list. Without it, a gate accidentally set to
-    // super_admin-only would still pass every test above.
+    // Mirror of the block list: catches a gate accidentally narrowed to super_admin only.
     for (const [method, url] of WRITES) {
       for (const level of ['manager', 'admin'] as const) {
         it(`${level} is allowed through to ${method} ${url}`, async () => {
@@ -313,16 +278,11 @@ describe(
       }
     }
 
-    // --- the viewer read model ---------------------------------------------
-    //
-    // Opening reads to a viewer is only safe if the hidden columns really are
-    // hidden. This drives it through the HTTP layer rather than calling
-    // `redactForViewer` directly, because the bug worth catching is a route that
-    // forgets to call it.
+    // Goes through HTTP rather than `redactForViewer`: the bug to catch is a route that forgets to call it.
     describe('viewer redaction over HTTP', () => {
       const SENTINEL = 'integration-test-internal-note';
 
-      /** Set internalNotes on the newest row of a tenant table, then restore it. */
+      /** Sets internalNotes on one row of a tenant table, restoring it afterwards. */
       async function withInternalNote(
         table: 'orders' | 'contact_messages' | 'customers',
         run: (id: number) => Promise<void>,
@@ -343,7 +303,7 @@ describe(
           .select({ id: target.id, internalNotes: target.internalNotes })
           .from(target)
           .limit(1);
-        if (!row) return; // nothing seeded for this table — nothing to assert
+        if (!row) return; // nothing seeded for this table
         const original = row.internalNotes;
         await db.update(target).set({ internalNotes: SENTINEL }).where(eq(target.id, row.id));
         try {
@@ -441,7 +401,6 @@ describe(
       });
     });
 
-    // --- the gate is about the method, not the URL -------------------------
     it('an unknown identity is unauthorized, not merely forbidden', async () => {
       const res = await app.inject({
         method: 'GET',

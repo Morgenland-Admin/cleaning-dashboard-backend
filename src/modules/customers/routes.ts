@@ -17,16 +17,9 @@ const listQuerySchema = z.object({
   q: z.string().trim().min(1).max(200).optional(),
 });
 
-/** Largest value a Postgres int4 id can hold — bigger digit runs can't be an id. */
 const MAX_INT4 = 2147483647;
 
-/**
- * Free-text list filter: matches id, email, name, company, customer number and
- * phone. Runs in SQL rather than on the loaded page so searching for "#3734"
- * finds that customer even when it sits thousands of rows deep.
- */
 function searchCondition(customers: CustomersTable, q: string) {
-  // LIKE metacharacters are escaped so a literal "%" doesn't match everything.
   const like = `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
   const parts = [
     ilike(customers.email, like),
@@ -43,10 +36,6 @@ function searchCondition(customers: CustomersTable, q: string) {
 
 const tagsSchema = z.array(z.string().trim().min(1).max(64)).max(50);
 
-/**
- * Optional text field: trims, and treats an empty string as "cleared" (null) so
- * the form can blank a field without sending an explicit null.
- */
 const optText = (max: number) =>
   z
     .string()
@@ -84,7 +73,6 @@ const optDate = z
     message: 'date must be YYYY-MM-DD',
   });
 
-/** Person, company and billing fields shared by create and update. */
 const profileShape = {
   name: optText(200),
   phone: optText(32),
@@ -145,7 +133,6 @@ const addressSchema = z.object({
 
 const addressUpdateSchema = addressSchema.partial();
 
-/** Fields of a customer that are mirrored onto its default address row. */
 const ADDRESS_MIRROR_KEYS = [
   'addressLine1',
   'addressLine2',
@@ -154,11 +141,6 @@ const ADDRESS_MIRROR_KEYS = [
   'country',
 ] as const;
 
-/**
- * Display name of a contact. An explicitly supplied name always wins; otherwise
- * it is derived from the person fields, falling back to the company — so a
- * business contact without a named person still shows up as the company.
- */
 function deriveName(input: {
   name?: string | null;
   firstName?: string | null;
@@ -174,12 +156,10 @@ function deriveName(input: {
   return person || input.companyName?.trim() || null;
 }
 
-/** Drop keys the request did not send so a PATCH never nulls untouched columns. */
 function stripUndefined<T extends Record<string, unknown>>(obj: T): Record<string, unknown> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 }
 
-/** True for a Postgres unique-violation on the customer_number index. */
 function isCustomerNumberClash(err: unknown): boolean {
   const e = err as { code?: string; constraint?: string } | null;
   return e?.code === '23505' && (e.constraint ?? '').includes('customer_number');
@@ -189,12 +169,11 @@ const importSchema = z.object({
   csv: z
     .string()
     .min(8)
-    .max(10 * 1024 * 1024), // 10 MB hard cap
+    .max(10 * 1024 * 1024),
   dryRun: z.boolean().default(false),
   marketingOptIn: z.boolean().default(false),
 });
 
-/** Postal fields shared by a customer row and one of its address rows. */
 interface PostalFields {
   addressLine1: string | null;
   addressLine2: string | null;
@@ -206,7 +185,6 @@ interface PostalFields {
 type CustomerAddressesTable = TenantTables['customerAddresses'];
 type CustomersTable = TenantTables['customers'];
 
-/** Default address first, then oldest to newest. */
 function listAddresses(table: CustomerAddressesTable, customerId: number) {
   return db
     .select()
@@ -215,7 +193,7 @@ function listAddresses(table: CustomerAddressesTable, customerId: number) {
     .orderBy(desc(table.isDefault), asc(table.id));
 }
 
-/** Copy a default address onto the flat customers.address_* mirror columns. */
+// The default address is mirrored onto customers.address_*; invoices, exports and emails read those.
 async function mirrorAddressToCustomer(
   customers: CustomersTable,
   customerId: number,
@@ -234,11 +212,6 @@ async function mirrorAddressToCustomer(
     .where(eq(customers.id, customerId));
 }
 
-/**
- * Push the address edited on the customer form into the default address row —
- * updating it when one exists, otherwise creating it. Keeps the Addresses tab
- * and the customer form from disagreeing about the primary address.
- */
 async function upsertDefaultAddress(
   table: CustomerAddressesTable,
   customer: PostalFields & {
@@ -281,9 +254,7 @@ async function upsertDefaultAddress(
 
 export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Writes need manager+; reads stay open to any member of the brand. A `viewer`
-  // already reads the orders these customers belong to — blocking the customer
-  // record itself just left that role with dangling references.
+  // Reads open to any member (a `viewer` reads the linked orders); writes manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
@@ -348,8 +319,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       reply.code(409).send({ error: 'A customer with this email already exists' });
       return;
     }
-    // A street on the form means the operator entered an address — keep it as the
-    // customer's default address row so the Addresses tab is never empty.
+    // A street on the form means an address was entered: keep it as the default address row.
     if (row.addressLine1) {
       await db.insert(customerAddresses).values({
         customerId: row.id,
@@ -442,9 +412,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     return { customer: redactForViewer(row, accessLevelOf(request)) };
   });
 
-  // Customer 360: profile + everything linked to this customer (by customer_id,
-  // falling back to a case-insensitive email match so data shows even if a row
-  // predates the backfill). Lists are capped — this is a profile, not an export.
+  // Customer 360: linked rows by customer_id, falling back to a case-insensitive email match. Lists are capped.
   app.get('/:id/overview', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const {
@@ -510,7 +478,6 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       ]);
 
     const paidOrders = orderRows.filter((o) => o.paidAt != null);
-    // Refunds come off the turnover, per order row.
     const orderSpentCents = paidOrders.reduce(
       (sum, o) => sum + Math.max(o.totalCents - o.refundedAmountCents, 0),
       0,
@@ -520,8 +487,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     const openInvoices = issuedInvoices.filter(
       (i) => i.status === 'sent' || i.status === 'overdue',
     );
-    // Money actually received via invoices. An invoice tied to an order bills
-    // what that order already counts, so only standalone ones add turnover.
+    // Only standalone invoices add turnover: an order-linked invoice bills what the order already counts.
     const paidInvoiceSpentCents = invoiceRows
       .filter((i) => i.status === 'paid' && i.orderId == null)
       .reduce((sum, i) => sum + i.totalCents, 0);
@@ -538,7 +504,6 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       paidOrders: paidOrders.length,
       lifetimeSpentCents: orderSpentCents + paidInvoiceSpentCents,
       invoices: invoiceRows.length,
-      /** Issued (non-draft, non-void) invoices — what the customer was billed. */
       issuedInvoices: issuedInvoices.length,
       invoicedCents: issuedInvoices.reduce((sum, i) => sum + i.totalCents, 0),
       openInvoices: openInvoices.length,
@@ -551,9 +516,8 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       newsletterStatus,
     };
 
-    // Customer 360 pulls rows from five tables that all carry staff notes and
-    // submission forensics. Redact each collection, not just the profile —
-    // otherwise this endpoint becomes the way around the per-module rules.
+    // Five tables carry staff notes and submission forensics: redact each collection, not just the profile,
+    // or this endpoint bypasses the per-module rules.
     const level = accessLevelOf(request);
     return {
       customer: redactForViewer(customer, level),
@@ -586,8 +550,6 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
       if (clash) throw conflict('A customer with this email already exists');
       patch.email = email;
     }
-    // Recompute the display name whenever a name part changes, so the lists and
-    // invoices never drift from the person/company fields.
     if (
       body.name !== undefined ||
       body.firstName !== undefined ||
@@ -626,11 +588,6 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204).send();
   });
 
-  // --- Addresses -------------------------------------------------------------
-  // An ERP contact keeps several addresses (invoice, pickup/service, shipping).
-  // One is the default; it is mirrored onto the flat customers.address_* columns
-  // that invoices, exports and emails read.
-
   app.get('/:id/addresses', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { customers, customerAddresses } = request.company!.tables;
@@ -651,7 +608,6 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     if (!customer) throw notFound('Customer not found');
 
     const existing = await listAddresses(customerAddresses, id);
-    // The very first address is always the default — otherwise nothing would be.
     const makeDefault = body.isDefault || existing.length === 0;
 
     const [row] = await db.transaction(async (tx) => {
@@ -757,12 +713,7 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     reply.code(204).send();
   });
 
-  /**
-   * Rebuild the stored aggregates (orders, turnover, first/last order) from the
-   * live paid orders and paid invoices, then re-derive the loyalty tier. Reading
-   * the counters instead would keep any historic drift — e.g. a customer billed
-   * through hand-written invoices only, whose counters were never touched.
-   */
+  // Rebuilds aggregates from live paid orders and paid invoices (the stored counters can drift), then re-derives the loyalty tier.
   app.post('/:id/recompute-tier', async (request) => {
     const id = parseIntId((request.params as { id: string }).id);
     const updated = await recomputeCustomerAggregates(request.company!.tables, id);

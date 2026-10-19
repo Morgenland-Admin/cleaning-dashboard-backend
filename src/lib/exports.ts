@@ -7,7 +7,6 @@ import { getTenantTables } from '../db/schema/tenant.js';
 
 export type ExportKind = 'orders' | 'inquiries' | 'contacts' | 'newsletter' | 'customers';
 
-/** Supported export filters — validated at job creation, applied at run time. */
 export interface ExportFilter {
   /** Inclusive lower bound, "YYYY-MM-DD". */
   createdFrom?: string;
@@ -165,7 +164,6 @@ async function fetchExportRows(
       };
     }
     case 'newsletter': {
-      // No status column — date range only.
       const conds = filterConds(filter, tables.newsletterSubscribers.createdAt, null);
       const rows = await db
         .select()
@@ -189,7 +187,6 @@ async function fetchExportRows(
       };
     }
     case 'customers': {
-      // No status column — date range only.
       const conds = filterConds(filter, tables.customers.createdAt, null);
       const rows = await db
         .select()
@@ -323,7 +320,6 @@ async function runJob(job: JobRow): Promise<void> {
   }
 }
 
-/** Fail jobs stuck in 'processing' (worker died mid-job). */
 async function failStaleJobs(): Promise<void> {
   await db.execute(sql`
     UPDATE export_jobs
@@ -360,7 +356,6 @@ async function cleanupExpiredExports(): Promise<void> {
 let workerInterval: NodeJS.Timeout | null = null;
 let cleanupCounter = 0;
 
-/** Start the polling worker. Called once at server boot. */
 export function startExportWorker(opts: { intervalMs?: number } = {}): void {
   if (workerInterval) return;
   const interval = opts.intervalMs ?? 5000;
@@ -372,7 +367,6 @@ export function startExportWorker(opts: { intervalMs?: number } = {}): void {
         await runJob(job);
         job = await claimNextJob();
       }
-      // Cleanup ~once a minute, not every tick.
       cleanupCounter += 1;
       if (cleanupCounter >= 12) {
         cleanupCounter = 0;

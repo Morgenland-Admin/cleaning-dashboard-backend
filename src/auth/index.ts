@@ -28,6 +28,7 @@ export const auth = betterAuth({
       await sendEmail({
         to: u.email,
         from: adminSender(),
+        log: { companySlug: null, kind: 'password_reset' },
         email: rendered,
       });
     },
@@ -58,8 +59,7 @@ export const auth = betterAuth({
       '/sign-up/email': { window: 60, max: 5 },
       '/forget-password': { window: 60, max: 3 },
       '/reset-password': { window: 60, max: 5 },
-      // Cheap cookie-authenticated read, refetched on every window focus by
-      // the dashboard — the 30/min default logs active users out mid-session.
+      // Refetched on every window focus; the 30/min default logs active users out.
       '/get-session': { window: 60, max: 120 },
     },
   },

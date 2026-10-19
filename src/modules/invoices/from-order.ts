@@ -3,32 +3,18 @@ import { eq } from 'drizzle-orm';
 import { db } from '../../db/index.js';
 import type { TenantTables } from '../../db/schema/tenant.js';
 
-/**
- * Turning an order into a draft invoice.
- *
- * This lived inside `auto-invoice.ts` and ran only on the payment webhook. It is
- * its own module now because there are two callers with the same arithmetic and
- * different endings: the automatic one (which may issue + email straight away)
- * and the manual "Rechnung erstellen" button on an order (which never does, so
- * the positions can still be edited). Two copies of VAT back-calculation would
- * have drifted the moment one of them was fixed.
- */
-
-/** Default VAT rate for cleaning services (Germany). */
 export const VAT_RATE = 19;
 
-/** Net cents backed out of a gross (VAT-inclusive) amount. */
 export function netFromGross(grossCents: number, ratePercent: number): number {
   return Math.round(grossCents / (1 + ratePercent / 100));
 }
 
-/** Calendar date in Europe/Berlin (the Leistungsdatum is tax-relevant). */
+/** Calendar date in Europe/Berlin; the Leistungsdatum is tax-relevant. */
 export function berlinDate(d: Date): string {
-  // en-CA yields YYYY-MM-DD; the timeZone pins it to the German business day.
+  // en-CA yields YYYY-MM-DD.
   return d.toLocaleDateString('en-CA', { timeZone: 'Europe/Berlin' });
 }
 
-/** Postgres unique-violation SQLSTATE. */
 export function isUniqueViolation(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: string }).code === '23505';
 }
@@ -36,7 +22,6 @@ export function isUniqueViolation(err: unknown): boolean {
 export interface InvoiceSourceOrder {
   id: number;
   orderNumber: string | null;
-  /** Set on orders created after the customer-360 link landed. */
   customerId?: number | null;
   customerName: string;
   customerEmail: string;
@@ -61,13 +46,8 @@ export interface InvoiceLineItem {
 }
 
 /**
- * The order's money, restated as net invoice lines.
- *
- * An order is priced gross (what the customer paid), an invoice is written net
- * plus VAT. Each line is backed out of its gross individually and the tax is
- * then the remainder against the order total — never a recomputed percentage —
- * so the invoice total always matches the amount taken to the cent, whatever the
- * rounding did to the individual lines.
+ * Orders are gross, invoices net + VAT. Lines are backed out individually and tax is the remainder
+ * against the order total (never a recomputed %), so the invoice total matches the amount paid to the cent.
  */
 export function buildLineItemsFromOrder(
   order: InvoiceSourceOrder,
@@ -103,7 +83,7 @@ export function buildLineItemsFromOrder(
       unitPriceCents: -netFromGross(order.discountCents, VAT_RATE),
     });
   }
-  // Fallback so the invoice is never empty (e.g. order with no line items).
+  // Never an empty invoice.
   if (lineItems.length === 0) {
     const orderRef = order.orderNumber ? `Auftrag ${order.orderNumber}` : `Auftrag #${order.id}`;
     lineItems.push({
@@ -128,12 +108,8 @@ export interface CreateDraftResult {
 }
 
 /**
- * Insert the draft for an order, or report the one already there.
- *
- * Idempotent by the partial unique index on `invoices.order_id`: a concurrent
- * caller (a webhook retry, or an operator hitting the button while the webhook
- * lands) loses the insert with 23505 and gets the winner's row back, so an order
- * can never end up with two invoices.
+ * Insert the draft for an order, or return the existing one. The partial unique index on `invoices.order_id`
+ * makes a concurrent caller lose with 23505 and get the winner's row, so an order never has two invoices.
  */
 export async function createInvoiceDraftForOrder(
   tables: TenantTables,
@@ -161,10 +137,7 @@ export async function createInvoiceDraftForOrder(
   const { lineItems, subtotalCents, taxCents } = buildLineItemsFromOrder(order, items);
   const serviceDate = berlinDate(order.paidAt ?? new Date());
 
-  // Inherit the customer's preferred payment term (e.g. a B2B firm on net-14),
-  // falling back to the 7-day column default when they have none. The company /
-  // USt-IdNr. of a business customer rides along so the invoice is addressed to
-  // the firm, not just the person who booked.
+  // Customer's payment term (default 7 days); a business customer's company / USt-IdNr. is addressed on the invoice.
   const [cust] = await db
     .select({
       id: customers.id,
@@ -181,7 +154,7 @@ export async function createInvoiceDraftForOrder(
 
   try {
     const invoice = await db.transaction(async (tx) => {
-      // Draft carries no number — assigned from the gapless sequence at issue.
+      // Drafts have no number; it is assigned at issue.
       const [row] = await tx
         .insert(invoices)
         .values({
@@ -197,7 +170,6 @@ export async function createInvoiceDraftForOrder(
           recipientPostalCode: order.addressPostalCode,
           recipientCity: order.addressCity,
           recipientCountry: order.addressCountry ?? 'DE',
-          // Betreff on the printed invoice — points the customer at their order.
           subject: order.orderNumber ? `Auftrag ${order.orderNumber}` : null,
           serviceDate,
           currency: order.currency,

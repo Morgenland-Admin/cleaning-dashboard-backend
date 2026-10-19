@@ -1,9 +1,4 @@
-/**
- * Per-brand PriceBook registry.
- *
- * Routes resolve a book by company slug. An unknown slug returns null — the
- * caller (orders module) decides how to respond (404 vs fallback).
- */
+/** Per-brand PriceBook registry, resolved by company slug; an unknown slug returns null and the caller decides. */
 
 import { cleaniloBook } from './cleanilo.js';
 import { hamburgBook } from './hamburg.js';
@@ -20,7 +15,6 @@ export function getPriceBook(slug: string): PriceBook | null {
   return BOOKS[slug] ?? null;
 }
 
-/** Used by the storefront catalog endpoint to surface enabled services. */
 export function listPriceBooks(): readonly PriceBook[] {
   return Object.values(BOOKS);
 }

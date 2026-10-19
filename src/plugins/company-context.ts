@@ -11,7 +11,6 @@ export interface CompanyContext {
   slug: CompanySlug;
   name: string;
   schema: string;
-  /** S3 top-level folder for this brand. */
   keyPrefix: string;
   tables: TenantTables;
 }

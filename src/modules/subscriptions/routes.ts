@@ -43,7 +43,6 @@ const listQuerySchema = z.object({
 
 export const subscriptionsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Reads stay open to any member; mutations (incl. Stripe cancel) need manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
@@ -191,8 +190,7 @@ export const subscriptionsAdminRoutes: FastifyPluginAsync = async (app) => {
         .where(and(eq(subscriptions.id, id), eq(subscriptions.status, row.status)))
         .returning();
       if (!updated) {
-        // The synchronous Stripe webhook may have already written the target
-        // status — that's success, not a conflict.
+        // The Stripe webhook may already have written the target status: success, not a conflict.
         const [latest] = await db
           .select()
           .from(subscriptions)

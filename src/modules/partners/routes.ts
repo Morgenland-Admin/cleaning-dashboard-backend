@@ -117,7 +117,6 @@ export const partnersSelfRoutes: FastifyPluginAsync = async (app) => {
     reply.send({ onboardingUrl: accountLink.url, connectId });
   });
 
-  /** Re-sync the partner's Connect account flags from Stripe. */
   app.get('/connect/status', async (request) => {
     const userId = request.authUser!.id;
     const { partners } = request.company!.tables;
@@ -159,13 +158,12 @@ export const partnersSelfRoutes: FastifyPluginAsync = async (app) => {
 export const partnersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
-  // Approving, suspending and creating partner accounts are all privileged.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
     const { partners } = request.company!.tables;
     const rows = await db.select().from(partners).orderBy(desc(partners.createdAt)).limit(200);
-    // Internal notes plus payout banking — a brand viewer needs neither.
+    // Internal notes and payout banking are hidden from viewers.
     return {
       partners: redactListForViewer(rows, accessLevelOf(request), PARTNER_PAYOUT_FIELDS),
     };

@@ -27,7 +27,7 @@ interface SeedUser {
   role: 'owner' | 'admin';
 }
 
-/** Create the user + credential directly (public sign-up is disabled). Idempotent. */
+/** Writes user + credential directly because public sign-up is disabled. */
 async function ensureUser(seed: SeedUser): Promise<string> {
   const [existing] = await db.select().from(user).where(eq(user.email, seed.email)).limit(1);
   if (existing) {
@@ -85,7 +85,6 @@ async function ensureMembershipsAllBrands(userId: string, role: 'owner' | 'admin
   }
 }
 
-/** Insert one sample row per tenant table, only when that table is empty. */
 async function seedBrandSamples(slug: string, schemaName: string, name: string) {
   const t = getTenantTables(schemaName);
 
@@ -169,7 +168,6 @@ async function main() {
   });
   await ensureMembershipsAllBrands(n8nId, 'admin');
 
-  // Dedicated human-callback owner — only when a password is provided.
   let callbackId: string | null = null;
   if (CALLBACK_PASSWORD) {
     if (CALLBACK_PASSWORD.length < 8) {

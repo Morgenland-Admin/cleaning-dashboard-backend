@@ -4,12 +4,8 @@ import { LEGACY_BOOTSTRAP, type LegacyConfig } from '../db/bootstrap-companies.j
 import { brandInfoFromCompany } from './service.js';
 import { contactReplyEmail, inquiryQuoteEmail, orderMessageEmail } from './templates.js';
 
-// Guards the rule Kabir asked for: mail an operator sends from the dashboard
-// (contact reply, offer, order message) signs as the BRAND — the signatory
-// configured on the company row — and never as the logged-in dashboard user
-// ("Admin"). The operator's name stays in the internal audit log only.
+// Operator-sent mail signs as the brand's configured signatory, never as the dashboard user ("Admin").
 
-/** The subset of the company row the brand templates read, from the boot seed. */
 function brandFromSeed(cfg: LegacyConfig) {
   return brandInfoFromCompany({
     name: cfg.name,
@@ -29,7 +25,6 @@ function brandFromSeed(cfg: LegacyConfig) {
   });
 }
 
-/** The three operator-composed customer mails, rendered for one brand. */
 function operatorMails(cfg: LegacyConfig): Record<string, string> {
   const brand = brandFromSeed(cfg);
   return {
@@ -56,8 +51,7 @@ function operatorMails(cfg: LegacyConfig): Record<string, string> {
 
 for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
   test(`${cfg.slug}: operator mail signs with the brand signature`, () => {
-    // Every brand must carry a seeded sign-off — the derived fallback exists for
-    // brands created later, not for the three legacy ones.
+    // The derived fallback is for later-created brands; the three legacy ones must be seeded.
     const sig = cfg.emailSignature;
     assert.ok(sig, `${cfg.slug} has no emailSignature in the boot seed`);
     const signatory = sig.signatory;
@@ -69,8 +63,7 @@ for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
         html.includes(sig.signOff ?? 'Mit freundlichen Grüßen'),
         `${kind} has no closing line`,
       );
-      // The brand's own name and the GbR's legal name still appear (header /
-      // Pflichtangaben footer), but no dashboard login name may show up.
+      // Brand and GbR legal names may appear; operator login names may not.
       for (const operator of ['Admin', 'Rohan']) {
         assert.ok(!html.includes(operator), `${kind} leaks the operator name "${operator}"`);
       }
@@ -79,8 +72,7 @@ for (const cfg of Object.values(LEGACY_BOOTSTRAP)) {
 }
 
 test('a brand with no configured signature signs as its own team, not the operator', () => {
-  // Simulates a company created via POST /admin/companies before anyone seeded
-  // an email_signature for it.
+  // Company created via POST /admin/companies before any email_signature was seeded.
   const brand = brandInfoFromCompany({
     name: 'Neue Marke',
     senderEmail: 'info@neue-marke.de',

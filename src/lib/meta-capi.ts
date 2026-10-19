@@ -7,8 +7,7 @@ import { captureException } from './observability.js';
 
 const GRAPH_API_VERSION = 'v21.0';
 
-// Forwarded by the storefront only after marketing consent — its presence is
-// the consent signal. eventId is shared with the browser Pixel for dedup.
+// Forwarded by the storefront only after marketing consent (its presence is the consent signal); eventId dedups against the browser Pixel.
 export const metaEventContextSchema = z.object({
   eventId: z.string().min(1).max(100),
   eventSourceUrl: z.string().url().max(2000).optional(),
@@ -24,7 +23,7 @@ interface BrandMetaConfig {
   testEventCode?: string;
 }
 
-// Per-brand CAPI creds from env, like the Resend keys. Unconfigured ⇒ no-op.
+// Per-brand creds from env; unconfigured is a no-op.
 function brandMetaConfig(companySlug: string): BrandMetaConfig | null {
   let pixelId: string | undefined;
   let accessToken: string | undefined;
@@ -78,8 +77,7 @@ export interface MetaServerEventInput {
   eventTime?: number;
 }
 
-// Fire one server-side CAPI event. Best-effort: any failure is logged and
-// swallowed so tracking never breaks a checkout or form submit.
+// Best-effort: failures are logged and swallowed so tracking never breaks a checkout or form submit.
 export async function sendMetaServerEvent(
   companySlug: string,
   input: MetaServerEventInput,

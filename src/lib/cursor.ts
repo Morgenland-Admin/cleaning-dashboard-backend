@@ -1,18 +1,10 @@
 /**
- * Stable opaque cursor for list pagination. Encodes the last row's
- * (createdAt, id) tuple so the next page can do
- *   WHERE (created_at, id) < ($cursorCreatedAt, $cursorId)
- *   ORDER BY created_at DESC, id DESC
- * — which is stable even when many rows share the same created_at second.
- *
- * Format: base64url(JSON.stringify({ c: ISO, i: number })). Encoded so it
- * looks like a single opaque token to clients; decoded server-side.
+ * Opaque keyset cursor: the last row's (createdAt, id), for `WHERE (created_at, id) < (...)
+ * ORDER BY created_at DESC, id DESC` — stable even when rows share a created_at.
  */
 
 export interface ListCursor {
-  /** ISO 8601 timestamp of the last row on the previous page. */
   createdAt: string;
-  /** Primary key of the last row. */
   id: number;
 }
 
@@ -45,7 +37,7 @@ export function decodeCursor(token: string): ListCursor | null {
       return { createdAt: data.c, id: data.i };
     }
   } catch {
-    // fallthrough
+    // malformed token
   }
   return null;
 }

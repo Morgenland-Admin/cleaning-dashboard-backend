@@ -99,7 +99,7 @@ function buildTenantTables(schemaName: string) {
       id: serial('id').primaryKey(),
       customerId: integer('customer_id'),
       name: text('name').notNull(),
-      // Nullable: voice-AI phone leads often have no email (phone is the contact).
+      // Null for voice-AI phone leads (phone is the contact).
       email: text('email'),
       phone: varchar('phone', { length: 32 }),
       service: text('service'),
@@ -111,15 +111,12 @@ function buildTenantTables(schemaName: string) {
       source: varchar('source', { length: 64 }),
       status: varchar('status', { length: 16 }).notNull().default('new'),
       priority: varchar('priority', { length: 16 }).notNull().default('normal'),
-      // Service PLZ (where the cleaning happens) — drives geo callback routing.
+      // Service location PLZ; drives callback geo routing.
       plz: varchar('plz', { length: 5 }),
-      // Free-text "Grund des Anrufs" captured by the inbound voice-AI.
       callReason: text('call_reason'),
-      // Geo routing: 'human' (within radius of Hamburg) | 'ai' (warm-callback
-      // queue). Null on legacy rows created before routing existed.
+      // 'human' (within radius of Hamburg) | 'ai' (warm-callback queue); null on rows predating routing.
       callbackOwner: varchar('callback_owner', { length: 8 }),
-      // User who owns a human callback. A plain user pointer (not a "Kabir"
-      // flag) so leads can be distributed across reps without a schema change.
+      // User id of the human callback owner.
       assignedTo: text('assigned_to'),
       consentPrivacy: boolean('consent_privacy').notNull().default(false),
       consentMarketing: boolean('consent_marketing').notNull().default(false),
@@ -145,10 +142,8 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  // Log of emails sent to a lead from the dashboard (currently quotes/offers).
-  // Mail goes out via Resend, which never lands a copy in the brand mailbox, so
-  // this table is the in-app system of record. We persist the rendered HTML so
-  // the operator can preview exactly what the customer received.
+  // Quotes/offers emailed to a lead from the dashboard. Resend leaves no copy in the brand
+  // mailbox, so the rendered HTML is stored here for preview.
   const inquiryEmails = s.table(
     'inquiry_emails',
     {
@@ -394,10 +389,10 @@ function buildTenantTables(schemaName: string) {
     {
       id: serial('id').primaryKey(),
       email: text('email').notNull().unique(),
-      /** Display name — derived from first/last name, falling back to the company. */
+      /** Derived from first/last name, else the company. */
       name: text('name'),
       phone: varchar('phone', { length: 32 }),
-      /** 'private' | 'business' — drives which detail fields the UI asks for. */
+      /** 'private' | 'business' */
       customerType: varchar('customer_type', { length: 8 }).notNull().default('private'),
       /** 'herr' | 'frau' | 'divers' | 'firma' */
       salutation: varchar('salutation', { length: 16 }),
@@ -415,7 +410,6 @@ function buildTenantTables(schemaName: string) {
       taxNumber: varchar('tax_number', { length: 32 }),
       /** Operator-facing customer number (Kundennummer), unique per brand. */
       customerNumber: varchar('customer_number', { length: 32 }),
-      /** Number in a legacy/external system (Odoo, old Excel, …). */
       externalNumber: varchar('external_number', { length: 64 }),
       jobPosition: text('job_position'),
       department: text('department'),
@@ -431,7 +425,7 @@ function buildTenantTables(schemaName: string) {
       loyaltyTier: varchar('loyalty_tier', { length: 16 }).notNull().default('neukunde'),
       tags: jsonb('tags').$type<string[]>().notNull().default([]),
       internalNotes: text('internal_notes'),
-      /** Preferred invoice payment term (days) for this customer; null → brand default (7). */
+      /** Payment term in days; null → brand default (7). */
       defaultPaymentTermsDays: integer('default_payment_terms_days'),
       firstOrderAt: timestamp('first_order_at', { withTimezone: true }),
       lastOrderAt: timestamp('last_order_at', { withTimezone: true }),
@@ -448,12 +442,8 @@ function buildTenantTables(schemaName: string) {
   );
 
   /**
-   * Addresses of a customer — an ERP contact can have many (invoice address,
-   * pickup/service address, shipping address). `customerId` is a logical link
-   * (plain indexed integer, no cross-schema FK), matching the customer_id
-   * convention on orders/inquiries. Exactly one row per customer carries
-   * `isDefault`; the API mirrors that row onto the customers.address_* columns
-   * so invoices, exports and emails keep reading a single flat address.
+   * Many per customer; exactly one has `isDefault` and the API mirrors it onto customers.address_*.
+   * `customerId` is a logical link (no cross-schema FK).
    */
   const customerAddresses = s.table(
     'customer_addresses',
@@ -463,9 +453,7 @@ function buildTenantTables(schemaName: string) {
       /** 'billing' | 'service' | 'shipping' */
       kind: varchar('kind', { length: 16 }).notNull().default('billing'),
       isDefault: boolean('is_default').notNull().default(false),
-      /** Free label shown in the list, e.g. "Werkstatt Speicherstadt". */
       label: text('label'),
-      /** Recipient on this address — may differ from the customer name. */
       name: text('name'),
       company: text('company'),
       addressLine1: text('address_line1'),
@@ -540,18 +528,11 @@ function buildTenantTables(schemaName: string) {
       number: varchar('number', { length: 64 }),
       orderId: integer('order_id'),
       partnerId: integer('partner_id'),
-      /**
-       * Logical link to the billed customer (plain indexed integer, no
-       * cross-schema FK) — same convention as orders.customer_id. Lets the
-       * customer record show its invoices even when the invoice was written
-       * standalone, without an order.
-       */
+      /** Logical link (no cross-schema FK), like orders.customer_id; set on standalone invoices too. */
       customerId: integer('customer_id'),
       customerType: varchar('customer_type', { length: 8 }).notNull().default('b2c'),
       recipientName: text('recipient_name').notNull(),
-      /** B2B: company line printed above the recipient name in the address field. */
       recipientCompany: text('recipient_company'),
-      /** B2B: USt-IdNr. of the recipient, printed in the invoice info block. */
       recipientVatId: varchar('recipient_vat_id', { length: 32 }),
       recipientEmail: text('recipient_email'),
       // §14 UStG: recipient postal address is mandatory on invoices > 250 EUR.
@@ -560,7 +541,6 @@ function buildTenantTables(schemaName: string) {
       recipientPostalCode: varchar('recipient_postal_code', { length: 16 }),
       recipientCity: text('recipient_city'),
       recipientCountry: varchar('recipient_country', { length: 2 }).default('DE'),
-      /** Betreff line under the invoice headline, e.g. "Teppichbodenreinigung – Premiumreinigung". */
       subject: varchar('subject', { length: 200 }),
       // §14 UStG: Leistungsdatum / Leistungszeitraum.
       serviceDate: date('service_date'),
@@ -576,22 +556,18 @@ function buildTenantTables(schemaName: string) {
         .$type<
           Array<{
             label: string;
-            /** Second line under the label on the invoice, e.g. "Premiumreinigung". */
             note?: string | null;
             quantity: number;
             unitPriceCents: number;
-            /** Render as a package/section header line (bold) on the invoice. */
+            /** Bold package header line; distinct from the invoice-level packageMode. */
             isPackage?: boolean;
           }>
         >()
         .notNull()
         .default([]),
       /**
-       * Paketrechnung: the positions only describe the scope of work (label +
-       * note + Menge) and carry no per-line price — the agreed package price is
-       * `subtotal_cents`, entered once, and only the Netto/USt/Gesamt block shows
-       * money. Line `unit_price_cents` is forced to 0 on write in this mode, so
-       * nothing downstream can print a stale figure.
+       * Paketrechnung: lines only describe scope; the package price is `subtotal_cents`, entered once.
+       * Line `unit_price_cents` is forced to 0 on write so no stale figure can print.
        */
       packageMode: boolean('package_mode').notNull().default(false),
       paymentTermsDays: integer('payment_terms_days').notNull().default(7),
@@ -608,13 +584,9 @@ function buildTenantTables(schemaName: string) {
       craftsmanService: boolean('craftsman_service').notNull().default(false),
       /** Gross (VAT-inclusive) labour share of the total, in cents. */
       laborGrossCents: integer('labor_gross_cents'),
-      /** VAT contained in `laborGrossCents` — defaults to 19 %, operator-overridable. */
+      /** VAT part of `laborGrossCents`; defaults to 19 %, operator-overridable. */
       laborVatCents: integer('labor_vat_cents'),
-      /**
-       * The §35a sentence exactly as printed. Written whenever the labour figures
-       * change and frozen at issue, so a reissued PDF reproduces the wording the
-       * customer received even if the template text changes later.
-       */
+      /** The §35a sentence as printed; frozen at issue so a reissued PDF keeps the customer's wording. */
       craftsmanNote: text('craftsman_note'),
       createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
       updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -652,8 +624,7 @@ function buildTenantTables(schemaName: string) {
     }),
   );
 
-  // Gapless per-year invoice number sequence (one counter row per year, per
-  // tenant). Incremented at ISSUE time so abandoned drafts never burn a number.
+  // Legacy per-year counter; numbering now runs on company.invoice_number_next.
   const invoiceCounters = s.table('invoice_counters', {
     year: integer('year').primaryKey(),
     nextValue: integer('next_value').notNull().default(0),
@@ -717,6 +688,8 @@ function buildTenantTables(schemaName: string) {
       bodyHtml: text('body_html'),
       schemaJsonld: jsonb('schema_jsonld').$type<Record<string, unknown> | unknown[]>(),
       faq: jsonb('faq').$type<Array<{ question: string; answer: string }>>().notNull().default([]),
+      // Editorial/SEO settings (excerpt, noindex, canonical, social, image alt); shape in modules/seo/blog.ts.
+      meta: jsonb('meta').$type<Record<string, unknown>>().notNull().default({}),
       status: varchar('status', { length: 16 }).notNull().default('draft'), // draft | live | protected
       gscPosition: numeric('gsc_position', { precision: 5, scale: 2 }),
       source: varchar('source', { length: 64 }),
@@ -757,7 +730,6 @@ function buildTenantTables(schemaName: string) {
 
 export type TenantTables = ReturnType<typeof buildTenantTables>;
 
-/** Memoized accessor — admin-created companies resolve their tables at runtime. */
 const tenantCache = new Map<string, TenantTables>();
 export function getTenantTables(schemaName: string): TenantTables {
   let cached = tenantCache.get(schemaName);
@@ -1349,6 +1321,7 @@ CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
   "body_html" text,
   "schema_jsonld" jsonb,
   "faq" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "meta" jsonb DEFAULT '{}'::jsonb NOT NULL,
   "status" varchar(16) DEFAULT 'draft' NOT NULL,
   "gsc_position" numeric(5, 2),
   "source" varchar(64),
@@ -1359,6 +1332,7 @@ CREATE TABLE IF NOT EXISTS ${q}."seo_pages" (
 CREATE INDEX IF NOT EXISTS "seo_pages_status_type_idx" ON ${q}."seo_pages" ("status", "type");
 ALTER TABLE ${q}."seo_pages" ADD COLUMN IF NOT EXISTS "category" varchar(64);
 CREATE INDEX IF NOT EXISTS "seo_pages_category_idx" ON ${q}."seo_pages" ("category");
+ALTER TABLE ${q}."seo_pages" ADD COLUMN IF NOT EXISTS "meta" jsonb DEFAULT '{}'::jsonb NOT NULL;
 
 -- ── Customer 360: richer profile + customer_id links across source tables ──
 -- Self-healing for schemas predating these columns (idempotent).

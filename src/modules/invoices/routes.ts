@@ -21,36 +21,28 @@ import { nextInvoiceNumber } from './number.js';
 
 const lineItemSchema = z.object({
   label: z.string().min(1).max(200),
-  /** Second line under the label on the invoice ({{POSn_ZUSATZ}}). */
   note: z.string().max(200).nullable().optional(),
   quantity: z.number().min(0).max(100000),
-  // Allow negative unit prices for discount / credit lines.
+  // Negative = discount / credit line.
   unitPriceCents: z.number().int().min(-100_000_000).max(100_000_000),
   isPackage: z.boolean().optional(),
 });
 
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 
-/**
- * §35a EStG (Handwerkerleistung). The operator ticks the box and enters the
- * gross labour share; the VAT inside it defaults to the invoice's rate and can
- * be overridden. Both are money in cents, like every other amount here.
- */
+/** §35a EStG Handwerkerleistung: gross labour share + the VAT inside it (defaults to the invoice rate); cents. */
 const craftsmanFields = {
   craftsmanService: z.boolean().optional(),
   laborGrossCents: z.number().int().min(0).max(100_000_000).nullable().optional(),
-  /** Omit (or null) to derive it from the gross share. */
+  /** Omit/null = derive from the gross share. */
   laborVatCents: z.number().int().min(0).max(100_000_000).nullable().optional(),
-  /** Hand-edited wording; omit to compose it, null to reset to the composed one. */
+  /** Hand-edited wording; omit = compose, null = reset to composed. */
   craftsmanNote: z.string().max(1000).nullable().optional(),
 };
 
 /**
- * Paketrechnung. The positions only describe the scope of work — no per-line
- * Einzelpreis/Betrag is printed — and the agreed net package price is entered
- * once, landing in `subtotal_cents`. `packageNetCents` is mandatory whenever the
- * mode is switched on (0 is allowed so an undecided draft can still be parked;
- * issuing a 0,00 € invoice is refused further down).
+ * Paketrechnung: no per-line prices; the agreed net package price lands in `subtotal_cents`.
+ * `packageNetCents` is required when the mode is on (0 parks an undecided draft; issuing 0,00 € is refused).
  */
 const packageFields = {
   packageMode: z.boolean().optional(),
@@ -58,9 +50,7 @@ const packageFields = {
 };
 
 const recipientAddressFields = {
-  /** B2B: company line above the recipient name in the address field. */
   recipientCompany: z.string().max(200).nullable().optional(),
-  /** B2B: USt-IdNr. of the recipient, shown in the invoice info block. */
   recipientVatId: z.string().max(32).nullable().optional(),
   recipientAddressLine1: z.string().max(200).nullable().optional(),
   recipientAddressLine2: z.string().max(200).nullable().optional(),
@@ -76,17 +66,15 @@ const createSchema = z.object({
   recipientName: z.string().min(1).max(200),
   recipientEmail: z.string().email().optional(),
   ...recipientAddressFields,
-  /** Betreff line under the invoice headline ({{BETREFF}}). */
   subject: z.string().max(200).nullable().optional(),
   serviceDate: dateStr.nullable().optional(),
   serviceDateEnd: dateStr.nullable().optional(),
   lineItems: z.array(lineItemSchema).min(1).max(100),
   ...packageFields,
-  /** VAT rate; taxCents is computed server-side. */
+  /** taxCents is computed server-side. */
   taxRatePercent: z.union([z.literal(0), z.literal(7), z.literal(19)]).default(19),
-  /** Omit to inherit the recipient customer's default term (falls back to 7). */
+  /** Omit = recipient customer's default, else 7. */
   paymentTermsDays: z.number().int().min(0).max(120).optional(),
-  /** How the invoice is settled — drives the payment text + bank block. */
   paymentMethod: z.enum(['transfer', 'card', 'cash']).default('transfer'),
   notes: z.string().max(2000).optional(),
   ...craftsmanFields,
@@ -110,7 +98,7 @@ const draftUpdateSchema = z.object({
   odooInvoiceId: z.string().max(255).nullable().optional(),
 });
 
-/** After issue, only status + external reference may change. */
+/** GoBD: after issue only status + external reference may change. */
 const issuedUpdateSchema = z.object({
   status: z.enum(['paid', 'overdue', 'void']).optional(),
   odooInvoiceId: z.string().max(255).nullable().optional(),
@@ -140,11 +128,7 @@ function computeTaxCents(subtotalCents: number, taxRatePercent: number): number 
   return Math.round((subtotalCents * taxRatePercent) / 100);
 }
 
-/**
- * The three money columns. A normal invoice sums its positions; a Paketrechnung
- * ignores the line prices entirely and takes the single agreed net package price
- * as the subtotal, because its positions are pure scope-of-work text.
- */
+/** Paketrechnung: the subtotal is the agreed net package price, line prices are ignored. */
 function computeMoney(
   lineItems: Array<{ quantity: number; unitPriceCents: number }>,
   taxRatePercent: number,
@@ -158,11 +142,7 @@ function computeMoney(
   return { subtotalCents, taxCents, totalCents: subtotalCents + taxCents };
 }
 
-/**
- * Strip prices off the positions of a Paketrechnung before they are stored, so
- * no later render (PDF, email, dashboard) can surface a figure the document
- * deliberately doesn't show.
- */
+/** Paketrechnung positions are stored without prices so no later render (PDF, email, dashboard) can show one. */
 function normalizeLineItems<T extends { unitPriceCents: number }>(
   lineItems: T[],
   packageMode: boolean,
@@ -170,11 +150,7 @@ function normalizeLineItems<T extends { unitPriceCents: number }>(
   return packageMode ? lineItems.map((l) => ({ ...l, unitPriceCents: 0 })) : lineItems;
 }
 
-/**
- * Guard against freezing a document that bills nothing — the failure mode a
- * package invoice makes easy, since its positions carry no prices to notice are
- * missing. Credit notes (negative totals) stay allowed.
- */
+/** Refuses a 0,00 € invoice (easy to miss on a Paketrechnung); credit notes (negative) stay allowed. */
 function zeroTotalError(totalCents: number): string | null {
   return totalCents === 0
     ? 'Der Rechnungsbetrag ist 0,00 €. Bitte tragen Sie den Preis ein, bevor die Rechnung ausgestellt wird.'
@@ -196,21 +172,8 @@ interface CraftsmanState {
 }
 
 /**
- * Resolve the §35a EStG columns for a create/update, including the sentence
- * that gets printed. The text is stored — not only rendered from a template —
- * so a reissued PDF reproduces exactly what the customer received.
- *
- * The VAT share defaults to the portion contained in the gross labour amount at
- * the invoice's own rate (19 % → 200,00 € contains 31,93 €) and is overridable,
- * because a mixed invoice can carry a labour share taxed differently from the
- * document as a whole. Throws a 400 when the box is ticked without a usable
- * amount — a §35a block with a missing or impossible figure is worse than none.
- *
- * `craftsmanNote` may be sent to print a hand-edited wording (the dashboard
- * always sends what it displayed, so the operator gets WYSIWYG). Omitted, the
- * sentence is composed; sent as null, it resets to the composed one. A stored
- * custom wording survives unrelated PATCHes but is regenerated when the amounts
- * change, so the text can never quote a figure the invoice no longer carries.
+ * §35a EStG columns + printed sentence (stored, so a reissue matches what was sent). The VAT share defaults to the
+ * portion inside the gross labour amount; custom `craftsmanNote` is regenerated when amounts change, null resets it.
  */
 function resolveCraftsman(
   body: CraftsmanInput,
@@ -246,8 +209,7 @@ function resolveCraftsman(
     );
   }
 
-  // Explicit override wins. Otherwise recompute whenever the gross share was
-  // part of this request, so an edited amount never keeps a stale VAT figure.
+  // Explicit override wins; else recompute when the gross share changed (no stale VAT).
   const autoVat = craftsmanVatFromGross(
     gross,
     taxRatePercent > 0 ? taxRatePercent : CRAFTSMAN_DEFAULT_VAT_RATE,
@@ -289,15 +251,12 @@ function missingIssueFields(current: {
 
 export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Writes (issue, send, credit) need manager+; reads stay open to any member,
-  // so a `viewer` can answer "was this paid?" without being able to change it.
+  // Writes need manager+; reads stay open to any member (viewer included).
   app.addHook('preHandler', app.requireWriteAccess);
 
   /**
-   * Shared draft → issued transition (GoBD): assigns the gapless per-brand
-   * number + dueAt in one transaction. Used by both `/send` (issue + email) and
-   * `/issue` (issue + print, no email). Returns the issued row, or null if the
-   * draft was changed/issued concurrently. Assumes §14 fields already validated.
+   * Draft → sent with gapless number + dueAt in one transaction (GoBD); null if changed concurrently.
+   * Caller validates the §14 fields.
    */
   async function issueDraftTx(
     request: FastifyRequest,
@@ -373,9 +332,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     return { invoice: row };
   });
 
-  // Render the invoice as a PDF for on-screen preview / download. Same document
-  // that gets attached to the email (shared buildInvoicePdfData). Works for
-  // drafts too, so operators can proof a Rechnung before issuing it.
+  // Same document as the emailed PDF; drafts included so operators can proof before issuing.
   app.get('/:id/pdf', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { invoices } = request.company!.tables;
@@ -418,10 +375,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       packageMode,
       body.packageNetCents ?? 0,
     );
-    // Payment term: explicit value wins; else the recipient customer's default; else 7.
-    // The same lookup fills the B2B company / USt-IdNr. when the caller left them
-    // out, so an invoice to a business customer is never addressed person-only,
-    // and links the invoice to that customer record.
+    // Payment term: explicit > customer default > 7. The lookup also fills B2B company / USt-IdNr. and the customer link.
     let paymentTermsDays = body.paymentTermsDays;
     let recipientCompany = body.recipientCompany;
     let recipientVatId = body.recipientVatId;
@@ -444,8 +398,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         recipientVatId ??= cust.vatId;
       }
       customerId = cust?.id ?? null;
-      // Recipient isn't a customer yet — create the record (partner invoices
-      // excluded: a partner is not a customer).
+      // Unknown recipient: create the customer (not for partner invoices).
       if (customerId == null && body.partnerId == null) {
         customerId = await linkCustomerByEmail(db, customers, {
           email: body.recipientEmail,
@@ -454,7 +407,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       }
     }
     paymentTermsDays ??= 7;
-    // No email to go by (or an unknown one): inherit the order's customer.
+    // No usable email: inherit the order's customer.
     if (customerId == null && body.orderId != null) {
       const { orders } = request.company!.tables;
       const [ord] = await db
@@ -466,7 +419,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     }
     const craftsman = resolveCraftsman(body, null, totalCents, body.taxRatePercent);
     const invoice = await db.transaction(async (tx) => {
-      // Drafts carry no number — it's assigned from the gapless sequence at issue.
+      // No number on drafts; assigned at issue (gapless).
       const [row] = await tx
         .insert(invoices)
         .values({
@@ -533,11 +486,10 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const set: Record<string, unknown> = { ...body, updatedAt: now };
-    // Input-only field — it feeds subtotalCents below and is not a column.
+    // Input-only, not a column.
     delete set.packageNetCents;
     if (body.status === 'paid') set.paidAt = now;
-    // Re-point the customer link when a draft's recipient is retyped, so the
-    // invoice follows the person it is actually billed to.
+    // Re-point the customer link when a draft's recipient is retyped.
     if (isDraft && 'recipientEmail' in body && current.partnerId == null) {
       const draftBody = body as z.infer<typeof draftUpdateSchema>;
       set.customerId = draftBody.recipientEmail
@@ -558,9 +510,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       const packageMode = draftBody.packageMode ?? current.packageMode;
       const lineItems = normalizeLineItems(draftBody.lineItems ?? current.lineItems, packageMode);
       const taxRatePercent = draftBody.taxRatePercent ?? current.taxRatePercent;
-      // A PATCH that only reorders positions must not drop the package price —
-      // it already lives in subtotalCents. Leaving package mode resets it to the
-      // (now zero) line sum, so the operator has to price the positions again.
+      // Reordering alone must not drop the package price (it lives in subtotalCents); leaving package mode resets it.
       const packageNetCents =
         draftBody.packageNetCents ?? (current.packageMode ? current.subtotalCents : 0);
       set.lineItems = lineItems;
@@ -568,9 +518,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       Object.assign(set, computeMoney(lineItems, taxRatePercent, packageMode, packageNetCents));
     }
     if (isDraft) {
-      // Recomputed on every draft write: line-item edits change the total the
-      // labour share is checked against, and the stored §35a sentence has to
-      // follow the amounts it quotes.
+      // Every draft write: totals feed the labour-share check and the stored sentence must follow its amounts.
       const draftBody = body as z.infer<typeof draftUpdateSchema>;
       Object.assign(
         set,
@@ -597,8 +545,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         changedByUserId: adminId,
         reason: 'Status geändert (PATCH)',
       });
-      // Turnover changed hands (paid) or was written off (void) — keep the
-      // customer's totals and loyalty tier in step.
+      // paid/void changes turnover: refresh customer totals and loyalty tier.
       if (body.status === 'paid' || body.status === 'void') {
         await recomputeCustomerForInvoice(request.company!.tables, row, request.log);
       }
@@ -622,8 +569,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const now = new Date();
     let row = current;
     if (current.status === 'draft') {
-      // §14 UStG: mandatory before issue. Leistungsdatum is optional — the
-      // recipient postal address stays required.
+      // §14 UStG: recipient address is mandatory before issue; Leistungsdatum is optional here.
       const missing = missingIssueFields(current);
       if (missing.length > 0) {
         reply.code(400).send({
@@ -637,8 +583,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         reply.code(400).send({ error: zeroTotal });
         return;
       }
-      // dueAt is set once at first issue; re-sends never move it. The gapless
-      // invoice number is assigned here (issue time), in the same transaction.
+      // dueAt is set once at first issue (re-sends never move it); the gapless number is assigned here.
       const issued = await issueDraftTx(
         request,
         id,
@@ -652,7 +597,6 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       }
       row = issued;
     } else {
-      // sent/overdue: re-send the unchanged document.
       await db.insert(invoiceStatusLog).values({
         invoiceId: id,
         fromStatus: current.status,
@@ -661,7 +605,6 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
         reason: 'Rechnung erneut versendet',
       });
     }
-    // Email the invoice to the recipient via the brand's Resend account.
     // Best-effort: a mail failure must not undo the "sent" transition.
     let emailSent = false;
     let emailSkipped = false;
@@ -685,9 +628,7 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     return { invoice: row, emailSent, emailSkipped };
   });
 
-  // Issue a draft WITHOUT emailing it (offline / print flow). Assigns the
-  // gapless number and freezes the invoice exactly like `/send`, but never
-  // touches Resend — the operator prints or downloads the PDF instead.
+  // Issue without emailing (print/offline): same numbering and freeze as /send, never touches Resend.
   app.post('/:id/issue', async (request, reply) => {
     const id = parseIntId((request.params as { id: string }).id);
     const { invoices } = request.company!.tables;
@@ -732,7 +673,6 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const now = new Date();
     const [current] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
     if (!current) throw notFound('Invoice not found');
-    // Only issued invoices can be paid.
     if (current.status !== 'sent' && current.status !== 'overdue') {
       reply.code(409).send({
         error: `Rechnung im Status "${current.status}" kann nicht als bezahlt markiert werden.`,
@@ -755,7 +695,6 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
       changedByUserId: request.authUser!.id,
       reason: 'Als bezahlt markiert',
     });
-    // The money is in — fold it into the customer's turnover / loyalty tier.
     await recomputeCustomerForInvoice(request.company!.tables, row, request.log);
     return { invoice: row };
   });
@@ -766,7 +705,6 @@ export const invoicesAdminRoutes: FastifyPluginAsync = async (app) => {
     const now = new Date();
     const [current] = await db.select().from(invoices).where(eq(invoices.id, id)).limit(1);
     if (!current) throw notFound('Invoice not found');
-    // Only issued, unpaid invoices can be dunned.
     if (current.status !== 'sent' && current.status !== 'overdue') {
       reply.code(409).send({
         error: `Mahnung ist für Rechnungen im Status "${current.status}" nicht möglich.`,

@@ -17,10 +17,8 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
   });
 
   app.get('/chat', { websocket: true }, async (connection, req) => {
-    // CSWSH guard: browsers always send Origin on the WS handshake, and SOP does
-    // not block cross-origin WS the way it does fetch — so reject any browser
-    // origin not in our CORS allowlist. A missing Origin (non-browser) is allowed,
-    // matching the HTTP CORS policy.
+    // CSWSH guard: SOP doesn't block cross-origin WS, so reject browser origins outside the CORS
+    // allowlist. A missing Origin (non-browser client) is allowed, as in the HTTP CORS policy.
     const origin = req.headers.origin;
     if (origin && !env.CORS_ORIGINS.includes(origin)) {
       connection.close(4403, 'Origin not allowed');
@@ -90,7 +88,7 @@ const chatWsPlugin: FastifyPluginAsync = async (app) => {
         connection.close(4403, 'Not a member of this brand');
         return;
       }
-      // Partner chat is outside the blog/SEO scope (see seoMayAccess).
+      // Partner chat is outside the SEO-only scope.
       if (accessLevel === 'seo') {
         connection.close(4403, 'Insufficient access level');
         return;

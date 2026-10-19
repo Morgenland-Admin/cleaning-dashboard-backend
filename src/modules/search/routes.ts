@@ -7,20 +7,11 @@ import { company, membership } from '../../db/schema/shared.js';
 import { getTenantTables } from '../../db/schema/tenant.js';
 import { accessLevelOf } from '../../lib/access.js';
 
-/**
- * Cross-brand, cross-entity lookup for the dashboard's ⌘K palette.
- *
- * Deliberately read-only and deliberately shallow: it returns just enough to
- * render a row and route to it. The palette is for "find that order" — the
- * per-page filters remain the tool for working a list.
- *
- * Scope is the caller's own brands (all active brands for a super_admin), so this
- * cannot become a way to read across a tenant boundary.
- */
+// Cross-brand lookup for the ⌘K palette: read-only and shallow (enough to render a row and route to it).
+// Scope is the caller's own brands (all active for a super_admin), so it cannot read across a tenant boundary.
 
 const querySchema = z.object({
   q: z.string().trim().min(2).max(120),
-  /** Cap per entity kind, per brand. Small on purpose — this is a picker. */
   limit: z.coerce.number().int().min(1).max(10).default(5),
 });
 
@@ -31,25 +22,18 @@ interface SearchHit {
   companySlug: string;
   companyName: string;
   id: number;
-  /** Primary line, e.g. an order number or a customer name. */
   title: string;
-  /** Secondary line — who or what it concerns. */
   subtitle: string | null;
-  /** Right-aligned meta, e.g. a status or an amount. */
   meta: string | null;
-  /** Dashboard path the palette navigates to. */
   href: string;
 }
 
-/** Escape LIKE metacharacters so a literal "%" doesn't match everything. */
 function likeTerm(q: string): string {
   return `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
 }
 
-/** Largest value a Postgres int4 id can hold — longer digit runs can't be an id. */
 const MAX_INT4 = 2147483647;
 
-/** "3734" and "#3734" both mean "the row with this id". */
 function asId(q: string): number | null {
   const m = /^#?(\d{1,10})$/.exec(q);
   if (!m) return null;
@@ -57,12 +41,8 @@ function asId(q: string): number | null {
   return n <= MAX_INT4 ? n : null;
 }
 
-/**
- * Orders display `YYYY/NNNNNN`, and for rows without a persisted `order_number`
- * that string is *derived* from the id — so it cannot be matched with a LIKE.
- * Parse it back to the id instead, otherwise searching for the number printed on
- * the screen finds nothing.
- */
+// Orders without a stored order_number display a number (YYYY/NNNNNN) derived from the id, so LIKE can't match it:
+// parse it back to the id.
 function orderNumberToId(q: string): number | null {
   const m = /^(\d{4})\s*\/\s*(\d{1,6})$/.exec(q.trim());
   if (!m) return null;
@@ -70,7 +50,7 @@ function orderNumberToId(q: string): number | null {
   return n > 0 && n <= MAX_INT4 ? n : null;
 }
 
-/** Same display format the orders module uses, for rows with no stored number. */
+// Same display format the orders module uses for rows with no stored number.
 function displayOrderNumber(row: { id: number; orderNumber: string | null; createdAt: Date }) {
   return row.orderNumber ?? `${row.createdAt.getUTCFullYear()}/${String(row.id).padStart(6, '0')}`;
 }
@@ -90,7 +70,6 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
       const userId = request.authUser!.id;
       const level = accessLevelOf(request);
 
-      // A super_admin sees every active brand; everyone else only their own.
       const brands =
         level === 'super_admin'
           ? await db
@@ -109,9 +88,7 @@ const searchRoutes: FastifyPluginAsync = async (app) => {
       const id = asId(q);
       const derivedOrderId = orderNumberToId(q);
 
-      // Per brand: five small, independent lookups. Every one is indexed on the
-      // columns it filters, and each is capped at `limit`, so the total work is
-      // bounded by brands × 5 × limit regardless of table size.
+      // Five small indexed lookups per brand, each capped at `limit`: work is bounded by brands × 5 × limit.
       const perBrand = await Promise.all(
         brands.map(async (brand): Promise<SearchHit[]> => {
           const t = getTenantTables(brand.schemaName);

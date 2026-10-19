@@ -1,21 +1,9 @@
 import { nanoid } from 'nanoid';
 
 /**
- * Status FSM mirroring workflow ALL_09. The status of an order can only move
- * along these directed edges; the admin UI greys out transitions that aren't
- * allowed from the current state.
- *
- * pending           — order row exists, no payment yet (DRAFT before checkout)
- * payment_pending   — Stripe Checkout Session created, waiting for completion
- * paid              — Stripe webhook reported success; ready for admin to accept
- * accepted          — admin acknowledged + scheduled
- * picked_up         — driver collected the carpet (or customer dropped off)
- * in_cleaning       — workshop is processing
- * ready             — done, awaiting delivery / pickup
- * delivered         — handed back to customer
- * completed         — customer confirmed receipt (or 14-day auto-complete)
- * cancelled         — terminated before payment/processing (refund handled separately)
- * refunded          — money returned, terminal
+ * Status FSM (mirrors workflow ALL_09); the admin UI greys out disallowed transitions.
+ * `completed` = customer confirmed receipt or 14-day auto-complete; `cancelled` = before
+ * processing, refund is separate.
  */
 export type OrderStatus =
   | 'pending'
@@ -46,11 +34,7 @@ export const ORDER_STATUSES: readonly OrderStatus[] = [
   'refunded',
 ];
 
-/**
- * Allowed forward + side transitions. Any paid state can move to
- * partially_refunded (some money back, order continues) or refunded (terminal).
- * A partially_refunded order can still be fully refunded later.
- */
+/** Allowed transitions; partially_refunded keeps the order going and can still be fully refunded. */
 const FORWARD: Record<OrderStatus, OrderStatus[]> = {
   pending: ['payment_pending', 'cancelled'],
   payment_pending: ['paid', 'cancelled'],
@@ -83,7 +67,6 @@ export function allowedNextStatuses(from: OrderStatus): OrderStatus[] {
   return FORWARD[from] ?? [];
 }
 
-/** Map a status to the order column that stamps its at-time. Falsy = no col. */
 export function statusTimestampColumn(s: OrderStatus): string | null {
   switch (s) {
     case 'paid':
@@ -109,11 +92,7 @@ export function statusTimestampColumn(s: OrderStatus): string | null {
   }
 }
 
-/**
- * URL-safe random token for /bestellung/[token]. 24 chars = ~143 bits of
- * entropy — same order of magnitude as a UUIDv4, but URL-safe without
- * any percent-encoding. Nanoid's default alphabet excludes ambiguous chars.
- */
+/** URL-safe token for /bestellung/[token]; 24 chars ≈ 143 bits of entropy. */
 export function generateOrderToken(): string {
   return nanoid(24);
 }

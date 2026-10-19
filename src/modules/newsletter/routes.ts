@@ -34,7 +34,7 @@ const listQuerySchema = z.object({
   cursor: z.string().min(1).max(500).optional(),
 });
 
-const CONFIRM_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+const CONFIRM_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
 function appBaseUrl(): string {
   return env.APP_BASE_URL.replace(/\/$/, '');
@@ -57,10 +57,9 @@ function renderHtmlPage(
   reply: FastifyReply,
   opts: {
     title: string;
-    /** Heading text — will be HTML-escaped before injection. */
+    /** HTML-escaped before injection. */
     heading: string;
-    /** Pre-rendered, already-trusted HTML for the body. Caller is responsible
-     * for escaping any user-controlled segments before passing them here. */
+    /** Trusted pre-rendered HTML; the caller must escape any user-controlled segments. */
     bodyHtml: string;
     status?: number;
   },
@@ -74,8 +73,8 @@ function renderHtmlPage(
 }
 
 export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
-  // Unsubscribe form + RFC 8058 clients POST urlencoded bodies; the token is
-  // in the query string, so accept and discard the body.
+  // The unsubscribe form and RFC 8058 clients POST urlencoded bodies; the token is in the query string,
+  // so the body is accepted and discarded.
   app.addContentTypeParser(
     'application/x-www-form-urlencoded',
     { parseAs: 'string' },
@@ -140,6 +139,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
           const result = await sendEmail({
             to: row.email,
             from: brandSender(companyRow),
+            log: { companySlug: slug, kind: 'newsletter_confirm' },
             apiKey: companyRow.resendApiKey ?? undefined,
             replyTo: companyRow.email ?? undefined,
             // RFC 8058 one-click unsubscribe (Gmail/Yahoo bulk-sender rules).
@@ -250,7 +250,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
     token: z.string().min(8).max(500),
   });
 
-  /** Confirmation page only — mail scanners prefetch GETs, so POST does the work. */
+  /** Confirmation page only: mail scanners prefetch GETs, so the POST does the work. */
   app.get(
     '/unsubscribe',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
@@ -291,7 +291,7 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  /** Performs the unsubscribe. Also serves RFC 8058 one-click POSTs. */
+  /** Also serves RFC 8058 one-click POSTs. */
   app.post(
     '/unsubscribe',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
@@ -340,7 +340,6 @@ export const newsletterPublicRoutes: FastifyPluginAsync = async (app) => {
 export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireAudience('admin'));
   app.addHook('preHandler', app.requireCompany);
-  // Deleting subscribers and bulk-importing consent records — manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {
@@ -369,7 +368,7 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
       hasMore && last
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
-    // Subscriber rows carry the IP/user-agent captured at signup.
+    // Subscriber rows carry the signup IP/user-agent; redacted for viewers.
     return {
       subscribers: redactListForViewer(page, accessLevelOf(request)),
       nextCursor,
@@ -398,14 +397,12 @@ export const newsletterAdminRoutes: FastifyPluginAsync = async (app) => {
     csv: z
       .string()
       .min(8)
-      .max(10 * 1024 * 1024), // 10 MB hard cap
+      .max(10 * 1024 * 1024),
     dryRun: z.boolean().default(false),
     tag: z.string().trim().max(64).optional(),
     source: z.string().trim().max(64).default('csv-import'),
-    /**
-     * UWG §7: the sender must prove consent. Rows import as confirmed only
-     * when the admin attests proof exists; otherwise they must double-opt-in.
-     */
+    // UWG §7: the sender must prove consent. Rows import as confirmed only when the admin attests
+    // proof exists, otherwise they must double-opt-in.
     attestConsent: z.boolean().default(false),
   });
 

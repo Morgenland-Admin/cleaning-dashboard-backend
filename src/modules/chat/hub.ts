@@ -1,17 +1,7 @@
 import type { WebSocket } from 'ws';
 
-/**
- * Lightweight in-memory pub/sub for chat events. Keyed on
- *   roomId = `${companySlug}:${partnerUserId}`
- *
- * Each room holds the set of connected sockets (admin + partner). When a
- * REST send/read/typing event happens, we look up the room and broadcast
- * to every socket except the sender.
- *
- * Trade-off: in-memory means horizontal scaling needs a Redis adapter or
- * sticky sessions. Acceptable for one backend instance today; document
- * before we shard.
- */
+// In-memory pub/sub; rooms are keyed `${companySlug}:${partnerUserId}`.
+// Single instance only: scaling out needs a Redis adapter or sticky sessions.
 
 export type ChatEvent =
   | {
@@ -46,7 +36,6 @@ export interface ChatMessagePayload {
 
 interface SocketEntry {
   socket: WebSocket;
-  /** Who the connection authenticated as — used so we never echo back to sender. */
   userId: string;
   role: 'admin' | 'partner';
 }
@@ -70,10 +59,6 @@ export function join(roomId: string, entry: SocketEntry): () => void {
   };
 }
 
-/**
- * Send an event to everyone in the room except the originator. Returns the
- * number of recipients so callers can log delivery stats if useful.
- */
 export function broadcast(roomId: string, event: ChatEvent, exceptUserId?: string): number {
   const bucket = rooms.get(roomId);
   if (!bucket) return 0;
@@ -89,7 +74,6 @@ export function broadcast(roomId: string, event: ChatEvent, exceptUserId?: strin
   return n;
 }
 
-/** Internal — exposed for diagnostics / future presence features. */
 export function roomSize(roomId: string): number {
   return rooms.get(roomId)?.size ?? 0;
 }

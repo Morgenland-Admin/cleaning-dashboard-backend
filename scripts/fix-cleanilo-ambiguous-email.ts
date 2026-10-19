@@ -1,22 +1,7 @@
 /**
- * Correction for the CLEANILO historical import: replace a real CRM email that
- * was accepted on an ambiguous name-only match with the standard import
- * placeholder.
- *
- * Background: the reconciliation offered several equally-rated `name_exact` +
- * SICHER candidates for one invoice (a bare surname matches many people) and the
- * importer's Map-overwrite silently kept the last one. The agreed rule is that a
- * name alone never verifies an address — that invoice must carry a placeholder.
- * `applyMatches` now rejects ambiguous candidates (see `fix-cleanilo-b2b.ts`
- * for the same treatment of contradicting B2B segments); this script repairs the row
- * that already landed.
- *
- *   Dry run:  DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/fix-cleanilo-ambiguous-email.ts
- *   Apply:    … scripts/fix-cleanilo-ambiguous-email.ts --commit
- *
- * Writes go straight to the tenant tables (no API, no webhook) so no
- * notification, dunning or automation can fire. Idempotent: a customer already
- * on a placeholder is left untouched.
+ * Replaces a real CRM email accepted on an ambiguous name-only match with the import placeholder.
+ * Direct tenant writes (no API/webhook, so no automation fires); idempotent.
+ * DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/fix-cleanilo-ambiguous-email.ts <invoices.json> <reconciliation.csv> [--commit]
  */
 import { and, eq, sql } from 'drizzle-orm';
 
@@ -51,8 +36,7 @@ async function main(): Promise<void> {
   );
 
   for (const amb of plan.ambiguousMatches) {
-    // The plan is now placeholder-based for this invoice; take the exact
-    // placeholder the importer would have written so the row matches a re-run.
+    // Use the placeholder the importer would write, so the row matches a re-run.
     const invoice = plan.invoices.find((i) => i.invoiceNumber === amb.invoiceNumber);
     if (!invoice) {
       L(`  ${amb.invoiceNumber}: not in the import plan (skipped row?) — nothing to do`);

@@ -8,7 +8,7 @@ import { SEO_HIDDEN_REVIEW_FIELDS, accessLevelOf, redactListForViewer } from '..
 import { decodeCursor, encodeCursor } from '../../lib/cursor.js';
 import { badRequest, notFound, parseIntId } from '../../lib/http-errors.js';
 
-/** Recompute a partner's avg rating + count from published reviews only. */
+// Average rating and count come from published reviews only.
 async function recomputePartnerRating(tables: TenantTables, partnerId: number): Promise<void> {
   const [agg] = await db
     .select({ avgRating: avg(tables.reviews.rating), n: count() })
@@ -146,7 +146,6 @@ export const reviewsAdminRoutes: FastifyPluginAsync = async (app) => {
     return { reviews: reviewsOut, nextCursor };
   });
 
-  // Mutations need at least manager level — viewers stay read-only.
   const canModerate = { preHandler: app.requireAccess('super_admin', 'admin', 'manager') };
 
   const respondSchema = z.object({ response: z.string().trim().min(1).max(4000) });

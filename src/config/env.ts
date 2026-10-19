@@ -28,14 +28,16 @@ const envSchema = z.object({
   RESEND_API_KEY_HAMBURG: optionalString,
   RESEND_API_KEY_CLEANILO: optionalString,
   RESEND_API_KEY_TRL: optionalString,
+  // Resend webhook signing secrets: the unsuffixed one belongs to the RESEND_API_KEY account
+  // (system mail); brand ones are seeded into company.resend_webhook_secret.
+  RESEND_WEBHOOK_SECRET: optionalString,
+  RESEND_WEBHOOK_SECRET_HAMBURG: optionalString,
+  RESEND_WEBHOOK_SECRET_CLEANILO: optionalString,
+  RESEND_WEBHOOK_SECRET_TRL: optionalString,
   ADMIN_FROM_EMAIL: z.string().email().default('admin@reinigungs-portal.com'),
   ADMIN_FROM_NAME: z.string().default('Reinigungs-Portal'),
-  // Our own brand domains. An inquiry whose contact email is one of these is
-  // almost certainly loop traffic — our own confirmation/notification mail
-  // re-ingested by the inbound-email workflow — never a real external customer,
-  // so we never send it confirmation/notification mail. Defense in depth behind
-  // the n8n self-sender filter. Comma-separated; matches the domain or any
-  // subdomain of it.
+  // Own brand domains (incl. subdomains): an inquiry from one is loop traffic (our own mail
+  // re-ingested), so it gets no confirmation mail. Backstop behind the n8n self-sender filter.
   OWN_EMAIL_DOMAINS: z
     .string()
     .default(
@@ -47,8 +49,7 @@ const envSchema = z.object({
         .map((s) => s.trim().toLowerCase())
         .filter(Boolean),
     ),
-  // Max inquiries a single contact email may create per rolling hour. Hard
-  // backstop that caps any runaway feedback loop regardless of source.
+  // Per contact email, rolling hour; caps runaway feedback loops.
   INQUIRY_MAX_PER_EMAIL_PER_HOUR: z.coerce.number().int().positive().default(10),
   APP_BASE_URL: z.string().url().default('http://localhost:5173'),
   AWS_REGION: z.string().default('eu-central-1'),
@@ -56,8 +57,7 @@ const envSchema = z.object({
   AWS_SECRET_ACCESS_KEY: optionalString,
   S3_ENDPOINT: optionalUrl,
   S3_BUCKET: optionalString,
-  // Public base URL (CDN or bucket host) for the public/ asset prefix; e.g.
-  // blog featured images. Falls back to a URL built from endpoint/bucket/region.
+  // Public base URL for the public/ asset prefix (blog images); falls back to endpoint/bucket/region.
   S3_PUBLIC_BASE_URL: optionalUrl,
   STRIPE_SECRET_KEY: optionalString,
   STRIPE_WEBHOOK_SECRET: optionalString,
@@ -73,59 +73,38 @@ const envSchema = z.object({
   VAPID_SUBJECT: z.string().default('mailto:admin@reinigungs-portal.com'),
   SENTRY_DSN: optionalString,
 
-  // Meta Conversions API (per-brand). Needs both pixel id + token, else no-op.
-  // TEST_EVENT_CODE is optional (Events Manager → Test Events).
+  // Meta Conversions API: needs both pixel id and token, else no-op.
   META_PIXEL_ID_HAMBURG: optionalString,
   META_CAPI_TOKEN_HAMBURG: optionalString,
   META_TEST_EVENT_CODE_HAMBURG: optionalString,
 
-  // Shared secret for the storefront's on-demand revalidation hook
-  // (POST <storefrontOrigin>/api/revalidate/). Set ⇒ publishing or editing a
-  // blog/SEO page shows on the site within seconds instead of after the 1 h ISR
-  // window. Must equal REVALIDATE_SECRET in that storefront. Unset ⇒ no-op.
+  // Must equal REVALIDATE_SECRET in the storefront; unset ⇒ blog/SEO edits wait for the 1 h ISR window.
   STOREFRONT_REVALIDATE_SECRET_HAMBURG: optionalString,
 
-  // Claude text assistant. Key unset ⇒ /admin/ai/* returns 503 (UI shows a hint).
+  // Key unset ⇒ /admin/ai/* returns 503.
   ANTHROPIC_API_KEY: optionalString,
   ANTHROPIC_MODEL: z.string().default('claude-sonnet-4-6'),
   ANTHROPIC_MAX_TOKENS: z.coerce.number().int().positive().max(8192).default(1024),
 
-  // ── Voice-AI / callback geo-routing ──
-  // Reference point and radius for splitting inquiries between a human callback
-  // (within radius) and the automated AI warm-callback queue (outside). Both are
-  // expected to change as we grow, so they live in config, not code. Default ref
-  // is PLZ 20457 taken from the centroid table itself, keeping the haversine
-  // self-consistent with the lookup data.
+  // Human vs AI callback split: within the radius of the reference point ⇒ human. Default ref is
+  // PLZ 20457 from the centroid table, so the haversine matches the lookup data.
   CALLBACK_GEO_REF_LAT: z.coerce.number().default(53.53165),
   CALLBACK_GEO_REF_LNG: z.coerce.number().default(9.98526),
   CALLBACK_GEO_RADIUS_KM: z.coerce.number().positive().default(100),
-  // User id that human (Hamburg-area) callbacks are assigned to by default.
-  // A plain user pointer — hand off or distribute across reps later by changing
-  // this value (or the assignment logic), no schema change. Set to Kabir's id.
   CALLBACK_DEFAULT_HUMAN_ASSIGNEE_ID: optionalString,
-  // Shared secret the voice-AI / n8n intake endpoint must present in the
-  // X-Intake-Token header. When unset, the intake endpoint is disabled (503).
+  // X-Intake-Token for the voice-AI / n8n intake endpoint; unset ⇒ endpoint disabled (503).
   INQUIRY_INTAKE_TOKEN: optionalString,
 
-  // ── Calendly (pickup / on-site appointments) ──
-  // One CLEANILO Calendly account for all brands — the single deliberate
-  // brand-sharing exception. Calendly syncs the booking to the CLEANILO Google
-  // Calendar itself, which is why we don't talk to the Google API at all.
-  // Personal Access Token from the CLEANILO Calendly account (paid plan required
-  // for the Scheduling API). Unset ⇒ appointment confirmation behaves exactly as
-  // before, no booking attempted.
+  // One CLEANILO Calendly account serves all brands (the only brand-sharing exception); Calendly
+  // writes the CLEANILO Google Calendar itself. Needs the paid plan; unset ⇒ no booking attempted.
   CALENDLY_API_TOKEN: optionalString,
-  // Event-type URI of the CLEANILO "Besichtigung / Ausführung" event, e.g.
-  // https://api.calendly.com/event_types/<uuid>. Needed for booking; read it with
-  // `node --import tsx scripts/calendly-setup.ts event-types`.
+  // CLEANILO "Besichtigung / Ausführung" event type URI; list via `scripts/calendly-setup.ts event-types`.
   CALENDLY_PICKUP_EVENT_TYPE_URI: optionalString,
-  // Signing key of the webhook subscription. Unset ⇒ the webhook accepts nothing
-  // (503), because an unverified booking webhook is untrusted input.
+  // Unset ⇒ the webhook accepts nothing (503): unverified bookings are untrusted.
   CALENDLY_WEBHOOK_SIGNING_KEY: optionalString,
-  // Zone the invitee is booked in. Our slots are Europe/Berlin wall clock.
+  // Our slots are Europe/Berlin wall clock.
   CALENDLY_TIMEZONE: z.string().default('Europe/Berlin'),
-  // Test seam: point the client at a local Calendly stub so the booking flow can
-  // be exercised without writing to the real calendar. Rejected in production.
+  // Test seam for a local Calendly stub; rejected in production.
   CALENDLY_API_BASE: optionalUrl,
 });
 
@@ -136,7 +115,7 @@ if (!parsed.success) {
   process.exit(1);
 }
 
-// Publishable keys end up in browsers — never allow an sk_ here.
+// Publishable keys reach browsers: never allow an sk_ here.
 if (parsed.data.STRIPE_PUBLISHABLE_KEY?.startsWith('sk_')) {
   console.error(
     'STRIPE_PUBLISHABLE_KEY contains a SECRET key (sk_...). ' +
@@ -150,11 +129,11 @@ if (parsed.data.NODE_ENV === 'production') {
   if (parsed.data.APP_BASE_URL === 'http://localhost:5173') {
     errors.push('APP_BASE_URL is required in production (currently using the local dev default).');
   }
-  // Stripe webhooks fail silently without the signing secret — catch it at boot.
+  // Stripe webhooks fail silently without the signing secret.
   if (parsed.data.STRIPE_SECRET_KEY && !parsed.data.STRIPE_WEBHOOK_SECRET) {
     errors.push('STRIPE_WEBHOOK_SECRET is required when STRIPE_SECRET_KEY is set.');
   }
-  // PayPal must be configured as a coherent set, or not at all.
+  // PayPal: all three or none.
   const paypalKeys = [
     parsed.data.PAYPAL_CLIENT_ID,
     parsed.data.PAYPAL_SECRET,
@@ -165,14 +144,13 @@ if (parsed.data.NODE_ENV === 'production') {
       'PayPal is half-configured: set PAYPAL_CLIENT_ID, PAYPAL_SECRET and PAYPAL_WEBHOOK_ID together, or none.',
     );
   }
-  // A token without an event type books nothing — fail loudly rather than have
-  // pickup confirmations silently skip the calendar.
+  // A token without an event type would silently skip the calendar.
   if (parsed.data.CALENDLY_API_TOKEN && !parsed.data.CALENDLY_PICKUP_EVENT_TYPE_URI) {
     errors.push(
       'CALENDLY_PICKUP_EVENT_TYPE_URI is required when CALENDLY_API_TOKEN is set (otherwise no pickup can be booked).',
     );
   }
-  // The stub seam must never be live: it would silently swallow real bookings.
+  // The stub seam would swallow real bookings.
   if (
     parsed.data.CALENDLY_API_BASE &&
     parsed.data.CALENDLY_API_BASE !== 'https://api.calendly.com'

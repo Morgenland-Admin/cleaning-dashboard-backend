@@ -80,7 +80,6 @@ export const exportsAdminRoutes: FastifyPluginAsync = async (app) => {
     if (q.status !== 'all') conds.push(eq(exportJobs.status, q.status));
     if (q.cursor) {
       const cur = decodeCursor(q.cursor);
-      // Tuple predicate matching the (createdAt DESC, id DESC) ordering.
       if (cur) {
         const cw = or(
           lt(exportJobs.createdAt, sql`${cur.createdAt}::timestamptz`),

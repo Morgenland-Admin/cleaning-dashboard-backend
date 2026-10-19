@@ -24,7 +24,6 @@ async function main() {
     process.on(sig, () => {
       if (shuttingDown) return;
       shuttingDown = true;
-      // Never hang past the deadline on a stuck close.
       const deadline = setTimeout(() => {
         console.error(`Shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms — forcing exit`);
         process.exit(1);

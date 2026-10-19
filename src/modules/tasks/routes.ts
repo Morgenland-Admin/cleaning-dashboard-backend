@@ -11,7 +11,7 @@ import { notifyTaskAssigned, notifyTaskComment, spawnTask } from '../../lib/task
 const listQuerySchema = z.object({
   status: z.enum(['open', 'in_progress', 'done', 'dismissed', 'all']).default('open'),
   brand: z.string().min(1).max(63).optional(),
-  /** When true, only the tasks assigned to me. Not z.coerce.boolean() — "false" would coerce to true. */
+  /** Only tasks assigned to me. Not z.coerce.boolean(): "false" would coerce to true. */
   mine: z
     .enum(['true', 'false'])
     .transform((v) => v === 'true')
@@ -34,9 +34,7 @@ const editSchema = z.object({
   title: z.string().min(1).max(500).optional(),
   body: z.string().max(8000).nullable().optional(),
   priority: z.enum(['low', 'normal', 'high', 'urgent']).optional(),
-  /** Set to null to clear. */
   dueAt: z.string().datetime().nullable().optional(),
-  /** Set to null to unassign. */
   assigneeUserId: z.string().nullable().optional(),
 });
 
@@ -44,7 +42,7 @@ const commentSchema = z.object({
   body: z.string().trim().min(1).max(4000),
 });
 
-/** Brands the user is a member of — gates every list / mutation. */
+// Brands the user is a member of; gates every list and mutation.
 async function userBrandSlugs(userId: string): Promise<string[]> {
   const rows = await db
     .select({ slug: membership.companySlug })

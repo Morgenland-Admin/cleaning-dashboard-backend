@@ -26,7 +26,7 @@ test('haversine distance is zero from a point to itself', () => {
   assert.equal(Math.round(haversineKm(HAMBURG, HAMBURG)), 0);
 });
 
-// Boundary cases Kabir spot-checked against the 100 km cutoff.
+// Boundary cases against the 100 km cutoff.
 test('cities within 100 km route to a human', () => {
   for (const plz of ['28195' /* Bremen */, '24103' /* Kiel */, '23552' /* Lübeck */]) {
     const r = routeCallback(plz);

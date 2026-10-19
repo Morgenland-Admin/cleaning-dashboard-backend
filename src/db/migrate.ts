@@ -1,20 +1,6 @@
 /**
- * Boot-time DB bootstrap + migration script.
- *
- * Runs ahead of `node dist/server.js` (see Dockerfile CMD). Three phases:
- *
- *   1. Ensure the three legacy tenant schemas exist. Drizzle migrations
- *      reference tables in these schemas (e.g. CREATE TABLE "cleanilo".orders);
- *      without the schemas, migration 0000 fails on a fresh database.
- *
- *   2. Run drizzle migrations idempotently.
- *
- *   3. Upsert the three legacy company rows so the X-Company-Slug header
- *      resolves on first boot. This is the absolute minimum runtime state
- *      needed for the storefronts to work. Additional companies are created
- *      via POST /admin/companies once an admin user exists.
- *
- * Idempotent: rerunning is safe on every container start.
+ * Runs before `node dist/server.js` and is safe to rerun on every start: creates the legacy tenant
+ * schemas (migration 0000 references them), applies drizzle migrations, upserts the legacy company rows.
  */
 
 import { drizzle } from 'drizzle-orm/node-postgres';
@@ -29,15 +15,13 @@ import { createTenantSchemaSql } from './schema/tenant.js';
 
 const { Pool } = pg;
 
-// pg_advisory_lock key, shared by all replicas.
 const MIGRATION_LOCK_KEY = 7_421_001;
 
 async function main(): Promise<void> {
   const pool = new Pool({ connectionString: env.DATABASE_URL });
   const db = drizzle(pool);
 
-  // Serialize migrations across replicas. Advisory locks are session-level,
-  // so lock and unlock must run on the same pinned client.
+  // Serializes replicas; the lock is session-level, so unlock must use the same client.
   console.log('[migrate] acquiring advisory lock…');
   const lockClient = await pool.connect();
   await lockClient.query(`SELECT pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
@@ -64,23 +48,21 @@ async function main(): Promise<void> {
       updatedAt: new Date(),
     };
     if (cfg.resendApiKey) updateSet.resendApiKey = cfg.resendApiKey;
-    // Only set a default logo when none exists — never clobber an admin upload.
+    if (cfg.resendWebhookSecret) updateSet.resendWebhookSecret = cfg.resendWebhookSecret;
+    // Coalesced fields only seed blanks, so admin edits (uploads, live counter) win.
     if (cfg.logoUrl) updateSet.logoUrl = sql`coalesce(${company.logoUrl}, ${cfg.logoUrl})`;
     if (cfg.invoiceLogoUrl)
       updateSet.invoiceLogoUrl = sql`coalesce(${company.invoiceLogoUrl}, ${cfg.invoiceLogoUrl})`;
-    // Phone / mobile / accent: seed only where blank so an admin edit wins.
     if (cfg.phone) updateSet.phone = sql`coalesce(${company.phone}, ${cfg.phone})`;
     if (cfg.mobile) updateSet.mobile = sql`coalesce(${company.mobile}, ${cfg.mobile})`;
     if (cfg.primaryColor)
       updateSet.primaryColor = sql`coalesce(${company.primaryColor}, ${cfg.primaryColor})`;
-    // Invoice numbering: seed only where blank so an admin edit / live counter wins.
     if (cfg.invoiceNumberPrefix)
       updateSet.invoiceNumberPrefix = sql`coalesce(${company.invoiceNumberPrefix}, ${cfg.invoiceNumberPrefix})`;
     if (cfg.invoiceNumberStart != null)
       updateSet.invoiceNumberNext = sql`coalesce(${company.invoiceNumberNext}, ${cfg.invoiceNumberStart})`;
-    // Email signature is seed-owned brand content → overwrite on every boot.
+    // Seed-owned: overwritten on every boot.
     if (cfg.emailSignature) updateSet.emailSignature = cfg.emailSignature;
-    // Legal + banking identity: seed only where blank so admin edits always win.
     if (cfg.legal) {
       const l = cfg.legal;
       updateSet.legalName = sql`coalesce(${company.legalName}, ${l.legalName})`;
@@ -113,6 +95,7 @@ async function main(): Promise<void> {
         senderEmail: cfg.senderEmail,
         senderName: cfg.senderName,
         resendApiKey: cfg.resendApiKey,
+        resendWebhookSecret: cfg.resendWebhookSecret,
         logoUrl: cfg.logoUrl,
         invoiceLogoUrl: cfg.invoiceLogoUrl,
         websiteUrl: cfg.websiteUrl,

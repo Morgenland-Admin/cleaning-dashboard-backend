@@ -11,18 +11,11 @@ interface MinimalLogger {
   error(obj: unknown, msg?: string): void;
 }
 
-/** Re-exported for callers that still import the row shape from here. */
 export type { InvoiceSourceOrder };
 
 /**
- * Create an invoice for a just-paid order. Idempotent (safe on webhook retries):
- * net/USt are backed out of the paid gross so the total matches to the cent.
- *
- * When the §14-UStG fields are present (address + Leistungsdatum) it also issues
- * + emails immediately (replacing n8n ALL_12) — unless the brand has
- * `auto_issue_invoices` switched off, in which case it deliberately stops at the
- * draft so an operator can still add positions agreed after the booking (a
- * repair, say) and finalise one invoice by hand.
+ * Create an invoice for a just-paid order; idempotent (webhook retries). Issues + emails at once
+ * when the §14 UStG fields are present, unless the brand has `auto_issue_invoices` off (stops at draft).
  */
 export async function autoCreateInvoiceForPaidOrder(
   tables: TenantTables,
@@ -52,12 +45,11 @@ export async function autoCreateInvoiceForPaidOrder(
     .where(eq(company.slug, companySlug))
     .limit(1);
 
-  // Brand opted out of automatic issuing — leave it editable.
   if (companyRow && !companyRow.autoIssueInvoices) {
     return { created: true, issued: false, invoiceId: invoice.id, number: invoice.number };
   }
 
-  // §14 UStG mandatory fields for issuing. Missing any → leave as draft.
+  // §14 UStG mandatory fields; any missing → stays draft.
   const canIssue =
     Boolean(invoice.recipientAddressLine1) &&
     Boolean(invoice.recipientPostalCode) &&
@@ -67,7 +59,7 @@ export async function autoCreateInvoiceForPaidOrder(
     return { created: true, issued: false, invoiceId: invoice.id, number: invoice.number };
   }
 
-  // Issue: draft → sent, assign the gapless number + stamp dueAt — atomically.
+  // Number assignment and the status flip must be one transaction (gapless series).
   const now = new Date();
   const dueAt = new Date(now.getTime() + invoice.paymentTermsDays * 24 * 60 * 60 * 1000);
   const issued = await db.transaction(async (tx) => {
@@ -88,11 +80,11 @@ export async function autoCreateInvoiceForPaidOrder(
     return r;
   });
   if (!issued) {
-    // Someone issued/voided it between create and issue — leave as is.
+    // Lost a race with a manual issue/void.
     return { created: true, issued: false, invoiceId: invoice.id, number: invoice.number };
   }
 
-  // Email from the brand's sender. Best-effort — issue stands even if mail fails.
+  // Best-effort: the issue stands even if the mail fails.
   let emailed = false;
   try {
     if (companyRow) {

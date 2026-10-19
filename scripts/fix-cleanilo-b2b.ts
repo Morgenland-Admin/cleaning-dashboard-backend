@@ -1,24 +1,7 @@
 /**
- * Correction for the CLEANILO historical import: drop the `b2b` customer tag and
- * reset `invoices.customer_type` to 'b2c' where the B2B flag rests only on
- * contradicting CRM candidates.
- *
- * Background: `applyMatches` used to OR the segment column across *all* candidate
- * rows for an invoice, so a single "B2B" row won even when the other candidates
- * said B2C — and those candidates are frequently different people (shared first
- * name, shared email token). Kabir's decision (08/2026): B2B from the CRM counts
- * only when no candidate contradicts it; a name that identifies a company or
- * institution on its own still decides by itself. `applyMatches` now implements
- * that rule; this script repairs the rows that already landed.
- *
- *   Dry run:  DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/fix-cleanilo-b2b.ts <invoices.json> <reconciliation.csv>
- *   Apply:    … scripts/fix-cleanilo-b2b.ts <invoices.json> <reconciliation.csv> --commit
- *
- * Writes go straight to the tenant tables (no API, no webhook) so no
- * notification, dunning or automation can fire. Idempotent: rows already on the
- * corrected value are left untouched. Only ever *removes* B2B — a row the plan
- * would newly promote is reported and skipped, never written, so a change in the
- * source data can't quietly inflate the signed-off figure.
+ * Drops the `b2b` tag / resets `customer_type` to 'b2c' where B2B rests only on contradicting CRM candidates; never promotes.
+ * Direct tenant writes (no API/webhook, so no automation fires); idempotent.
+ * DOTENV_CONFIG_PATH=.env.prod node --import tsx scripts/fix-cleanilo-b2b.ts <invoices.json> <reconciliation.csv> [--commit]
  */
 import { eq, inArray } from 'drizzle-orm';
 
@@ -51,7 +34,6 @@ async function main(): Promise<void> {
       `${plan.disputedB2B.length} disputed segment(s) rejected.\n`,
   );
 
-  // ── Customers ────────────────────────────────────────────────────────────
   const planByEmail = new Map(plan.customers.map((c) => [c.email.toLowerCase(), c]));
   const dbCustomers = await db
     .select({
@@ -84,7 +66,6 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── Invoices ─────────────────────────────────────────────────────────────
   const importCustomerIds = new Set(
     dbCustomers.filter((c) => (c.tags ?? []).includes(IMPORT_TAG)).map((c) => c.id),
   );
@@ -104,10 +85,8 @@ async function main(): Promise<void> {
   const invoiceFixes: Array<{ id: number; number: string; recipientName: string; status: string }> =
     [];
   for (const row of dbInvoices) {
-    // Drafts carry no number and can never be an imported row.
     const planned = row.number == null ? undefined : planInvoices.get(row.number);
     if (!planned) continue;
-    // Only ever touch an invoice that belongs to an imported customer.
     if (row.customerId == null || !importCustomerIds.has(row.customerId)) {
       L(`  ! invoice ${row.number} is not linked to an imported customer — refusing to touch`);
       continue;

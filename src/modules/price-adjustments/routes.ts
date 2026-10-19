@@ -17,7 +17,6 @@ const createSchema = z.object({
 
 export const priceAdjustmentsAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
-  // Reads stay open to any member; pricing mutations need manager+.
   app.addHook('preHandler', app.requireWriteAccess);
 
   app.get('/', async (request) => {

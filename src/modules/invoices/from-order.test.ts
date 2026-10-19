@@ -26,7 +26,7 @@ function order(over: Partial<InvoiceSourceOrder> = {}): InvoiceSourceOrder {
 }
 
 test('netFromGross backs 19% VAT out of a gross amount', () => {
-  assert.equal(netFromGross(8900, 19), 7479); // 89.00 → 74.79
+  assert.equal(netFromGross(8900, 19), 7479);
   assert.equal(netFromGross(11900, 19), 10000);
 });
 
@@ -64,7 +64,6 @@ test('pickup fee, minimum-order top-up and discount each get their own line', ()
     'Mindestbestellwert-Aufschlag',
     'Rabatt (WILLKOMMEN10)',
   ]);
-  // The discount is the only negative line.
   assert.ok(lineItems[3]!.unitPriceCents < 0);
 });
 
@@ -90,16 +89,11 @@ test('an order with neither items nor a number falls back to the id', () => {
   assert.equal(lineItems[0]!.label, 'Auftrag #42');
 });
 
-/*
- * The invariant that matters: whatever per-line rounding does, subtotal + tax
- * has to land exactly on what the customer was charged. Tax is the remainder,
- * never a recomputed percentage — this is the test that fails if someone
- * "tidies" it into `Math.round(subtotal * 0.19)`.
- */
+// Tax is the remainder against the charged total, never a recomputed percentage.
 test('subtotal + tax always equals the order total, to the cent', () => {
   const cases: Array<{ total: number; items: number[] }> = [
     { total: 8900, items: [8900] },
-    { total: 37744, items: [3244, 1020, 17940, 3000, 9540, 3000] }, // the real 6-line order
+    { total: 37744, items: [3244, 1020, 17940, 3000, 9540, 3000] },
     { total: 1, items: [1] },
     { total: 3333, items: [1111, 1111, 1111] },
     { total: 9999, items: [3333, 3333, 3333] },

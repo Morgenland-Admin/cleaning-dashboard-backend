@@ -4,7 +4,7 @@ Multi-tenant backend for Cleanilo, Hamburg Teppichreinigung, and Teppichreinigen
 
 ## Requirements
 
-- Node.js >= 20
+- Node.js 24 (`nvm use` reads `.nvmrc`); the git hooks (lint-staged 17) need >= 22.22
 - pnpm >= 10 (`corepack enable` will provision the pinned version)
 - PostgreSQL 14+
 - (Optional) Docker + Docker Compose

@@ -11,3 +11,6 @@ coverage/
 .vscode/
 drizzle/.snapshots/
 email-samples/
+
+# Local development notes
+docs/

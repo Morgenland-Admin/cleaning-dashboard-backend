@@ -12,7 +12,6 @@ const partnerRoutes: FastifyPluginAsync = async (app) => {
   await app.register(companiesRoutes, { prefix: '/companies' });
   await app.register(partnersSelfRoutes, { prefix: '/partners' });
   await app.register(ordersPartnerRoutes, { prefix: '/orders' });
-  // PWA push: chat messages + order assignments reach partner devices.
   await app.register(pushRoutes, { prefix: '/push' });
 };
 

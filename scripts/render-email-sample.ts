@@ -1,17 +1,7 @@
 /**
- * Renders the customer mail an operator composes in the dashboard — contact
- * reply, offer, order message — to HTML files, so the per-brand sign-off can be
- * checked without sending anything to a real customer.
- *
- * Sender, sign-off, contact channels, legal footer and accent colour are read
- * from the real company row and mapped through `brandInfoFromCompany` — the same
- * path production mail takes. Recipient and body are neutral fixtures.
- *
- *   node --import tsx scripts/render-email-sample.ts [options]
- *
- *     --slug <slug>  brand to render (default: all legacy brands)
- *     --out <dir>    output directory (default ./email-samples)
- *     --no-db        read the identity from the boot seed instead of the DB
+ * Renders the operator-composed customer mails to HTML for per-brand sign-off; nothing is sent.
+ * Identity comes from the company row (production path), recipient and body are fixtures.
+ * node --import tsx scripts/render-email-sample.ts [--slug <slug>] [--out <dir, default ./email-samples>] [--no-db: boot seed instead of DB]
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -39,11 +29,7 @@ const only = opt('--slug');
 const outDir = opt('--out') ?? 'email-samples';
 const slugs = only ? [only] : Object.keys(LEGACY_BOOTSTRAP);
 
-/**
- * Company identity from the boot seed — the same values `db/migrate.ts` upserts
- * into the company row. Used when there's no reachable DB; it cannot reflect
- * later admin edits made via PATCH /admin/companies, the DB path (default) does.
- */
+/** Boot-seed identity for when no DB is reachable; misses later PATCH /admin/companies edits. */
 function companyFromSeed(slug: string): CompanyFull {
   const cfg = LEGACY_BOOTSTRAP[slug as keyof typeof LEGACY_BOOTSTRAP];
   if (!cfg)
@@ -97,7 +83,7 @@ async function loadCompanies(): Promise<Array<{ row: CompanyFull; source: string
   }
 }
 
-// Neutral placeholder recipient + bodies — never a real customer.
+// Fixtures only; never a real customer.
 const RECIPIENT = 'Frau Beispiel';
 
 mkdirSync(outDir, { recursive: true });

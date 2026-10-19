@@ -47,12 +47,11 @@ export function verifyUnsubscribeToken(token: string): UnsubPayload | null {
       return data as UnsubPayload;
     }
   } catch {
-    // fallthrough
+    // malformed token
   }
   return null;
 }
 
-/** Random URL-safe token for double-opt-in confirmation. */
 export function randomConfirmToken(): string {
   return b64urlEncode(randomBytes(24));
 }
