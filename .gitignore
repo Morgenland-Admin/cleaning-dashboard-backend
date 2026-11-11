@@ -16,3 +16,6 @@ email-samples/
 
 # Local development notes
 docs/
+
+# Local ops tool (prints a fresh partner password)
+scripts/set-partner-password.ts
