@@ -4,7 +4,9 @@ import { inArray, sql } from 'drizzle-orm';
 import { buildApp, type App } from '../../app.js';
 import { db, pool } from '../../db/index.js';
 import { createTenantSchemaSql, getTenantTables } from '../../db/schema/tenant.js';
+import { env } from '../../config/env.js';
 import { signCustomerToken, verifyCustomerToken } from '../../lib/token.js';
+import { loginLinkOrigin } from './routes.js';
 
 const SLUG = 'cleanilo';
 const EMAIL = 'zz-account-test@example.invalid';
@@ -20,6 +22,28 @@ describe('customer token', () => {
     assert.equal(
       verifyCustomerToken(signCustomerToken(EMAIL, SLUG, 'login', -1), SLUG, 'login'),
       null,
+    );
+  });
+});
+
+describe('login link origin', () => {
+  const brand = {
+    storefrontOrigin: 'https://www.cleanilo.de/',
+    storefrontAliases: ['https://cleanilo.de'],
+  };
+
+  it('links back to a storefront the API trusts', () => {
+    assert.equal(loginLinkOrigin('https://cleanilo.de', brand), 'https://cleanilo.de');
+    const envOrigin = env.CORS_ORIGINS[0];
+    if (envOrigin) assert.equal(loginLinkOrigin(envOrigin, brand), envOrigin);
+  });
+
+  it('falls back to the brand storefront for unknown or missing origins', () => {
+    assert.equal(loginLinkOrigin('https://evil.example', brand), 'https://www.cleanilo.de');
+    assert.equal(loginLinkOrigin(undefined, brand), 'https://www.cleanilo.de');
+    assert.equal(
+      loginLinkOrigin(undefined, { storefrontOrigin: null, storefrontAliases: [] }),
+      env.APP_BASE_URL.replace(/\/$/, ''),
     );
   });
 });

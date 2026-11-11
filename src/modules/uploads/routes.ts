@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { s3Configured, signDownload, signPublicUpload, signUpload } from '../../lib/s3.js';
+import { accessLevelOf } from '../../lib/access.js';
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const ALLOWED_TYPES = new Set([
@@ -28,6 +29,12 @@ const signSchema = z.object({
 const adminSignSchema = signSchema.extend({
   folder: z.enum(['inquiries', 'receipts']).optional(),
 });
+
+const publicImageSignSchema = signSchema.extend({
+  folder: z.enum(['blog', 'materials']).default('blog'),
+});
+// Print materials: no HEIC/HEIF, browsers can't render them for print.
+const MATERIAL_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 export const uploadsPublicRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.resolveCompanyPublic);
@@ -111,8 +118,8 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // Presigns a publicly-readable image upload (e.g. blog featured image); the caller stores the returned URL
-  // in schemaJsonld.image. `seo` is allowed because the blog editor needs it.
+  // Presigns a publicly-readable image upload (blog featured image, or `folder: 'materials'` for print templates);
+  // the caller stores the returned URL. `seo` is allowed because the blog editor needs it.
   app.post(
     '/sign-public-image',
     {
@@ -124,10 +131,16 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
         reply.code(503).send({ error: 'Uploads are not configured on this server' });
         return;
       }
-      const body = signSchema.parse(request.body);
-      if (!ALLOWED_TYPES.has(body.contentType)) {
+      const body = publicImageSignSchema.parse(request.body);
+      // Brand-material photos are a manager+ feature; seo users only upload blog images.
+      if (body.folder === 'materials' && accessLevelOf(request) === 'seo') {
+        reply.code(403).send({ error: 'Insufficient access level' });
+        return;
+      }
+      const allowed = body.folder === 'materials' ? MATERIAL_TYPES : ALLOWED_TYPES;
+      if (!allowed.has(body.contentType)) {
         reply.code(415).send({
-          error: `Unsupported image type "${body.contentType}". Allowed: ${[...ALLOWED_TYPES].join(', ')}`,
+          error: `Unsupported image type "${body.contentType}". Allowed: ${[...allowed].join(', ')}`,
         });
         return;
       }
@@ -136,6 +149,7 @@ export const uploadsAdminRoutes: FastifyPluginAsync = async (app) => {
         filename: body.filename,
         contentType: body.contentType,
         sizeBytes: body.size,
+        folder: body.folder,
       });
       reply.code(201).send({ uploadUrl, key, publicUrl, expiresIn });
     },

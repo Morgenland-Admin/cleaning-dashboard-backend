@@ -15,6 +15,7 @@ import {
 } from 'drizzle-orm/pg-core';
 
 import type { EmailSignature } from '../../email/templates.js';
+import type { BrandMaterialDraftData } from '../../modules/brand-materials/schema.js';
 
 export const user = pgTable('user', {
   id: text('id').primaryKey(),
@@ -300,6 +301,30 @@ export const aiPrompts = pgTable(
   },
   (t) => ({
     brandKindUnique: uniqueIndex('ai_prompts_brand_kind_unique_idx').on(t.companySlug, t.kind),
+  }),
+);
+
+/** Shared per-brand edits of a printable Marketing-Materialien template; `_brand` holds brand-wide values. */
+export const brandMaterialDrafts = pgTable(
+  'brand_material_drafts',
+  {
+    id: serial('id').primaryKey(),
+    companySlug: varchar('company_slug', { length: 63 })
+      .notNull()
+      .references(() => company.slug, { onDelete: 'cascade' }),
+    templatePath: varchar('template_path', { length: 160 }).notNull(),
+    data: jsonb('data').$type<BrandMaterialDraftData>().notNull().default({}),
+    updatedByUserId: text('updated_by_user_id').references(() => user.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    brandPathUnique: uniqueIndex('brand_material_drafts_brand_path_unique_idx').on(
+      t.companySlug,
+      t.templatePath,
+    ),
   }),
 );
 

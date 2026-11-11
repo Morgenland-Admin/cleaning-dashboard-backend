@@ -32,6 +32,7 @@ import { partnerApplicationsAdminRoutes } from '../modules/partners/applications
 import { dispatchAdminRoutes } from '../modules/dispatch/routes.js';
 import { legacyRecordsAdminRoutes } from '../modules/legacy/routes.js';
 import { staffAdminRoutes } from '../modules/staff/routes.js';
+import { brandMaterialsAdminRoutes } from '../modules/brand-materials/routes.js';
 import { accessLevelOf, seoMayAccess } from '../lib/access.js';
 
 const adminRoutes: FastifyPluginAsync = async (app) => {
@@ -77,6 +78,7 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
   await app.register(dispatchAdminRoutes);
   await app.register(legacyRecordsAdminRoutes, { prefix: '/legacy-records' });
   await app.register(staffAdminRoutes, { prefix: '/staff' });
+  await app.register(brandMaterialsAdminRoutes, { prefix: '/brand-materials' });
 };
 
 export default adminRoutes;

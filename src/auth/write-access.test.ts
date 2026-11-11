@@ -142,6 +142,7 @@ describe(
       '/admin/service-catalog',
       '/admin/partner-applications',
       '/admin/partners/1/documents',
+      '/admin/brand-materials',
     ];
 
     for (const url of READS) {
@@ -233,9 +234,12 @@ describe(
       ['POST', '/admin/tasks'],
       ['PATCH', '/admin/tasks/1'],
       ['POST', '/admin/tasks/1/comments'],
+      ['PATCH', '/admin/brand-materials'],
+      // No templatePath: a request that clears the gate fails in Zod, so no draft is deleted.
+      ['DELETE', '/admin/brand-materials'],
     ];
     // Bodyless or all-optional writes: probed for refusal only, since letting one through would act.
-    const REFUSE_ONLY_WRITES: Array<[method: 'POST' | 'PATCH', url: string]> = [
+    const REFUSE_ONLY_WRITES: Array<[method: 'POST' | 'PATCH' | 'DELETE', url: string]> = [
       ['PATCH', '/admin/service-catalog/1'],
       ['POST', '/admin/partner-applications/1/invite'],
       ['POST', '/admin/partner-applications/1/reject'],
@@ -243,6 +247,7 @@ describe(
       ['POST', '/admin/tasks/1/ack'],
       ['POST', '/admin/tasks/1/done'],
       ['POST', '/admin/tasks/1/dismiss'],
+      ['DELETE', '/admin/brand-materials?templatePath=_brand'],
     ];
     for (const [method, url] of REFUSE_ONLY_WRITES) {
       for (const level of ['viewer', 'seo'] as const) {

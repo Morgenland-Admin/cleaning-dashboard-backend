@@ -51,10 +51,16 @@ function buildKey(keyPrefix: string, originalName: string, folder: UploadFolder)
 const UPLOAD_EXPIRY_SECONDS = 60 * 5;
 const DOWNLOAD_EXPIRY_SECONDS = 60 * 10;
 
-// Served publicly (bucket policy / CDN) with stable, non-expiring URLs; blog images only.
+// Served publicly (bucket policy / CDN) with stable, non-expiring URLs; blog + print-material images only.
 const PUBLIC_PREFIX = 'public';
 
-function buildPublicKey(keyPrefix: string, originalName: string): string {
+export type PublicImageFolder = 'blog' | 'materials';
+
+function buildPublicKey(
+  keyPrefix: string,
+  originalName: string,
+  folder: PublicImageFolder,
+): string {
   const now = new Date();
   const year = now.getUTCFullYear();
   const month = String(now.getUTCMonth() + 1).padStart(2, '0');
@@ -64,7 +70,7 @@ function buildPublicKey(keyPrefix: string, originalName: string): string {
       .replace(/[^a-z0-9.\-_]+/g, '-')
       .replace(/^-+|-+$/g, '')
       .slice(0, 80) || 'image';
-  return `${PUBLIC_PREFIX}/${keyPrefix}/blog/${year}/${month}/${nanoid(12)}-${safeName}`;
+  return `${PUBLIC_PREFIX}/${keyPrefix}/${folder}/${year}/${month}/${nanoid(12)}-${safeName}`;
 }
 
 export function publicAssetUrl(key: string): string {
@@ -83,9 +89,10 @@ export async function signPublicUpload(opts: {
   filename: string;
   contentType: string;
   sizeBytes: number;
+  folder?: PublicImageFolder;
 }): Promise<{ uploadUrl: string; key: string; publicUrl: string; expiresIn: number }> {
   const bucket = getBucket();
-  const key = buildPublicKey(opts.keyPrefix, opts.filename);
+  const key = buildPublicKey(opts.keyPrefix, opts.filename, opts.folder ?? 'blog');
   const cmd = new PutObjectCommand({
     Bucket: bucket,
     Key: key,

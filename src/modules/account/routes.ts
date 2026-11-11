@@ -19,6 +19,16 @@ const loginLinkSchema = z.object({
 });
 const sessionSchema = z.object({ token: z.string().min(20).max(1024) });
 
+/** The calling storefront (e.g. staging) when the API already trusts it, else the brand's storefront URL. */
+export function loginLinkOrigin(
+  requestOrigin: string | undefined,
+  brand: { storefrontOrigin: string | null; storefrontAliases: string[] },
+): string {
+  const trusted = [brand.storefrontOrigin, ...brand.storefrontAliases, ...env.CORS_ORIGINS];
+  if (requestOrigin && trusted.includes(requestOrigin)) return requestOrigin;
+  return (brand.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '');
+}
+
 function sessionEmail(request: FastifyRequest): string | null {
   const header = request.headers.authorization;
   if (!header?.startsWith('Bearer ')) return null;
@@ -49,7 +59,7 @@ export const accountPublicRoutes: FastifyPluginAsync = async (app) => {
       if (hit) {
         const [companyRow] = await db.select().from(company).where(eq(company.slug, slug)).limit(1);
         if (companyRow) {
-          const origin = (companyRow.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '');
+          const origin = loginLinkOrigin(request.headers.origin, companyRow);
           const token = signCustomerToken(body.email, slug, 'login', LOGIN_TTL_SECONDS);
           await sendEmail({
             to: body.email,
