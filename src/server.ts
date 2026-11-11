@@ -4,6 +4,7 @@ import { pool } from './db/index.js';
 import { startExportWorker, stopExportWorker } from './lib/exports.js';
 import { startDunningWorker, stopDunningWorker } from './lib/dunning.js';
 import { startOfferExpiryWorker, stopOfferExpiryWorker } from './lib/offer-expiry.js';
+import { startPayPalExpiryWorker, stopPayPalExpiryWorker } from './modules/orders/paypal-expiry.js';
 
 // Single-replica only: chat hub and caches are in-process (needs Redis to scale out).
 const SHUTDOWN_DEADLINE_MS = 15_000;
@@ -20,6 +21,7 @@ async function main() {
   startExportWorker();
   startDunningWorker();
   startOfferExpiryWorker();
+  startPayPalExpiryWorker(app);
 
   let shuttingDown = false;
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
@@ -36,6 +38,7 @@ async function main() {
         stopExportWorker();
         await stopDunningWorker(); // drain any in-flight sweep before closing the pool
         await stopOfferExpiryWorker();
+        await stopPayPalExpiryWorker();
         await app.close();
         await pool.end();
         process.exit(0);

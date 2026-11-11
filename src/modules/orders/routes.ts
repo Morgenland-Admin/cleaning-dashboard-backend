@@ -1405,7 +1405,7 @@ async function markOrderPaid(
   });
 }
 
-async function markOrderPaidPayPal(
+export async function markOrderPaidPayPal(
   app: FastifyInstance,
   companySlug: string,
   orderId: number,
@@ -1839,7 +1839,7 @@ async function markAfterServicePaid(
   await aggregateCustomerOnPaid(app, tables, order, paidTotal, now);
 }
 
-async function markOrderCancelled(
+export async function markOrderCancelled(
   app: FastifyInstance,
   companySlug: string,
   orderId: number,
