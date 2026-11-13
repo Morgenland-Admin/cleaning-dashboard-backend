@@ -84,7 +84,6 @@ export const hamburgBook: PriceBook = {
   teppichbodenCleaning: {
     prices: {
       basis: {
-        bis_30: 21000,
         bis_50: 32500,
         bis_75: 48000,
         bis_100: 62500,
@@ -93,7 +92,6 @@ export const hamburgBook: PriceBook = {
         ab_150: null,
       },
       standard: {
-        bis_30: 27900,
         bis_50: 44000,
         bis_75: 66000,
         bis_100: 89000,
@@ -102,7 +100,6 @@ export const hamburgBook: PriceBook = {
         ab_150: null,
       },
       premium: {
-        bis_30: 39000,
         bis_50: 66000,
         bis_75: 99000,
         bis_100: 134000,
@@ -122,7 +119,6 @@ export const hamburgBook: PriceBook = {
       premium: 'Mit Fleckenbehandlung & Imprägnierung',
     },
     bracketLabels: {
-      bis_30: 'bis 30 m²',
       bis_50: 'bis 50 m²',
       bis_75: 'bis 75 m²',
       bis_100: 'bis 100 m²',

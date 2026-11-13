@@ -6,6 +6,7 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { sql } from 'drizzle-orm';
+import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 
 import { env } from '../config/env.js';
@@ -19,6 +20,15 @@ import { geocodePlz } from '../lib/geo.js';
 const { Pool } = pg;
 
 const MIGRATION_LOCK_KEY = 7_421_001;
+
+/** Seeds a blank column, and replaces a value only when it is one of our own earlier seeds. */
+function seedOrRename(column: AnyPgColumn, next: string, previous: string[] = []) {
+  if (previous.length === 0) return sql`coalesce(${column}, ${next})`;
+  return sql`case when ${column} in (${sql.join(
+    previous.map((p) => sql`${p}`),
+    sql`, `,
+  )}) then ${next} else coalesce(${column}, ${next}) end`;
+}
 
 async function main(): Promise<void> {
   const pool = new Pool({ connectionString: env.DATABASE_URL });
@@ -72,12 +82,16 @@ async function main(): Promise<void> {
     if (cfg.emailSignature) updateSet.emailSignature = cfg.emailSignature;
     if (cfg.legal) {
       const l = cfg.legal;
-      updateSet.legalName = sql`coalesce(${company.legalName}, ${l.legalName})`;
+      updateSet.legalName = seedOrRename(company.legalName, l.legalName, l.previousLegalNames);
       updateSet.addressLine1 = sql`coalesce(${company.addressLine1}, ${l.addressLine1})`;
       updateSet.postalCode = sql`coalesce(${company.postalCode}, ${l.postalCode})`;
       updateSet.city = sql`coalesce(${company.city}, ${l.city})`;
       updateSet.country = sql`coalesce(${company.country}, ${l.country})`;
-      updateSet.accountHolder = sql`coalesce(${company.accountHolder}, ${l.accountHolder})`;
+      updateSet.accountHolder = seedOrRename(
+        company.accountHolder,
+        l.accountHolder,
+        l.previousAccountHolders,
+      );
       updateSet.iban = sql`coalesce(${company.iban}, ${l.iban})`;
       updateSet.bic = sql`coalesce(${company.bic}, ${l.bic})`;
       updateSet.bankName = sql`coalesce(${company.bankName}, ${l.bankName})`;

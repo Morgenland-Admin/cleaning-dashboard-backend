@@ -48,7 +48,6 @@ export type TeppichbodenTier = (typeof TEPPICHBODEN_TIERS)[number];
  * yields `outOfArea: true`; the frontend then routes to the contact form.
  */
 export const TEPPICHBODEN_BRACKETS = [
-  'bis_30',
   'bis_50',
   'bis_75',
   'bis_100',

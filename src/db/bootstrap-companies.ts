@@ -37,11 +37,15 @@ export interface LegacyConfig {
   /** Invoice/dunning identity, seeded coalesced; an undefined brand keeps its existing values. */
   legal?: {
     legalName: string;
+    /** Seeded names that may be replaced by legalName on boot (renames); any other admin edit wins. */
+    previousLegalNames?: string[];
+    accountHolder: string;
+    /** Seeded holders that may be replaced by accountHolder on boot; any other admin edit wins. */
+    previousAccountHolders?: string[];
     addressLine1: string;
     postalCode: string;
     city: string;
     country: string;
-    accountHolder: string;
     iban: string;
     bic: string;
     bankName: string;
@@ -53,6 +57,9 @@ export interface LegacyConfig {
     chamber?: string;
   };
 }
+
+// Payee name exactly as registered at the bank (Kabir 2026-11-13); one account for all three brands.
+const BANK_ACCOUNT_HOLDER = 'Cleanilo - M.Kabir Madjidian & M. Amiri GbR';
 
 // One GbR operates all three brands. Invoices show the USt-IdNr. only, never the Steuernummer.
 const GBR_LEGAL = {
@@ -93,21 +100,23 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
       whatsapp: '+49 177 6909604',
       web: 'www.cleanilo.de',
       webUrl: 'https://www.cleanilo.de',
-      hq: 'Zentrale: Brook 9, 20457 Hamburg-Speicherstadt',
+      hq: 'Eigene Werkstatt: Brook 9, 20457 Hamburg',
       slogan: 'CLEANILO – EINFACH. SCHNELL. ZUVERLÄSSIG',
       secondaryLocation: {
         name: 'Morgenland Teppiche',
-        lines: ['Brook 9', '20457 Hamburg-Speicherstadt'],
+        lines: ['Brook 9', '20457 Hamburg'],
         phone: '+49 40 386 327 75',
       },
     },
     legal: {
-      legalName: 'Cleanilo – M. Kabir Madjidian & M. Amiri GbR',
+      legalName: 'CLEANILO Madjidian-Amiri GbR',
+      previousLegalNames: ['Cleanilo – M. Kabir Madjidian & M. Amiri GbR'],
       addressLine1: 'Brook 9',
       postalCode: '20457',
       city: 'Hamburg',
       country: 'DE',
-      accountHolder: 'Cleanilo – M. Kabir Madjidian & M. Amiri GbR',
+      accountHolder: BANK_ACCOUNT_HOLDER,
+      previousAccountHolders: ['Cleanilo – M. Kabir Madjidian & M. Amiri GbR'],
       iban: 'DE91202208000043001639',
       bic: 'SXPYDEHHXXX',
       bankName: 'Banking Circle',
@@ -149,13 +158,14 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
       },
     },
     legal: {
-      // Same bank account as Cleanilo, but the bare GbR name (no brand prefix).
+      // Same bank account as Cleanilo; legal name without the brand prefix.
       legalName: 'M. Kabir Madjidian & M. Amiri GbR',
       addressLine1: 'Brook 9',
       postalCode: '20457',
       city: 'Hamburg',
       country: 'DE',
-      accountHolder: 'M. Kabir Madjidian & M. Amiri GbR',
+      accountHolder: BANK_ACCOUNT_HOLDER,
+      previousAccountHolders: ['M. Kabir Madjidian & M. Amiri GbR'],
       iban: 'DE91202208000043001639',
       bic: 'SXPYDEHHXXX',
       bankName: 'Banking Circle',
@@ -189,13 +199,14 @@ export const LEGACY_BOOTSTRAP: Record<(typeof LEGACY_COMPANY_SLUGS)[number], Leg
       hq: 'Zentrale: Brook 9, 20457 Hamburg',
     },
     legal: {
-      // Same bank account as Cleanilo, but the bare GbR name (no brand prefix).
+      // Same bank account as Cleanilo; legal name without the brand prefix.
       legalName: 'M. Kabir Madjidian & M. Amiri GbR',
       addressLine1: 'Brook 9',
       postalCode: '20457',
       city: 'Hamburg',
       country: 'DE',
-      accountHolder: 'M. Kabir Madjidian & M. Amiri GbR',
+      accountHolder: BANK_ACCOUNT_HOLDER,
+      previousAccountHolders: ['M. Kabir Madjidian & M. Amiri GbR'],
       iban: 'DE91202208000043001639',
       bic: 'SXPYDEHHXXX',
       bankName: 'Banking Circle',

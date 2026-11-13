@@ -91,6 +91,13 @@ import {
   type CalendlyWebhookPayload,
 } from '../../lib/calendly.js';
 
+/** CLEANILO never names the Speicherstadt (Kabir 2026-11); other brands keep their wording. */
+function dropOffNote(companySlug: string): string {
+  return companySlug === 'cleanilo'
+    ? 'Sie können Ihren Teppich nach Voranmeldung in unserer eigenen Werkstatt in Hamburg (Brook 9, 20457 Hamburg) abgeben.'
+    : 'Sie können Ihren Teppich nach Voranmeldung in unserer Werkstatt in der Hamburg-Speicherstadt abgeben.';
+}
+
 export { orderNumberOf };
 
 /** Per-brand card-statement suffix (Stripe: alnum + space, 22-char limit). */
@@ -449,7 +456,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
           const trackerUrl = `${storefrontOrigin}/bestellung?token=${encodeURIComponent(publicToken)}`;
           const baseNote =
             pickupMode === 'drop_off'
-              ? 'Sie können Ihren Teppich nach Voranmeldung in unserer Werkstatt in der Hamburg-Speicherstadt abgeben.'
+              ? dropOffNote(companyRow.slug)
               : pickupMode === 'onsite'
                 ? 'Wir melden uns innerhalb eines Werktages, um den Vor-Ort-Termin zu bestätigen.'
                 : 'Unser Fahrer holt Ihren Teppich ab. Wir melden uns mit dem genauen Termin.';
@@ -1592,7 +1599,7 @@ async function finalizePaidOrder(
     const trackerUrl = `${(companyRow.storefrontOrigin ?? env.APP_BASE_URL).replace(/\/$/, '')}/bestellung?token=${encodeURIComponent(order.publicToken)}`;
     const fulfillmentNote =
       order.pickupMode === 'drop_off'
-        ? 'Sie können Ihren Teppich nach Voranmeldung in unserer Werkstatt in der Hamburg-Speicherstadt abgeben.'
+        ? dropOffNote(companyRow.slug)
         : order.pickupMode === 'onsite'
           ? 'Wir melden uns innerhalb eines Werktages, um den Vor-Ort-Termin zu bestätigen.'
           : 'Unser Fahrer holt Ihren Teppich ab. Wir melden uns mit dem genauen Termin.';

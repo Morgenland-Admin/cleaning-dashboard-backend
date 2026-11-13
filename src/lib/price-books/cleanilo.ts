@@ -6,16 +6,45 @@
 import { hamburgBook } from './hamburg.js';
 import type { PriceBook } from './types.js';
 
-const DROP_OFF_LABEL =
-  'Selbst-Abgabe · Werkstatt Brook 9, 20457 Hamburg (Speicherstadt) · kostenlos';
+const DROP_OFF_LABEL = 'Selbst-Abgabe · eigene Werkstatt, Brook 9, 20457 Hamburg · kostenlos';
+
+const hhCarpet = hamburgBook.carpetCleaning!;
 
 export const cleaniloBook: PriceBook = {
   slug: 'cleanilo',
   brandName: 'CLEANILO',
   currency: 'EUR',
 
-  carpetCleaning: hamburgBook.carpetCleaning && {
-    ...hamburgBook.carpetCleaning,
+  // Same prices as HTR, own order and wording (Kabir 2026-11): machine-made vs. hand-made, never "Wolle" for maschinell.
+  carpetCleaning: {
+    ...hhCarpet,
+    prices: {
+      maschinell: hhCarpet.prices.maschinell,
+      shaggy: hhCarpet.prices.shaggy,
+      handgeknuepft: hhCarpet.prices.handgeknuepft,
+      china: hhCarpet.prices.china,
+      perser_premium: hhCarpet.prices.perser_premium,
+      seide: hhCarpet.prices.seide,
+      antik: hhCarpet.prices.antik,
+    },
+    labels: {
+      maschinell: 'Maschinell gewebte Teppiche',
+      shaggy: 'Hochflor / Shaggy',
+      handgeknuepft: 'Wollteppiche, handgeknüpft & handgewebt',
+      china: 'China-Teppiche',
+      perser_premium: 'Perser Premium',
+      seide: 'Seidenteppiche',
+      antik: 'Antike Teppiche (über 80 Jahre)',
+    },
+    descriptions: {
+      maschinell: 'Synthetik, Bouclé, Viskose',
+      shaggy: 'Langflor, Flokati',
+      handgeknuepft: 'Orient, Berber, Kelim, Nepal',
+      china: 'Peking, Ningxia',
+      perser_premium: 'Fein geknüpft, Naturfarben (Einstufung nach Begutachtung)',
+      seide: 'Qum, Hereke, Kaschmir',
+      antik: 'Sammlerstücke, nach Begutachtung',
+    },
     pickupMinOrderCents: 10000,
     dropOffLabel: DROP_OFF_LABEL,
   },
@@ -30,7 +59,6 @@ export const cleaniloBook: PriceBook = {
   teppichbodenCleaning: {
     prices: {
       basis: {
-        bis_30: 18500,
         bis_50: 29000,
         bis_75: 43000,
         bis_100: 56000,
@@ -39,7 +67,6 @@ export const cleaniloBook: PriceBook = {
         ab_150: null,
       },
       standard: {
-        bis_30: 24900,
         bis_50: 39000,
         bis_75: 59000,
         bis_100: 79000,
@@ -48,7 +75,6 @@ export const cleaniloBook: PriceBook = {
         ab_150: null,
       },
       premium: {
-        bis_30: 34900,
         bis_50: 59000,
         bis_75: 89000,
         bis_100: 119000,

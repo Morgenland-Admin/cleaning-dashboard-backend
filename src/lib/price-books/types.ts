@@ -15,6 +15,8 @@ import type {
 export interface CarpetCleaningBook {
   prices: Record<TeppichArt, number>;
   labels: Record<TeppichArt, string>;
+  /** Short examples shown under each label (catalog `description`). */
+  descriptions?: Partial<Record<TeppichArt, string>>;
   minOrderCents: number;
   /** Higher minimum for pickup orders (drop-off keeps minOrderCents); unset = same as minOrderCents. */
   pickupMinOrderCents?: number;

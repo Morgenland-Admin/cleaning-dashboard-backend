@@ -47,6 +47,7 @@ function buildCatalog(book: PriceBook): CatalogDto {
         code: k,
         label: c.labels[k],
         unitPriceCents: c.prices[k],
+        ...(c.descriptions?.[k] ? { description: c.descriptions[k] } : {}),
       })),
       options: {
         minOrderCents: c.minOrderCents,
