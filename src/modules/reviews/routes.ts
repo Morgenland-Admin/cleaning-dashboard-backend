@@ -28,16 +28,18 @@ const createReviewSchema = z.object({
   rating: z.number().int().min(1).max(5),
   comment: z.string().trim().max(4000).optional(),
   photos: z.array(z.string().url().max(500)).max(10).optional(),
+  // Every stored review is published with first name and city; the form's checkbox must be ticked.
+  consentPublish: z.literal(true),
 });
 
 const REVIEWABLE_STATUSES = ['delivered', 'completed'] as const;
 
-/** "Max Mustermann" → "Max M." — never the full name or contact on a public page. */
-export function publicReviewerName(name: string | null): string {
-  const parts = (name ?? '').trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return 'Kunde';
-  if (parts.length === 1) return parts[0]!;
-  return `${parts[0]} ${parts[parts.length - 1]!.charAt(0).toUpperCase()}.`;
+/** "Max Mustermann" + "Hamburg" → "Max aus Hamburg" (consent covers first name and city only). */
+export function publicReviewerName(name: string | null, city?: string | null): string {
+  const first = (name ?? '').trim().split(/\s+/).find(Boolean);
+  if (!first) return 'Kunde';
+  const place = city?.trim();
+  return place ? `${first} aus ${place}` : first;
 }
 
 const publicListSchema = z.object({
@@ -50,14 +52,15 @@ export const reviewsPublicRoutes: FastifyPluginAsync = async (app) => {
 
   app.get('/', async (request) => {
     const { limit, cursor } = publicListSchema.parse(request.query);
-    const { reviews } = request.company!.tables;
+    const { orders, reviews } = request.company!.tables;
     const conds = [eq(reviews.status, 'published')];
     const after = keysetAfter(reviews, reviews.createdAt, reviews.id, cursor);
     if (after) conds.push(after);
-    const [rows, [agg]] = await Promise.all([
+    const [joined, [agg]] = await Promise.all([
       db
-        .select()
+        .select({ review: reviews, city: orders.addressCity })
         .from(reviews)
+        .leftJoin(orders, eq(orders.id, reviews.orderId))
         .where(and(...conds))
         .orderBy(desc(reviews.createdAt), desc(reviews.id))
         .limit(limit + 1),
@@ -66,8 +69,9 @@ export const reviewsPublicRoutes: FastifyPluginAsync = async (app) => {
         .from(reviews)
         .where(eq(reviews.status, 'published')),
     ]);
-    const hasMore = rows.length > limit;
-    const page = hasMore ? rows.slice(0, limit) : rows;
+    const hasMore = joined.length > limit;
+    const pageRows = hasMore ? joined.slice(0, limit) : joined;
+    const page = pageRows.map((j) => ({ ...j.review, city: j.city }));
     const last = page[page.length - 1];
     return {
       summary: {
@@ -78,7 +82,7 @@ export const reviewsPublicRoutes: FastifyPluginAsync = async (app) => {
         id: r.id,
         rating: r.rating,
         comment: r.comment,
-        authorName: publicReviewerName(r.customerName),
+        authorName: publicReviewerName(r.customerName, r.city),
         source: r.source,
         createdAt: r.createdAt,
         response: r.partnerResponse,
@@ -264,13 +268,15 @@ export const reviewsPartnerRoutes: FastifyPluginAsync = async (app) => {
 
   app.get('/', async (request) => {
     const partner = await requireOwnPartner(request);
-    const { reviews } = request.company!.tables;
-    const rows = await db
-      .select()
+    const { orders, reviews } = request.company!.tables;
+    const joined = await db
+      .select({ review: reviews, city: orders.addressCity })
       .from(reviews)
+      .leftJoin(orders, eq(orders.id, reviews.orderId))
       .where(and(eq(reviews.partnerId, partner.id), eq(reviews.status, 'published')))
       .orderBy(desc(reviews.createdAt))
       .limit(200);
+    const rows = joined.map((j) => ({ ...j.review, city: j.city }));
     return {
       summary: {
         average: partner.rating == null ? null : Number(partner.rating),
@@ -281,7 +287,7 @@ export const reviewsPartnerRoutes: FastifyPluginAsync = async (app) => {
         orderId: r.orderId,
         rating: r.rating,
         comment: r.comment,
-        authorName: publicReviewerName(r.customerName),
+        authorName: publicReviewerName(r.customerName, r.city),
         createdAt: r.createdAt,
         response: r.partnerResponse,
         respondedAt: r.respondedAt,

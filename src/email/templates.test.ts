@@ -129,9 +129,9 @@ test('customer mail greets formally and never invents a name', () => {
   assert.equal(formalGreeting({ name: null }), 'Guten Tag,');
 });
 
-test('order confirmation carries the early-start consent and the Widerruf link only when given', async () => {
+test('CLEANILO confirmation carries the full Widerruf texts for every consented order', async () => {
   const { orderConfirmationEmail } = await import('./templates.js');
-  const { withdrawalNoticeFor, EARLY_START_CONSENT_TEXT } = await import('../lib/legal-texts.js');
+  const { withdrawalNoticeFor, TERMS_CONSENT_TEXT } = await import('../lib/legal-texts.js');
   const brand = brandFromSeed(LEGACY_BOOTSTRAP.cleanilo);
   const base = {
     brand,
@@ -144,21 +144,125 @@ test('order confirmation carries the early-start consent and the Widerruf link o
   };
   const plain = orderConfirmationEmail(base).html;
   assert.ok(!plain.includes('Widerruf'));
+  assert.equal(withdrawalNoticeFor({}, 'cleanilo', 'https://www.cleanilo.de'), null);
 
-  const withdrawal = withdrawalNoticeFor(
-    {
-      consents: {
-        earlyStartAcceptedAt: '2026-11-11T14:04:00.000Z',
-        earlyStartText: EARLY_START_CONSENT_TEXT,
-      },
-    },
+  const termsOnly = withdrawalNoticeFor(
+    { consents: { termsAcceptedAt: '2026-11-11T14:04:00.000Z' } },
     'cleanilo',
     'https://www.cleanilo.de/',
   );
+  assert.ok(termsOnly);
+  const html = orderConfirmationEmail({
+    ...base,
+    appointment: { label: 'Wunschtermin', value: '30.11.2026 · 10:00 Uhr' },
+    paymentMethodLabel: 'PayPal',
+    withdrawal: termsOnly,
+  }).html;
+  assert.ok(html.includes(TERMS_CONSENT_TEXT));
+  assert.ok(html.includes('Ende der Widerrufsbelehrung'));
+  assert.ok(html.includes('Erlöschen des Widerrufsrechts'));
+  assert.ok(html.includes('Muster-Widerrufsformular'));
+  assert.ok(html.includes('Datum: ______________________'));
+  assert.ok(html.includes('https://www.cleanilo.de/agb'));
+  assert.ok(
+    html.includes('über die Schaltfläche ‚<a href="https://www.cleanilo.de/vertrag-widerrufen"'),
+  );
+  assert.ok(html.includes('‘ auf cleanilo.de widerrufen.'));
+  assert.ok(html.includes('30.11.2026 · 10:00 Uhr'));
+  assert.ok(html.includes('Zahlungsart'));
+  assert.ok(!html.includes('ausdrücklich verlangt'));
+
+  const early = withdrawalNoticeFor(
+    {
+      consents: {
+        termsAcceptedAt: '2026-11-11T14:04:00.000Z',
+        earlyStartAcceptedAt: '2026-11-11T14:04:00.000Z',
+      },
+    },
+    'cleanilo',
+    'https://www.cleanilo.de',
+  );
+  const earlyHtml = orderConfirmationEmail({ ...base, withdrawal: early }).html;
+  assert.ok(
+    earlyHtml.includes(
+      'Sie haben am 11.11.2026, 15:04 Uhr ausdrücklich verlangt, dass wir mit der Ausführung vor Ablauf der Widerrufsfrist beginnen, und bestätigt, dass Sie bei vollständiger Erbringung Ihr Widerrufsrecht verlieren.',
+    ),
+  );
+});
+
+test('other brands keep the early-start-only Widerruf block with a link', async () => {
+  const { orderConfirmationEmail } = await import('./templates.js');
+  const { withdrawalNoticeFor, EARLY_START_CONSENT_TEXT } = await import('../lib/legal-texts.js');
+  const origin = 'https://www.hamburg-teppichreinigung.example';
+  assert.equal(
+    withdrawalNoticeFor(
+      { consents: { termsAcceptedAt: '2026-11-11T14:04:00.000Z' } },
+      'hamburg_teppichreinigung',
+      origin,
+    ),
+    null,
+  );
+  const withdrawal = withdrawalNoticeFor(
+    { consents: { earlyStartAcceptedAt: '2026-11-11T14:04:00.000Z' } },
+    'hamburg_teppichreinigung',
+    origin,
+  );
   assert.ok(withdrawal);
-  const html = orderConfirmationEmail({ ...base, withdrawal }).html;
+  const html = orderConfirmationEmail({
+    brand: brandFromSeed(LEGACY_BOOTSTRAP.hamburg_teppichreinigung),
+    customerName: 'Max Muster',
+    orderNumber: '2026/000001',
+    trackerUrl: 'https://example.test/bestellung?token=x',
+    totalFormatted: '100,00 €',
+    lines: [],
+    fulfillmentNote: 'Wir holen ab.',
+    withdrawal,
+  }).html;
   assert.ok(html.includes('Ihre Zustimmung zum vorzeitigen Leistungsbeginn'));
-  assert.ok(html.includes('11.11.2026, 15:04 Uhr'));
-  assert.ok(html.includes('https://www.cleanilo.de/widerruf'));
-  assert.equal(withdrawalNoticeFor({}, 'cleanilo', 'https://www.cleanilo.de'), null);
+  assert.ok(html.includes(EARLY_START_CONSENT_TEXT));
+  assert.ok(html.includes(`${origin}/widerruf`));
+  assert.ok(!html.includes('Ende der Widerrufsbelehrung'));
+});
+
+test('withdrawal receipt uses the approved wording with Berlin date and time', async () => {
+  const { withdrawalReceiptEmail } = await import('./templates.js');
+  const brand = brandFromSeed(LEGACY_BOOTSTRAP.cleanilo);
+  const withNumber = withdrawalReceiptEmail({
+    brand,
+    name: 'Max Muster',
+    receivedAt: new Date('2026-11-13T09:05:00.000Z'),
+    orderNumber: 'CL-TEST-0001',
+    declaration: [
+      ['Name', 'Max Muster'],
+      ['Auftragsnummer', 'CL-TEST-0001'],
+    ],
+  });
+  assert.equal(withNumber.subject, 'Eingangsbestätigung Ihres Widerrufs — Buchung CL-TEST-0001');
+  assert.ok(withNumber.html.includes('Sehr geehrte/r Max Muster,'));
+  assert.ok(
+    withNumber.html.includes(
+      'wir bestätigen den Eingang Ihrer Widerrufserklärung zu Buchung CL-TEST-0001 am <strong>13.11.2026</strong> um <strong>10:05 Uhr</strong>.',
+    ),
+  );
+  assert.ok(
+    withNumber.html.includes(
+      'Inhalt Ihrer Erklärung: Name: Max Muster; Auftragsnummer: CL-TEST-0001.',
+    ),
+  );
+  assert.ok(
+    withNumber.html.includes(
+      'Die Rückerstattung bereits geleisteter Zahlungen erfolgt binnen 14 Tagen auf das ursprünglich verwendete Zahlungsmittel.',
+    ),
+  );
+  assert.ok(withNumber.html.includes('Bei Fragen erreichen Sie uns unter '));
+  assert.ok(withNumber.html.includes('CLEANILO Madjidian-Amiri GbR'));
+
+  const without = withdrawalReceiptEmail({
+    brand,
+    name: 'Max Muster',
+    receivedAt: new Date('2026-11-13T09:05:00.000Z'),
+    declaration: [['Name', 'Max Muster']],
+  });
+  assert.equal(without.subject, 'Eingangsbestätigung Ihres Widerrufs');
+  assert.ok(without.html.includes('Widerrufserklärung zu Ihrer Buchung am'));
 });

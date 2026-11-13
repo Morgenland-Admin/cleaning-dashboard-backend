@@ -163,6 +163,7 @@ export function brandInfoFromCompany(
   c: CompanyLike & {
     primaryColor?: string | null;
     logoUrl?: string | null;
+    invoiceLogoUrl?: string | null;
     email?: string | null;
     phone?: string | null;
     websiteUrl?: string | null;
@@ -186,6 +187,7 @@ export function brandInfoFromCompany(
     domain: c.senderEmail?.split('@')[1] ?? '',
     primaryColor: c.primaryColor ?? undefined,
     logoUrl: c.logoUrl ?? null,
+    wordmarkUrl: c.invoiceLogoUrl ?? null,
     email: c.email ?? null,
     phone: c.phone ?? null,
     websiteUrl: c.websiteUrl ?? null,

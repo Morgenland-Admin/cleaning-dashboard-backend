@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { ensureTenantSchemaForTests } from '../../db/test-tenant-schema.js';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, pool } from '../../db/index.js';
-import { createTenantSchemaSql, getTenantTables } from '../../db/schema/tenant.js';
+import { getTenantTables } from '../../db/schema/tenant.js';
 import {
   attachLegacyPartnerChat,
   LEGACY_ADMIN_SENDER,
@@ -42,7 +43,7 @@ describe(
     const T = getTenantTables(SLUG);
 
     before(async () => {
-      await db.execute(sql.raw(createTenantSchemaSql(SLUG)));
+      await ensureTenantSchemaForTests(SLUG);
       await db
         .insert(T.legacyRecords)
         .values([

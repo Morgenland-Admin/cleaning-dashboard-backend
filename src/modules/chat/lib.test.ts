@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { eq, sql } from 'drizzle-orm';
+import { ensureTenantSchemaForTests } from '../../db/test-tenant-schema.js';
+import { eq } from 'drizzle-orm';
 import { db, pool } from '../../db/index.js';
-import { createTenantSchemaSql, getTenantTables } from '../../db/schema/tenant.js';
+import { getTenantTables } from '../../db/schema/tenant.js';
 import { ensureConversation, markDelivered, markRead, messagePage, previewOf } from './lib.js';
 
 const SLUG = 'cleanilo';
@@ -43,7 +44,7 @@ describe(
     const ids: number[] = [];
 
     before(async () => {
-      await db.execute(sql.raw(createTenantSchemaSql(SLUG)));
+      await ensureTenantSchemaForTests(SLUG);
       const [conv] = await db
         .insert(T.chatConversations)
         .values({ partnerUserId: PARTNER_USER })

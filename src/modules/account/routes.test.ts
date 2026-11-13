@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { inArray, sql } from 'drizzle-orm';
+import { ensureTenantSchemaForTests } from '../../db/test-tenant-schema.js';
+import { inArray } from 'drizzle-orm';
 import { buildApp, type App } from '../../app.js';
 import { db, pool } from '../../db/index.js';
-import { createTenantSchemaSql, getTenantTables } from '../../db/schema/tenant.js';
+import { getTenantTables } from '../../db/schema/tenant.js';
 import { env } from '../../config/env.js';
 import { signCustomerToken, verifyCustomerToken } from '../../lib/token.js';
 import { loginLinkOrigin } from './routes.js';
@@ -80,7 +81,7 @@ describe(
     });
 
     before(async () => {
-      await db.execute(sql.raw(createTenantSchemaSql(SLUG)));
+      await ensureTenantSchemaForTests(SLUG);
       const rows = await db
         .insert(T.orders)
         .values([

@@ -75,7 +75,11 @@ import {
   type CheckoutInput,
 } from './pricing-input.js';
 import { evaluateCancellation, type CancellationDecision } from './cancellation.js';
-import { EARLY_START_CONSENT_TEXT, withdrawalNoticeFor } from '../../lib/legal-texts.js';
+import {
+  EARLY_START_CONSENT_TEXT,
+  TERMS_CONSENT_TEXT,
+  withdrawalNoticeFor,
+} from '../../lib/legal-texts.js';
 import {
   bookConfirmedSlot,
   createBookingLink,
@@ -116,6 +120,46 @@ function formatSlotDe(slot: string): string {
   const [y, m, day] = (d ?? '').split('-');
   if (!y || !m || !day) return slot;
   return `${day}.${m}.${y}${t ? ` · ${t} Uhr` : ''}`;
+}
+
+/** Termin + Zahlungsart of the booking summary (§ 312f BGB); CLEANILO only, other brands unchanged. */
+function confirmationSummaryExtras(
+  companySlug: string,
+  order: {
+    metadata: Record<string, unknown> | null;
+    preferredDate: string | null;
+    paymentMode: string;
+  },
+  provider: 'stripe' | 'paypal' | null,
+): {
+  appointment?: { label: string; value: string } | null;
+  paymentMethodLabel?: string | null;
+} {
+  if (companySlug !== 'cleanilo') return {};
+  const meta = order.metadata ?? {};
+  const confirmed = typeof meta.confirmedSlot === 'string' ? meta.confirmedSlot : null;
+  const slots = Array.isArray(meta.preferredSlots)
+    ? meta.preferredSlots.filter((x): x is string => typeof x === 'string')
+    : [];
+  const appointment = confirmed
+    ? { label: 'Termin', value: formatSlotDe(confirmed) }
+    : slots.length > 0
+      ? {
+          label: slots.length > 1 ? 'Wunschtermine' : 'Wunschtermin',
+          value: slots.map(formatSlotDe).join(' / '),
+        }
+      : order.preferredDate
+        ? { label: 'Wunschtermin', value: formatSlotDe(order.preferredDate) }
+        : null;
+  const paymentMethodLabel =
+    order.paymentMode === 'after_service'
+      ? 'Zahlung nach erbrachter Leistung'
+      : provider === 'paypal'
+        ? 'PayPal'
+        : provider === 'stripe'
+          ? 'Kartenzahlung'
+          : null;
+  return { appointment, paymentMethodLabel };
 }
 
 /** Service address for the Calendly booking: address only, no order value (internal calendar). */
@@ -269,6 +313,14 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
         });
         return;
       }
+      if (body.expectedTotalCents != null && body.expectedTotalCents !== quote.totalCents) {
+        reply.code(409).send({
+          error:
+            'Der Preis hat sich geändert. Bitte prüfen Sie den aktuellen Festpreis und buchen Sie erneut.',
+          totalCents: quote.totalCents,
+        });
+        return;
+      }
 
       const [companyRow] = await db
         .select()
@@ -392,7 +444,9 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
               ...(body.consentTerms || body.consentEarlyStart
                 ? {
                     consents: {
-                      ...(body.consentTerms ? { termsAcceptedAt: now.toISOString() } : {}),
+                      ...(body.consentTerms
+                        ? { termsAcceptedAt: now.toISOString(), termsText: TERMS_CONSENT_TEXT }
+                        : {}),
                       ...(body.consentEarlyStart
                         ? {
                             earlyStartAcceptedAt: now.toISOString(),
@@ -488,6 +542,7 @@ export const ordersPublicRoutes: FastifyPluginAsync = async (app) => {
               pickupFeeFormatted:
                 quote.pickupFeeCents > 0 ? formatEurFromCents(quote.pickupFeeCents) : null,
               fulfillmentNote,
+              ...confirmationSummaryExtras(companyRow.slug, orderRow, null),
               withdrawal: withdrawalNoticeFor(orderRow.metadata, companyRow.slug, storefrontOrigin),
             }),
           });
@@ -1630,6 +1685,7 @@ async function finalizePaidOrder(
         pickupFeeFormatted:
           order.pickupFeeCents > 0 ? formatEurFromCents(order.pickupFeeCents) : null,
         fulfillmentNote,
+        ...confirmationSummaryExtras(companyRow.slug, order, paid.provider),
         withdrawal: withdrawalNoticeFor(
           order.metadata,
           companyRow.slug,

@@ -15,6 +15,7 @@ import { partnerApplicationsPublicRoutes } from '../modules/partners/application
 import { brandPublicRoutes } from '../modules/brand/routes.js';
 import { accountPublicRoutes } from '../modules/account/routes.js';
 import { withdrawalsPublicRoutes } from '../modules/withdrawals/routes.js';
+import { marketingPublicRoutes } from '../modules/marketing/routes.js';
 
 const storefrontRoutes: FastifyPluginAsync = async (app) => {
   await app.register(catalogPublicRoutes, { prefix: '/catalog' });
@@ -34,6 +35,7 @@ const storefrontRoutes: FastifyPluginAsync = async (app) => {
   await app.register(brandPublicRoutes, { prefix: '/brand' });
   await app.register(accountPublicRoutes, { prefix: '/account' });
   await app.register(withdrawalsPublicRoutes, { prefix: '/withdrawals' });
+  await app.register(marketingPublicRoutes, { prefix: '/marketing' });
 };
 
 export default storefrontRoutes;

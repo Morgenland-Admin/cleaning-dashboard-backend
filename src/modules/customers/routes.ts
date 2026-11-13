@@ -28,6 +28,7 @@ import {
 import { customerMessageEmail } from '../../email/templates.js';
 import { encodeCursor, keysetAfter } from '../../lib/cursor.js';
 import { conflict, HttpError, notFound, parseIntId } from '../../lib/http-errors.js';
+import { marketingUnsubscribeUrl } from '../../lib/token.js';
 import { recomputeCustomerAggregates } from '../../lib/customer-stats.js';
 import { orderNumberOf } from '../orders/lib.js';
 import { pageEmailLog, sentToAddress } from '../emails/list.js';
@@ -399,6 +400,17 @@ function renderCustomerEmail(
   });
 }
 
+/** Signed opt-out links for marketing sends (n8n puts them into its e-mails / SMS). */
+function withOptOutLinks<T extends { id: number }>(slug: string, row: T) {
+  return {
+    ...row,
+    marketingUnsubscribeUrls: {
+      email: marketingUnsubscribeUrl(slug, row.id, 'email'),
+      sms: marketingUnsubscribeUrl(slug, row.id, 'sms'),
+    },
+  };
+}
+
 export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', app.requireCompany);
   // Reads open to any member (a `viewer` reads the linked orders); writes manager+.
@@ -430,7 +442,13 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
         ? encodeCursor({ createdAt: last.createdAt.toISOString(), id: last.id })
         : null;
     // A viewer keeps the operational record but not staff commentary.
-    return { customers: redactListForViewer(page, accessLevelOf(request)), nextCursor };
+    const slug = request.company!.slug;
+    return {
+      customers: redactListForViewer(page, accessLevelOf(request)).map((r) =>
+        withOptOutLinks(slug, r),
+      ),
+      nextCursor,
+    };
   });
 
   app.post('/', async (request, reply) => {
@@ -547,7 +565,12 @@ export const customersAdminRoutes: FastifyPluginAsync = async (app) => {
     const { customers } = request.company!.tables;
     const [row] = await db.select().from(customers).where(eq(customers.id, id)).limit(1);
     if (!row) throw notFound('Customer not found');
-    return { customer: redactForViewer(row, accessLevelOf(request)) };
+    return {
+      customer: withOptOutLinks(
+        request.company!.slug,
+        redactForViewer(row, accessLevelOf(request)),
+      ),
+    };
   });
 
   // Customer 360 header: profile, addresses and uncapped stats; the linked lists page separately below.

@@ -463,6 +463,9 @@ function buildTenantTables(schemaName: string) {
       firstOrderAt: timestamp('first_order_at', { withTimezone: true }),
       lastOrderAt: timestamp('last_order_at', { withTimezone: true }),
       marketingOptIn: boolean('marketing_opt_in').notNull().default(false),
+      /** Per-channel marketing opt-out (unsubscribe link); n8n marketing flows skip when set. */
+      emailMarketingOptOutAt: timestamp('email_marketing_opt_out_at', { withTimezone: true }),
+      smsMarketingOptOutAt: timestamp('sms_marketing_opt_out_at', { withTimezone: true }),
       createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
       updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     },
@@ -1327,6 +1330,8 @@ CREATE TABLE IF NOT EXISTS ${q}."customers" (
   "first_order_at" timestamp with time zone,
   "last_order_at" timestamp with time zone,
   "marketing_opt_in" boolean DEFAULT false NOT NULL,
+  "email_marketing_opt_out_at" timestamp with time zone,
+  "sms_marketing_opt_out_at" timestamp with time zone,
   "created_at" timestamp with time zone DEFAULT now() NOT NULL,
   "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
   CONSTRAINT "${schemaName}_customers_email_unique" UNIQUE("email")
@@ -1613,6 +1618,10 @@ DO $$ BEGIN
 END $$;
 ALTER TABLE ${q}."service_inquiries" ADD COLUMN IF NOT EXISTS "assigned_partner_id" integer;
 ALTER TABLE ${q}."orders" ADD COLUMN IF NOT EXISTS "partner_photos" jsonb DEFAULT '[]'::jsonb NOT NULL;
+
+-- ── Marketing opt-out per channel (unsubscribe link) ──
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "email_marketing_opt_out_at" timestamp with time zone;
+ALTER TABLE ${q}."customers" ADD COLUMN IF NOT EXISTS "sms_marketing_opt_out_at" timestamp with time zone;
 
 CREATE TABLE IF NOT EXISTS ${q}."service_catalog" (
   "id" serial PRIMARY KEY NOT NULL,

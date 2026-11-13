@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { and, eq, sql } from 'drizzle-orm';
+import { ensureTenantSchemaForTests } from '../../db/test-tenant-schema.js';
+import { and, eq } from 'drizzle-orm';
 import { buildApp, type App } from '../../app.js';
 import { db, pool } from '../../db/index.js';
 import { membership, user } from '../../db/schema/shared.js';
-import { createTenantSchemaSql, getTenantTables } from '../../db/schema/tenant.js';
+import { getTenantTables } from '../../db/schema/tenant.js';
 import { previewOf } from './routes.js';
 
 const SLUG = 'cleanilo';
@@ -49,7 +50,7 @@ describe(
     const T = getTenantTables(SLUG);
 
     before(async () => {
-      await db.execute(sql.raw(createTenantSchemaSql(SLUG)));
+      await ensureTenantSchemaForTests(SLUG);
       for (const u of Object.values(USERS)) {
         await db
           .insert(user)

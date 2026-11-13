@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { ensureTenantSchemaForTests } from '../../db/test-tenant-schema.js';
+import { and, eq, inArray } from 'drizzle-orm';
 import { buildApp, type App } from '../../app.js';
 import { db, pool } from '../../db/index.js';
 import { emailLog } from '../../db/schema/shared.js';
-import { createTenantSchemaSql, getTenantTables } from '../../db/schema/tenant.js';
+import { getTenantTables } from '../../db/schema/tenant.js';
 
 const SLUG = 'cleanilo';
 const EMAIL = 'zz-withdrawal-test@example.invalid';
@@ -30,7 +31,7 @@ describe(
     const orderIds: number[] = [];
 
     before(async () => {
-      await db.execute(sql.raw(createTenantSchemaSql(SLUG)));
+      await ensureTenantSchemaForTests(SLUG);
       const rows = await db
         .insert(T.orders)
         .values({

@@ -1,6 +1,11 @@
 /** Inline HTML templates, each returning `{ subject, html }`; system templates are unbranded "Reinigungs-Portal" mail. */
 import { INVOICE_THANK_YOU } from '../lib/invoice-text.js';
-import { formatBerlinDateTime, type WithdrawalNotice } from '../lib/legal-texts.js';
+import {
+  berlinDateTimeParts,
+  earlyStartStatement,
+  formatBerlinDateTime,
+  type WithdrawalNotice,
+} from '../lib/legal-texts.js';
 
 export interface BrandInfo {
   name: string;
@@ -8,6 +13,8 @@ export interface BrandInfo {
   /** Header accent; defaults to rust. */
   primaryColor?: string;
   logoUrl?: string | null;
+  /** Wide logo for the mail header (the invoice wordmark); falls back to logoUrl. */
+  wordmarkUrl?: string | null;
   email?: string | null;
   phone?: string | null;
   websiteUrl?: string | null;
@@ -74,6 +81,21 @@ function nl2br(s: string): string {
   return escapeHtml(s).replace(/\n/g, '<br />');
 }
 
+const FONT_STACK = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+
+// Mobile rules; clients without <style> support (old Outlook) keep the fluid 600px layout.
+const RESPONSIVE_CSS = `
+  body { margin:0 !important; padding:0 !important; width:100% !important; }
+  a { color:inherit; }
+  @media only screen and (max-width:620px) {
+    .em-px { padding-left:20px !important; padding-right:20px !important; }
+    .em-hide-sm { display:none !important; }
+    .em-content { font-size:16px !important; }
+    .em-btn, .em-btn tbody, .em-btn tr, .em-btn td, .em-btn a { display:block !important; width:100% !important; text-align:center !important; box-sizing:border-box; }
+    .em-stack, .em-stack tbody, .em-stack tr, .em-stack td { display:block !important; width:100% !important; }
+    .em-stack td { padding-left:0 !important; padding-right:0 !important; }
+  }`;
+
 function layout(opts: {
   brand: BrandInfo;
   preheader: string;
@@ -81,41 +103,62 @@ function layout(opts: {
   footerNote?: string;
 }): string {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
-  const logo = emailSafeLogo(opts.brand.logoUrl);
-  const header = logo
+  const logo = emailSafeLogo(opts.brand.wordmarkUrl) ?? emailSafeLogo(opts.brand.logoUrl);
+  const site = opts.brand.websiteUrl || (opts.brand.domain ? `https://${opts.brand.domain}` : null);
+  const mark = logo
     ? `<img src="${escapeHtml(logo)}" alt="${escapeHtml(opts.brand.name)}" height="36" style="display:block;height:36px;max-height:36px;width:auto;border:0;outline:none;text-decoration:none;" />`
-    : `<div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:${accent};font-weight:700;">
-                  ${escapeHtml(opts.brand.name)}
-                </div>`;
+    : `<span style="font-size:18px;font-weight:700;letter-spacing:0.2px;color:#1f2933;">${escapeHtml(opts.brand.name)}</span>`;
+  const brandMark = site
+    ? `<a href="${escapeHtml(site)}" style="text-decoration:none;color:#1f2933;">${mark}</a>`
+    : mark;
+  const headerContact = opts.brand.phone
+    ? `<a href="tel:${escapeHtml(opts.brand.phone.replace(/[^\d+]/g, ''))}" style="font-size:13px;font-weight:600;color:${accent};text-decoration:none;white-space:nowrap;">${escapeHtml(opts.brand.phone)}</a>`
+    : '';
   return `<!DOCTYPE html>
 <html lang="de">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="x-apple-disable-message-reformatting" />
+    <meta name="color-scheme" content="light" />
+    <meta name="supported-color-schemes" content="light" />
     <title>${escapeHtml(opts.brand.name)}</title>
+    <style>${RESPONSIVE_CSS}</style>
   </head>
-  <body style="margin:0;padding:0;background:#f4ebdc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#2d2419;line-height:1.55;">
-    <span style="display:none!important;visibility:hidden;opacity:0;color:transparent;height:0;width:0;font-size:1px;mso-hide:all;">${escapeHtml(opts.preheader)}</span>
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#f4ebdc;padding:32px 16px;">
+  <body style="margin:0;padding:0;background:#ffffff;font-family:${FONT_STACK};color:#1f2933;line-height:1.6;-webkit-text-size-adjust:100%;">
+    <span style="display:none!important;visibility:hidden;opacity:0;color:transparent;height:0;width:0;font-size:1px;line-height:1px;max-height:0;overflow:hidden;mso-hide:all;">${escapeHtml(opts.preheader)}</span>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#ffffff;">
+      <tr>
+        <td style="height:4px;line-height:4px;font-size:0;background:${accent};">&nbsp;</td>
+      </tr>
+      <tr>
+        <td align="center" style="border-bottom:1px solid #e4e7eb;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:100%;max-width:600px;">
+            <tr>
+              <td class="em-px" style="padding:22px 32px;" valign="middle">${brandMark}</td>
+              ${headerContact ? `<td class="em-px em-hide-sm" align="right" valign="middle" style="padding:22px 32px;">${headerContact}</td>` : ''}
+            </tr>
+          </table>
+        </td>
+      </tr>
       <tr>
         <td align="center">
-          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="max-width:560px;width:100%;background:#fefaf0;border-radius:16px;overflow:hidden;border:1px solid #e2d3b6;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:100%;max-width:600px;">
             <tr>
-              <td style="padding:24px 32px 20px;border-bottom:1px solid #e2d3b6;">
-                ${header}
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:24px 32px 32px;font-size:15px;color:#2d2419;">
+              <td class="em-px em-content" style="padding:32px 32px 40px;font-size:15px;line-height:1.6;color:#1f2933;">
                 ${opts.contentHtml}
               </td>
             </tr>
           </table>
-          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="max-width:560px;width:100%;margin-top:16px;">
+        </td>
+      </tr>
+      <tr>
+        <td align="center" style="background:#f6f7f9;border-top:1px solid #e4e7eb;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:100%;max-width:600px;">
             <tr>
-              <td style="padding:0 32px;font-size:11px;color:#6b5b48;text-align:center;line-height:1.6;">
-                ${opts.footerNote ? '<div style="margin-bottom:10px;">' + escapeHtml(opts.footerNote) + '</div>' : ''}
+              <td class="em-px" style="padding:28px 32px 32px;font-size:12px;line-height:1.7;color:#5f6b7a;">
                 ${legalFooter(opts.brand, accent)}
+                ${opts.footerNote ? `<div style="margin-top:14px;font-size:11px;color:#7b8794;">${escapeHtml(opts.footerNote)}</div>` : ''}
               </td>
             </tr>
           </table>
@@ -127,10 +170,10 @@ function layout(opts: {
 }
 
 function button(href: string, label: string, accent = '#bd5b3e'): string {
-  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0;">
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" class="em-btn" style="margin:24px 0;">
     <tr>
-      <td style="background:${accent};border-radius:10px;">
-        <a href="${escapeHtml(href)}" style="display:inline-block;padding:12px 24px;color:#fefaf0;text-decoration:none;font-weight:600;font-size:14px;">
+      <td style="background:${accent};border-radius:6px;" align="center">
+        <a href="${escapeHtml(href)}" style="display:inline-block;padding:13px 26px;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;line-height:1.2;">
           ${escapeHtml(label)}
         </a>
       </td>
@@ -154,27 +197,27 @@ function formatIban(iban: string): string {
 function legalFooter(brand: BrandInfo, accent: string): string {
   const identity = brand.legalName && brand.legalName !== brand.name ? brand.legalName : brand.name;
   const addr = (brand.addressLines ?? []).filter(Boolean).join(' · ');
-  const line1 = [escapeHtml(identity), addr ? escapeHtml(addr) : ''].filter(Boolean).join(' · ');
+  const link = (href: string, text: string) =>
+    `<a href="${escapeHtml(href)}" style="color:#3f4a57;text-decoration:none;">${escapeHtml(text)}</a>`;
 
-  const idBits: string[] = [];
-  if (brand.vatId) idBits.push(`USt-IdNr. ${escapeHtml(brand.vatId)}`);
-  if (brand.registrationNumber) idBits.push(`Reg-Nr. ${escapeHtml(brand.registrationNumber)}`);
-  if (brand.phone) idBits.push(`Tel. ${escapeHtml(brand.phone)}`);
-  if (brand.email) {
-    idBits.push(
-      `<a href="mailto:${escapeHtml(brand.email)}" style="color:#6b5b48;text-decoration:none;">${escapeHtml(brand.email)}</a>`,
-    );
-  }
-
+  const contact: string[] = [];
+  if (brand.phone) contact.push(link(`tel:${brand.phone.replace(/[^\d+]/g, '')}`, brand.phone));
+  if (brand.email) contact.push(link(`mailto:${brand.email}`, brand.email));
   const site = brand.websiteUrl || (brand.domain ? `https://${brand.domain}` : null);
-  const brandLine = site
-    ? `<a href="${escapeHtml(site)}" style="color:${accent};text-decoration:none;font-weight:600;">${escapeHtml(displayHost(site))}</a>`
-    : `<span style="font-weight:600;">${escapeHtml(brand.domain || brand.name)}</span>`;
+  if (site)
+    contact.push(
+      `<a href="${escapeHtml(site)}" style="color:${accent};text-decoration:none;font-weight:600;">${escapeHtml(displayHost(site))}</a>`,
+    );
+
+  const ids: string[] = [];
+  if (brand.vatId) ids.push(`USt-IdNr. ${escapeHtml(brand.vatId)}`);
+  if (brand.registrationNumber) ids.push(`Reg-Nr. ${escapeHtml(brand.registrationNumber)}`);
 
   return `
-    ${line1 ? `<div style="color:#5b4b38;">${line1}</div>` : ''}
-    ${idBits.length ? `<div style="margin-top:2px;">${idBits.join(' · ')}</div>` : ''}
-    <div style="margin-top:8px;">${brandLine}</div>`;
+    <div style="font-size:13px;font-weight:700;color:#1f2933;">${escapeHtml(identity)}</div>
+    ${addr ? `<div>${escapeHtml(addr)}</div>` : ''}
+    ${contact.length ? `<div style="margin-top:8px;">${contact.join(' &nbsp;·&nbsp; ')}</div>` : ''}
+    ${ids.length ? `<div style="margin-top:8px;font-size:11px;color:#7b8794;">${ids.join(' · ')}</div>` : ''}`;
 }
 
 /** "Bankverbindung" card for invoice + dunning mail, with the invoice number as Verwendungszweck; empty without an IBAN. */
@@ -188,8 +231,8 @@ function bankTransferBlock(opts: {
   const accent = opts.accent;
   const MONO = "font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;";
   const LABEL =
-    'padding:7px 18px 7px 0;font-size:10px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:#93826a;white-space:nowrap;vertical-align:middle;';
-  const VAL = 'padding:7px 0;font-size:14px;color:#2d2419;line-height:1.4;vertical-align:middle;';
+    'padding:7px 18px 7px 0;font-size:10px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:#7b8794;white-space:nowrap;vertical-align:middle;';
+  const VAL = 'padding:7px 0;font-size:14px;color:#1f2933;line-height:1.4;vertical-align:middle;';
 
   const line = (label: string, value: string, valStyle = ''): string =>
     `<tr><td style="${LABEL}">${label}</td><td style="${VAL}${valStyle}">${value}</td></tr>`;
@@ -221,24 +264,24 @@ function bankTransferBlock(opts: {
     );
 
   const divider = payment.length
-    ? `<tr><td colspan="2" style="padding:8px 0 2px;"><div style="height:1px;background:#e6d6b8;line-height:1px;font-size:0;">&nbsp;</div></td></tr>`
+    ? `<tr><td colspan="2" style="padding:8px 0 2px;"><div style="height:1px;background:#e4e7eb;line-height:1px;font-size:0;">&nbsp;</div></td></tr>`
     : '';
 
   return `
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:22px 0 0;background:#faf3e3;border:1px solid #e6d6b8;border-radius:12px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:2px solid ${accent};border-bottom:1px solid #e4e7eb;">
       <tr>
-        <td style="padding:15px 20px 3px;border-bottom:1px solid #efe4cc;">
+        <td style="padding:14px 0 2px;border-bottom:1px solid #eef0f3;">
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
             <tr>
               <td style="font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:${accent};padding-bottom:12px;">Bankverbindung</td>
-              <td align="right" style="font-size:11px;color:#93826a;padding-bottom:12px;">Zahlung per Überweisung</td>
+              <td align="right" class="em-hide-sm" style="font-size:11px;color:#7b8794;padding-bottom:12px;">Zahlung per Überweisung</td>
             </tr>
           </table>
         </td>
       </tr>
       <tr>
-        <td style="padding:8px 20px 16px;">
-          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+        <td style="padding:8px 0 16px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" class="em-stack">
             ${account.join('')}
             ${divider}
             ${payment.join('')}
@@ -269,10 +312,10 @@ function signatureBlock(brand: BrandInfo): string {
 
   const parts: string[] = [];
   parts.push(
-    `<div style="font-size:14px;color:#2d2419;">${escapeHtml(sig.signOff ?? 'Mit freundlichen Grüßen')}</div>`,
+    `<div style="font-size:14px;color:#1f2933;">${escapeHtml(sig.signOff ?? 'Mit freundlichen Grüßen')}</div>`,
   );
   parts.push(
-    `<div style="margin-top:2px;font-size:15px;font-weight:700;color:#2d2419;">${escapeHtml(
+    `<div style="margin-top:2px;font-size:15px;font-weight:700;color:#1f2933;">${escapeHtml(
       sig.signatory ?? brand.name,
     )}</div>`,
   );
@@ -280,7 +323,7 @@ function signatureBlock(brand: BrandInfo): string {
   const contact: string[] = [];
   if (sig.supportLabel)
     contact.push(
-      `<div style="font-weight:600;color:#2d2419;">${escapeHtml(sig.supportLabel)}</div>`,
+      `<div style="font-weight:600;color:#1f2933;">${escapeHtml(sig.supportLabel)}</div>`,
     );
   for (const h of sig.supportHours ?? []) contact.push(`<div>${escapeHtml(h)}</div>`);
   const chan: string[] = [];
@@ -300,7 +343,7 @@ function signatureBlock(brand: BrandInfo): string {
   if (sig.hq) contact.push(`<div style="margin-top:8px;">${escapeHtml(sig.hq)}</div>`);
   if (contact.length)
     parts.push(
-      `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.7;">${contact.join('')}</div>`,
+      `<div style="margin-top:14px;font-size:12.5px;color:#5f6b7a;line-height:1.7;">${contact.join('')}</div>`,
     );
 
   if (sig.tagline)
@@ -309,19 +352,19 @@ function signatureBlock(brand: BrandInfo): string {
     );
   if (sig.slogan)
     parts.push(
-      `<div style="margin-top:6px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#93826a;">${escapeHtml(sig.slogan)}</div>`,
+      `<div style="margin-top:6px;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#7b8794;">${escapeHtml(sig.slogan)}</div>`,
     );
 
   const loc = sig.secondaryLocation;
   if (loc && (loc.name || loc.lines?.length)) {
     const locLines: string[] = [
-      `<div style="font-weight:600;color:#2d2419;">Weitere Annahmestelle</div>`,
+      `<div style="font-weight:600;color:#1f2933;">Weitere Annahmestelle</div>`,
     ];
     if (loc.name) locLines.push(`<div>${escapeHtml(loc.name)}</div>`);
     for (const l of loc.lines ?? []) locLines.push(`<div>${escapeHtml(l)}</div>`);
     if (loc.phone) locLines.push(`<div>Tel.: ${escapeHtml(loc.phone)}</div>`);
     parts.push(
-      `<div style="margin-top:14px;font-size:12.5px;color:#6b5b48;line-height:1.6;">${locLines.join('')}</div>`,
+      `<div style="margin-top:14px;font-size:12.5px;color:#5f6b7a;line-height:1.6;">${locLines.join('')}</div>`,
     );
   }
 
@@ -332,7 +375,7 @@ function signatureBlock(brand: BrandInfo): string {
       )}</a></div>`,
     );
 
-  return `<div style="margin:24px 0 0;padding-top:16px;border-top:1px solid #e2d3b6;">${parts.join('')}</div>`;
+  return `<div style="margin:24px 0 0;padding-top:16px;border-top:1px solid #e4e7eb;">${parts.join('')}</div>`;
 }
 
 export interface RenderedEmail {
@@ -360,13 +403,13 @@ export function resetPasswordEmail(opts: {
           aus Sicherheitsgründen 1&nbsp;Stunde gültig.
         </p>
         ${button(opts.resetUrl, 'Passwort zurücksetzen')}
-        <p style="margin:0 0 6px;font-size:12px;color:#6b5b48;">
+        <p style="margin:0 0 6px;font-size:12px;color:#5f6b7a;">
           Funktioniert der Button nicht? Kopiere diesen Link in deinen Browser:
         </p>
-        <p style="margin:0 0 16px;font-size:12px;color:#6b5b48;word-break:break-all;">
-          <a href="${escapeHtml(opts.resetUrl)}" style="color:#6b5b48;">${escapeHtml(opts.resetUrl)}</a>
+        <p style="margin:0 0 16px;font-size:12px;color:#5f6b7a;word-break:break-all;">
+          <a href="${escapeHtml(opts.resetUrl)}" style="color:#5f6b7a;">${escapeHtml(opts.resetUrl)}</a>
         </p>
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Hast du diese E-Mail nicht angefordert, kannst du sie ignorieren — dein Passwort bleibt unverändert.
         </p>
       `,
@@ -390,7 +433,7 @@ export function passwordChangedEmail(opts: { name?: string | null }): RenderedEm
         <p style="margin:0 0 8px;">
           Falls du das warst, ist alles in Ordnung — du musst nichts weiter tun.
         </p>
-        <p style="margin:16px 0 0;font-size:13px;color:#2d2419;">
+        <p style="margin:16px 0 0;font-size:13px;color:#1f2933;">
           Warst du das <strong>nicht</strong>, melde dich umgehend bei einem
           Workspace-Admin — der Zugang sollte sofort gesperrt werden.
         </p>
@@ -420,11 +463,11 @@ export function inviteEmail(opts: {
           Klicke auf den Button, um dein Konto einzurichten. Die Einladung ist 7&nbsp;Tage gültig.
         </p>
         ${button(opts.inviteUrl, 'Einladung annehmen')}
-        <p style="margin:0 0 6px;font-size:12px;color:#6b5b48;">
+        <p style="margin:0 0 6px;font-size:12px;color:#5f6b7a;">
           Funktioniert der Button nicht? Kopiere diesen Link in deinen Browser:
         </p>
-        <p style="margin:0;font-size:12px;color:#6b5b48;word-break:break-all;">
-          <a href="${escapeHtml(opts.inviteUrl)}" style="color:#6b5b48;">${escapeHtml(opts.inviteUrl)}</a>
+        <p style="margin:0;font-size:12px;color:#5f6b7a;word-break:break-all;">
+          <a href="${escapeHtml(opts.inviteUrl)}" style="color:#5f6b7a;">${escapeHtml(opts.inviteUrl)}</a>
         </p>
       `,
     }),
@@ -452,19 +495,19 @@ export function newsletterConfirmEmail(opts: {
           Bitte bestätigen Sie kurz, dass Sie wirklich Nachrichten von uns erhalten möchten.
         </p>
         ${button(opts.confirmUrl, 'Anmeldung bestätigen', accent)}
-        <p style="margin:0 0 6px;font-size:12px;color:#6b5b48;">
+        <p style="margin:0 0 6px;font-size:12px;color:#5f6b7a;">
           Funktioniert der Button nicht? Kopieren Sie diesen Link in Ihren Browser:
         </p>
-        <p style="margin:0 0 16px;font-size:12px;color:#6b5b48;word-break:break-all;">
-          <a href="${escapeHtml(opts.confirmUrl)}" style="color:#6b5b48;">${escapeHtml(opts.confirmUrl)}</a>
+        <p style="margin:0 0 16px;font-size:12px;color:#5f6b7a;word-break:break-all;">
+          <a href="${escapeHtml(opts.confirmUrl)}" style="color:#5f6b7a;">${escapeHtml(opts.confirmUrl)}</a>
         </p>
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Haben Sie diese Anmeldung nicht angefordert, können Sie diese E-Mail einfach ignorieren —
           oder sich direkt
-          <a href="${escapeHtml(opts.unsubscribeUrl)}" style="color:#6b5b48;text-decoration:underline;">austragen</a>.
+          <a href="${escapeHtml(opts.unsubscribeUrl)}" style="color:#5f6b7a;text-decoration:underline;">austragen</a>.
         </p>
       `,
-      footerNote: `Anmeldung über ${opts.brand.domain}. · <a href="${escapeHtml(opts.unsubscribeUrl)}" style="color:#6b5b48;">Abmelden</a>`,
+      footerNote: `Anmeldung über ${opts.brand.domain}. · <a href="${escapeHtml(opts.unsubscribeUrl)}" style="color:#5f6b7a;">Abmelden</a>`,
     }),
   };
 }
@@ -487,8 +530,8 @@ export function adminInboxNotificationEmail(opts: {
           .map(
             (d) => `
           <tr>
-            <td style="padding:2px 12px 2px 0;color:#6b5b48;">${escapeHtml(d.label)}</td>
-            <td style="padding:2px 0;color:#2d2419;">${escapeHtml(d.value)}</td>
+            <td style="padding:2px 12px 2px 0;color:#5f6b7a;">${escapeHtml(d.label)}</td>
+            <td style="padding:2px 0;color:#1f2933;">${escapeHtml(d.value)}</td>
           </tr>`,
           )
           .join('')}
@@ -506,13 +549,13 @@ export function adminInboxNotificationEmail(opts: {
         <p style="margin:0 0 8px;"><strong>${escapeHtml(opts.fromName)}</strong> &lt;${escapeHtml(opts.fromEmail)}&gt;</p>
         ${
           opts.subject
-            ? `<p style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Betreff</p>
+            ? `<p style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Betreff</p>
         <p style="margin:0 0 8px;font-weight:600;">${escapeHtml(opts.subject)}</p>`
             : ''
         }
         ${detailsHtml}
-        <p style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Nachricht</p>
-        <div style="margin:0;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.message)}</div>
+        <p style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Nachricht</p>
+        <div style="margin:0;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:14px;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.message)}</div>
         ${button(opts.adminUrl, 'Im Dashboard öffnen', accent)}
       `,
       footerNote: `Interne Benachrichtigung — gesendet an die hinterlegte Brand-Adresse von ${opts.brand.name}.`,
@@ -540,7 +583,7 @@ export function inquiryQuoteEmail(opts: {
       contentHtml: `
         <p style="margin:0 0 12px;">Hallo ${escapeHtml(opts.recipientName)},</p>
         <p style="margin:0 0 8px;">danke für Ihre Anfrage. Hier ist unser Angebot:</p>
-        <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.quoteBody)}</div>
+        <div style="font-size:14px;line-height:1.6;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.quoteBody)}</div>
         ${amountLine}
         ${signature}
       `,
@@ -563,13 +606,11 @@ export function contactReplyEmail(opts: {
   const signature = signatureBlock(opts.brand);
 
   const quoted = opts.originalMessage
-    ? `<div style="margin-top:28px;padding-top:16px;border-top:1px solid #e2d3b6;">
-        <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;margin-bottom:6px;">
+    ? `<div style="margin-top:28px;padding-top:16px;border-top:1px solid #e4e7eb;">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;margin-bottom:6px;">
           Ihre ursprüngliche Nachricht
         </div>
-        <div style="margin:0;padding:12px 14px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:13px;color:#5b4b38;white-space:pre-wrap;">
-          ${nl2br(opts.originalMessage)}
-        </div>
+        <div style="margin:0;padding:12px 14px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:13px;color:#3f4a57;">${nl2br(opts.originalMessage)}</div>
       </div>`
     : '';
 
@@ -580,7 +621,7 @@ export function contactReplyEmail(opts: {
       preheader: `Antwort auf Ihre Nachricht an ${opts.brand.name}.`,
       contentHtml: `
         <p style="margin:0 0 12px;">Hallo ${escapeHtml(opts.recipientName)},</p>
-        <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.replyBody)}</div>
+        <div style="font-size:14px;line-height:1.6;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.replyBody)}</div>
         ${signature}
         ${quoted}
       `,
@@ -599,30 +640,64 @@ export function orderConfirmationEmail(opts: {
   pickupLabel?: string | null;
   pickupFeeFormatted?: string | null;
   fulfillmentNote: string;
-  /** Early-start consent + Widerrufsbelehrung (durable medium, § 312f BGB); omitted when null. */
+  /** Termin row of the booking summary, e.g. { label: 'Wunschtermin', value: '16.11.2026 · 10:00 Uhr' }. */
+  appointment?: { label: string; value: string } | null;
+  paymentMethodLabel?: string | null;
+  /** Consents + Widerrufsbelehrung (durable medium, § 312f BGB); omitted when null. */
   withdrawal?: WithdrawalNotice | null;
 }): RenderedEmail {
+  const accent = opts.brand.primaryColor ?? '#bd5b3e';
+  const sectionLabel = (text: string) =>
+    `<p style="margin:24px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">${escapeHtml(text)}</p>`;
   const w = opts.withdrawal;
-  const withdrawalHtml = w
-    ? `
-        <p style="margin:24px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Ihre Zustimmung zum vorzeitigen Leistungsbeginn</p>
-        <div style="margin:0;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;color:#2d2419;">
-          „${escapeHtml(w.earlyStartText)}"
-          <div style="margin-top:6px;font-size:12px;color:#6b5b48;">Erteilt am ${escapeHtml(formatBerlinDateTime(w.earlyStartAcceptedAt))}</div>
-        </div>
-        <p style="margin:24px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Widerrufsbelehrung</p>
-        ${
-          w.belehrungHtml
-            ? `<div style="margin:0;font-size:13px;line-height:1.6;color:#2d2419;">${w.belehrungHtml}</div>`
-            : `<p style="margin:0;font-size:14px;"><a href="${escapeHtml(w.belehrungUrl)}" style="color:${opts.brand.primaryColor ?? '#bd5b3e'};">Widerrufsbelehrung und Muster-Widerrufsformular</a></p>`
-        }`
+  const termsHtml = w?.termsAcceptedAt
+    ? `${sectionLabel('AGB und Widerrufsbelehrung')}
+        <div style="margin:0;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:14px;color:#1f2933;">
+          „${escapeHtml(w.termsText)}“
+          <div style="margin-top:6px;font-size:12px;color:#5f6b7a;">Bestätigt am ${escapeHtml(formatBerlinDateTime(w.termsAcceptedAt))}</div>
+        </div>`
     : '';
+  let withdrawalHtml = '';
+  if (w?.belehrungHtml) {
+    const legalBox = (html: string) =>
+      `<div style="margin:0;padding:4px 16px;border:1px solid #e4e7eb;border-radius:6px;font-size:13px;line-height:1.6;color:#1f2933;">${html}</div>`;
+    withdrawalHtml = `
+        ${termsHtml}
+        ${
+          w.earlyStartAcceptedAt
+            ? `${sectionLabel('Beginn vor Ablauf der Widerrufsfrist')}
+        <p style="margin:0;font-size:14px;">${escapeHtml(earlyStartStatement(w.earlyStartAcceptedAt))}</p>`
+            : ''
+        }
+        ${sectionLabel('Widerruf und AGB')}
+        <p style="margin:0 0 8px;font-size:14px;">Sie können diesen Vertrag jederzeit innerhalb der Widerrufsfrist über die Schaltfläche ‚<a href="${escapeHtml(w.withdrawUrl)}" style="color:${accent};">Vertrag widerrufen</a>‘ auf ${escapeHtml(w.siteLabel)} widerrufen.</p>
+        <p style="margin:0;font-size:14px;"><a href="${escapeHtml(w.agbUrl)}" style="color:${accent};">Allgemeine Geschäftsbedingungen (AGB)</a></p>
+        <div style="margin-top:24px;">${legalBox(w.belehrungHtml)}</div>
+        ${w.formularHtml ? `<div style="margin-top:16px;">${legalBox(w.formularHtml)}</div>` : ''}`;
+  } else if (w?.earlyStartAcceptedAt) {
+    withdrawalHtml = `
+        ${termsHtml}
+        ${sectionLabel('Ihre Zustimmung zum vorzeitigen Leistungsbeginn')}
+        <div style="margin:0;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:14px;color:#1f2933;">
+          „${escapeHtml(w.earlyStartText ?? '')}“
+          <div style="margin-top:6px;font-size:12px;color:#5f6b7a;">Erteilt am ${escapeHtml(formatBerlinDateTime(w.earlyStartAcceptedAt))}</div>
+        </div>
+        ${sectionLabel('Widerrufsbelehrung')}
+        <p style="margin:0;font-size:14px;"><a href="${escapeHtml(w.belehrungUrl)}" style="color:${accent};">Widerrufsbelehrung und Muster-Widerrufsformular</a></p>`;
+  }
+  const summaryRow = (label: string, value: string) =>
+    `<p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">${escapeHtml(label)}</p>
+        <p style="margin:0 0 16px;font-weight:600;">${escapeHtml(value)}</p>`;
+  const summaryExtrasHtml = [
+    opts.appointment ? summaryRow(opts.appointment.label, opts.appointment.value) : '',
+    opts.paymentMethodLabel ? summaryRow('Zahlungsart', opts.paymentMethodLabel) : '',
+  ].join('');
   const itemRowsHtml = opts.lines
     .map(
       (l) => `<tr>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;">${escapeHtml(l.label)}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.subtotalFormatted)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:14px;">${escapeHtml(l.label)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:13px;color:#5f6b7a;white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.subtotalFormatted)}</td>
       </tr>`,
     )
     .join('');
@@ -630,8 +705,8 @@ export function orderConfirmationEmail(opts: {
   const pickupRow =
     opts.pickupLabel && opts.pickupFeeFormatted
       ? `<tr>
-          <td colspan="2" style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;">${escapeHtml(opts.pickupLabel)}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(opts.pickupFeeFormatted)}</td>
+          <td colspan="2" style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:14px;">${escapeHtml(opts.pickupLabel)}</td>
+          <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(opts.pickupFeeFormatted)}</td>
         </tr>`
       : '';
 
@@ -646,15 +721,16 @@ export function orderConfirmationEmail(opts: {
           vielen Dank für Ihren Auftrag bei <strong>${escapeHtml(opts.brand.name)}</strong>.
           Wir haben Ihre Zahlung erhalten und kümmern uns ab sofort um die Bearbeitung.
         </p>
-        <p style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Auftragsnummer</p>
+        <p style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Auftragsnummer</p>
         <p style="margin:0 0 16px;font-weight:600;font-family:monospace;">${escapeHtml(opts.orderNumber)}</p>
+        ${summaryExtrasHtml}
 
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border:1px solid #e2d3b6;border-radius:8px;overflow:hidden;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border-top:1px solid #e4e7eb;">
           <thead>
-            <tr style="background:#f4ebdc;">
-              <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Position</th>
-              <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Menge</th>
-              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Preis</th>
+            <tr>
+              <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;">Position</th>
+              <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;">Menge</th>
+              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;">Preis</th>
             </tr>
           </thead>
           <tbody>
@@ -672,7 +748,7 @@ export function orderConfirmationEmail(opts: {
         ${button(opts.trackerUrl, 'Auftrag verfolgen', opts.brand.primaryColor)}
         ${withdrawalHtml}
 
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Bitte heben Sie diese Bestätigung als Beleg auf. Bei Fragen antworten Sie einfach auf diese E-Mail.
         </p>
       `,
@@ -713,7 +789,7 @@ export function orderReceiptEmail(opts: {
   invoiceFollows: boolean;
 }): RenderedEmail {
   const accent = opts.brand.primaryColor ?? '#bd5b3e';
-  const CELL = 'padding:10px 12px;border-bottom:1px solid #e2d3b6;vertical-align:top;';
+  const CELL = 'padding:10px 12px;border-bottom:1px solid #e4e7eb;vertical-align:top;';
   const rows = opts.positions
     .map((p) => {
       const sub = [
@@ -724,19 +800,19 @@ export function orderReceiptEmail(opts: {
         .map(
           (a) => `<tr>
         <td style="${CELL}"></td>
-        <td style="${CELL}font-size:13px;color:#4a3c2c;">+ ${escapeHtml(a.label)}</td>
-        <td style="${CELL}font-size:13px;color:#6b5b48;white-space:nowrap;">${escapeHtml(a.quantityLabel)}</td>
+        <td style="${CELL}font-size:13px;color:#3f4a57;">+ ${escapeHtml(a.label)}</td>
+        <td style="${CELL}font-size:13px;color:#5f6b7a;white-space:nowrap;">${escapeHtml(a.quantityLabel)}</td>
         <td style="${CELL}font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(a.lineTotal)}</td>
       </tr>`,
         )
         .join('');
       return `<tr>
-        <td style="${CELL}font-size:13px;color:#6b5b48;">${p.pos}</td>
+        <td style="${CELL}font-size:13px;color:#5f6b7a;">${p.pos}</td>
         <td style="${CELL}font-size:14px;">
           <div style="font-weight:600;">${escapeHtml(p.label)}</div>
-          ${sub.length ? `<div style="margin-top:3px;font-size:12px;color:#6b5b48;line-height:1.5;">${sub.join('<br />')}</div>` : ''}
+          ${sub.length ? `<div style="margin-top:3px;font-size:12px;color:#5f6b7a;line-height:1.5;">${sub.join('<br />')}</div>` : ''}
         </td>
-        <td style="${CELL}font-size:13px;color:#6b5b48;white-space:nowrap;">${escapeHtml(p.quantityLabel)}</td>
+        <td style="${CELL}font-size:13px;color:#5f6b7a;white-space:nowrap;">${escapeHtml(p.quantityLabel)}</td>
         <td style="${CELL}font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(p.lineTotal)}</td>
       </tr>${addons}`;
     })
@@ -745,7 +821,7 @@ export function orderReceiptEmail(opts: {
   const summaryRows = opts.summary
     .map(
       (s) => `<tr>
-        <td colspan="3" style="padding:6px 12px;font-size:13px;color:#6b5b48;">${escapeHtml(s.label)}</td>
+        <td colspan="3" style="padding:6px 12px;font-size:13px;color:#5f6b7a;">${escapeHtml(s.label)}</td>
         <td style="padding:6px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(s.value)}</td>
       </tr>`,
     )
@@ -753,14 +829,14 @@ export function orderReceiptEmail(opts: {
   const paymentRows = opts.payment
     .map(
       (p) => `<tr>
-        <td colspan="3" style="padding:6px 12px;font-size:13px;${p.emphasis ? `font-weight:700;color:${accent};` : 'color:#6b5b48;'}">${escapeHtml(p.label)}</td>
+        <td colspan="3" style="padding:6px 12px;font-size:13px;${p.emphasis ? `font-weight:700;color:${accent};` : 'color:#5f6b7a;'}">${escapeHtml(p.label)}</td>
         <td style="padding:6px 12px;font-size:13px;text-align:right;white-space:nowrap;${p.emphasis ? `font-weight:700;color:${accent};` : ''}">${escapeHtml(p.value)}</td>
       </tr>`,
     )
     .join('');
 
   const TH =
-    'padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;';
+    'padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;';
   const when = opts.receivedTime
     ? `${opts.receivedDate} · ${opts.receivedTime} Uhr`
     : opts.receivedDate;
@@ -782,23 +858,23 @@ export function orderReceiptEmail(opts: {
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0 4px;">
           <tr>
             <td style="padding:0 16px 0 0;vertical-align:top;">
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Auftragsnummer</div>
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Auftragsnummer</div>
               <div style="margin-top:2px;font-weight:600;font-family:monospace;">${escapeHtml(opts.orderNumber)}</div>
             </td>
             <td style="padding:0 16px 0 0;vertical-align:top;">
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Übergabe</div>
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Übergabe</div>
               <div style="margin-top:2px;font-weight:600;">${escapeHtml(opts.handoverLabel)}</div>
             </td>
             <td style="vertical-align:top;">
-              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Datum</div>
+              <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Datum</div>
               <div style="margin-top:2px;font-weight:600;white-space:nowrap;">${escapeHtml(when)}</div>
             </td>
           </tr>
         </table>
 
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border:1px solid #e2d3b6;border-radius:8px;overflow:hidden;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border-top:1px solid #e4e7eb;">
           <thead>
-            <tr style="background:#f4ebdc;">
+            <tr>
               <th align="left" style="${TH}">Pos.</th>
               <th align="left" style="${TH}">Bezeichnung</th>
               <th align="left" style="${TH}">Menge</th>
@@ -809,8 +885,8 @@ export function orderReceiptEmail(opts: {
             ${rows}
             ${summaryRows}
             <tr>
-              <td colspan="3" style="padding:12px;font-size:14px;font-weight:700;border-top:1px solid #e2d3b6;">${escapeHtml(opts.totalLabel)}</td>
-              <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:1px solid #e2d3b6;color:${accent};">${escapeHtml(opts.total)}</td>
+              <td colspan="3" style="padding:12px;font-size:14px;font-weight:700;border-top:1px solid #e4e7eb;">${escapeHtml(opts.totalLabel)}</td>
+              <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:1px solid #e4e7eb;color:${accent};">${escapeHtml(opts.total)}</td>
             </tr>
             ${paymentRows}
           </tbody>
@@ -818,7 +894,7 @@ export function orderReceiptEmail(opts: {
 
         ${
           opts.note
-            ? `<div style="margin:16px 0;padding:12px 16px;background:#f4ebdc;border-left:3px solid ${accent};border-radius:6px;font-size:14px;">
+            ? `<div style="margin:16px 0;padding:12px 16px;background:#f6f7f9;border-left:3px solid ${accent};font-size:14px;">
                  <div style="font-weight:600;margin-bottom:4px;">Hinweis</div>
                  <div>${nl2br(opts.note)}</div>
                </div>`
@@ -833,7 +909,7 @@ export function orderReceiptEmail(opts: {
 
         ${button(opts.trackerUrl, 'Auftrag verfolgen', accent)}
 
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Bitte heben Sie diese Bestätigung als Beleg auf.
         </p>
       `,
@@ -886,17 +962,17 @@ export function invoiceEmail(opts: {
   const itemRowsHtml = opts.lineItems
     .map(
       (l) => `<tr>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;">${escapeHtml(l.label)}${
+        <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:14px;">${escapeHtml(l.label)}${
           l.note
-            ? `<br /><span style="font-size:12px;color:#6b5b48;">${escapeHtml(l.note)}</span>`
+            ? `<br /><span style="font-size:12px;color:#5f6b7a;">${escapeHtml(l.note)}</span>`
             : ''
         }</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:${pkg ? 'right' : 'center'};white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>${
+        <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:13px;color:#5f6b7a;text-align:${pkg ? 'right' : 'center'};white-space:nowrap;">${escapeHtml(l.quantityLabel)}</td>${
           pkg
             ? ''
             : `
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:13px;color:#6b5b48;text-align:right;white-space:nowrap;">${escapeHtml(l.unitPriceFormatted)}</td>
-        <td style="padding:8px 12px;border-bottom:1px solid #e2d3b6;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.lineTotalFormatted)}</td>`
+        <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:13px;color:#5f6b7a;text-align:right;white-space:nowrap;">${escapeHtml(l.unitPriceFormatted)}</td>
+        <td style="padding:8px 12px;border-bottom:1px solid #e4e7eb;font-size:14px;text-align:right;white-space:nowrap;">${escapeHtml(l.lineTotalFormatted)}</td>`
         }
       </tr>`,
     )
@@ -905,20 +981,20 @@ export function invoiceEmail(opts: {
   const totalsHtml =
     opts.taxFormatted && opts.taxRateLabel
       ? `<tr>
-            <td colspan="${sumSpan}" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">Zwischensumme (netto)</td>
+            <td colspan="${sumSpan}" style="padding:8px 12px;font-size:13px;color:#5f6b7a;text-align:right;">Zwischensumme (netto)</td>
             <td style="padding:8px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(opts.subtotalFormatted)}</td>
           </tr>
           <tr>
-            <td colspan="${sumSpan}" style="padding:8px 12px;font-size:13px;color:#6b5b48;text-align:right;">zzgl. USt. (${escapeHtml(opts.taxRateLabel)})</td>
+            <td colspan="${sumSpan}" style="padding:8px 12px;font-size:13px;color:#5f6b7a;text-align:right;">zzgl. USt. (${escapeHtml(opts.taxRateLabel)})</td>
             <td style="padding:8px 12px;font-size:13px;text-align:right;white-space:nowrap;">${escapeHtml(opts.taxFormatted)}</td>
           </tr>
           <tr>
-            <td colspan="${sumSpan}" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
-            <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
+            <td colspan="${sumSpan}" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e4e7eb;">Gesamtbetrag</td>
+            <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e4e7eb;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>`
       : `<tr>
-            <td colspan="${sumSpan}" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e2d3b6;">Gesamtbetrag</td>
-            <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e2d3b6;">${escapeHtml(opts.totalFormatted)}</td>
+            <td colspan="${sumSpan}" style="padding:12px;font-size:14px;font-weight:700;text-align:right;border-top:2px solid #e4e7eb;">Gesamtbetrag</td>
+            <td style="padding:12px;font-size:16px;font-weight:700;text-align:right;white-space:nowrap;border-top:2px solid #e4e7eb;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>`;
 
   // Card/cash: no bank block, a "paid" acknowledgement instead.
@@ -946,7 +1022,7 @@ export function invoiceEmail(opts: {
     : '';
 
   const notesHtml = opts.notes
-    ? `<p style="margin:16px 0 0;font-size:13px;color:#6b5b48;">${nl2br(opts.notes)}</p>`
+    ? `<p style="margin:16px 0 0;font-size:13px;color:#5f6b7a;">${nl2br(opts.notes)}</p>`
     : '';
 
   const sellerLines = [
@@ -978,33 +1054,33 @@ export function invoiceEmail(opts: {
 
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 16px;">
           <tr>
-            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsnummer</td>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;padding:2px 0;">Rechnungsnummer</td>
             <td style="font-size:13px;font-family:monospace;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceNumber)}</td>
           </tr>
           <tr>
-            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsdatum</td>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;padding:2px 0;">Rechnungsdatum</td>
             <td style="font-size:13px;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceDateFormatted)}</td>
           </tr>
           ${
             opts.dueDateFormatted
               ? `<tr>
-            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Fällig bis</td>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;padding:2px 0;">Fällig bis</td>
             <td style="font-size:13px;text-align:right;padding:2px 0;">${escapeHtml(opts.dueDateFormatted)}</td>
           </tr>`
               : ''
           }
         </table>
 
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border:1px solid #e2d3b6;border-radius:8px;overflow:hidden;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border-top:1px solid #e4e7eb;">
           <thead>
-            <tr style="background:#f4ebdc;">
-              <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Bezeichnung</th>
-              <th align="${pkg ? 'right' : 'center'}" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Menge</th>${
+            <tr>
+              <th align="left" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;">Bezeichnung</th>
+              <th align="${pkg ? 'right' : 'center'}" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;">Menge</th>${
                 pkg
                   ? ''
                   : `
-              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Einzelpreis</th>
-              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b5b48;border-bottom:1px solid #e2d3b6;">Betrag</th>`
+              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;">Einzelpreis</th>
+              <th align="right" style="padding:10px 12px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#5f6b7a;border-bottom:1px solid #e4e7eb;">Betrag</th>`
               }
             </tr>
           </thead>
@@ -1020,16 +1096,16 @@ export function invoiceEmail(opts: {
         ${notesHtml}
         <p style="margin:16px 0 0;font-size:14px;">${escapeHtml(INVOICE_THANK_YOU)}</p>
 
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e2d3b6;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e4e7eb;">
           <tr>
-            <td style="padding:16px 0 0;font-size:12px;color:#6b5b48;line-height:1.6;">
+            <td style="padding:16px 0 0;font-size:12px;color:#5f6b7a;line-height:1.6;">
               <span style="text-transform:uppercase;letter-spacing:1px;font-size:11px;">Rechnungssteller</span><br />
               ${sellerLines}
             </td>
           </tr>
         </table>
 
-        <p style="margin:20px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:20px 0 0;font-size:12px;color:#5f6b7a;">
           Bei Fragen zu dieser Rechnung antworten Sie einfach auf diese E-Mail.
         </p>
       `,
@@ -1105,25 +1181,25 @@ export function dunningEmail(opts: {
       brand: opts.brand,
       preheader: `${heading}: Rechnung ${opts.invoiceNumber} über ${opts.totalFormatted} ist offen.`,
       contentHtml: `
-        <p style="margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">${escapeHtml(heading)}</p>
+        <p style="margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">${escapeHtml(heading)}</p>
         <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.recipientName)},</p>
         <p style="margin:0 0 16px;">${intro}</p>
 
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 16px;">
           <tr>
-            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsnummer</td>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;padding:2px 0;">Rechnungsnummer</td>
             <td style="font-size:13px;font-family:monospace;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceNumber)}</td>
           </tr>
           ${
             opts.invoiceDateFormatted
               ? `<tr>
-            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:2px 0;">Rechnungsdatum</td>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;padding:2px 0;">Rechnungsdatum</td>
             <td style="font-size:13px;text-align:right;padding:2px 0;">${escapeHtml(opts.invoiceDateFormatted)}</td>
           </tr>`
               : ''
           }
           <tr>
-            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;padding:6px 0 2px;">Offener Betrag</td>
+            <td style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;padding:6px 0 2px;">Offener Betrag</td>
             <td style="font-size:16px;font-weight:700;text-align:right;padding:6px 0 2px;white-space:nowrap;">${escapeHtml(opts.totalFormatted)}</td>
           </tr>
         </table>
@@ -1137,16 +1213,16 @@ export function dunningEmail(opts: {
 
         ${bankHtml}
 
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e2d3b6;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:24px 0 0;border-top:1px solid #e4e7eb;">
           <tr>
-            <td style="padding:16px 0 0;font-size:12px;color:#6b5b48;line-height:1.6;">
+            <td style="padding:16px 0 0;font-size:12px;color:#5f6b7a;line-height:1.6;">
               <span style="text-transform:uppercase;letter-spacing:1px;font-size:11px;">Rechnungssteller</span><br />
               ${sellerLines}
             </td>
           </tr>
         </table>
 
-        <p style="margin:20px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:20px 0 0;font-size:12px;color:#5f6b7a;">
           Bei Fragen oder wenn Sie eine Ratenzahlung wünschen, antworten Sie einfach auf diese E-Mail.
         </p>
       `,
@@ -1180,8 +1256,8 @@ export function newOrderAdminEmail(opts: {
   const rowsHtml = detailRows
     .map(
       ([k, v]) => `<tr>
-        <td style="padding:6px 12px;font-size:12px;color:#6b5b48;border-bottom:1px solid #e2d3b6;white-space:nowrap;">${escapeHtml(k)}</td>
-        <td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e2d3b6;">${escapeHtml(v)}</td>
+        <td style="padding:6px 12px;font-size:12px;color:#5f6b7a;border-bottom:1px solid #e4e7eb;white-space:nowrap;">${escapeHtml(k)}</td>
+        <td style="padding:6px 12px;font-size:14px;border-bottom:1px solid #e4e7eb;">${escapeHtml(v)}</td>
       </tr>`,
     )
     .join('');
@@ -1195,7 +1271,7 @@ export function newOrderAdminEmail(opts: {
         <p style="margin:0 0 16px;font-size:14px;">
           <strong>${escapeHtml(opts.customerName)}</strong> hat soeben einen Auftrag bezahlt.
         </p>
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border:1px solid #e2d3b6;border-radius:8px;overflow:hidden;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:16px 0;border-top:1px solid #e4e7eb;">
           <tbody>${rowsHtml}</tbody>
         </table>
         ${button(opts.adminUrl, 'Im Dashboard öffnen', opts.brand.primaryColor)}
@@ -1224,13 +1300,13 @@ export function contactAckEmail(opts: {
         </p>
         ${
           opts.subject
-            ? `<p style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Betreff</p>
+            ? `<p style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Betreff</p>
         <p style="margin:0 0 12px;font-weight:600;">${escapeHtml(opts.subject)}</p>`
             : ''
         }
-        <p style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Ihre Nachricht</p>
-        <div style="margin:0;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.message)}</div>
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Ihre Nachricht</p>
+        <div style="margin:0;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:14px;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.message)}</div>
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Diese Bestätigung wurde automatisch erstellt. Sie können direkt auf
           diese Mail antworten, um Ergänzungen zu schicken.
         </p>
@@ -1332,7 +1408,7 @@ export function orderStatusUpdateEmail(opts: {
 
   const refundLine =
     opts.refundFormatted && opts.refundFormatted !== '0,00 €'
-      ? `<p style="margin:16px 0 0;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;">
+      ? `<p style="margin:16px 0 0;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:14px;">
            <strong>Rückerstattung:</strong> ${escapeHtml(opts.refundFormatted)}
          </p>`
       : '';
@@ -1344,12 +1420,12 @@ export function orderStatusUpdateEmail(opts: {
       preheader: copy.subject,
       contentHtml: `
         <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
-        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">${escapeHtml(copy.headline)}</p>
+        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">${escapeHtml(copy.headline)}</p>
         <p style="margin:0 0 16px;font-size:16px;font-weight:600;">${escapeHtml(opts.brand.name)} — ${escapeHtml(opts.orderNumber)}</p>
         <p style="margin:0 0 16px;font-size:14px;">${escapeHtml(copy.body)}</p>
         ${refundLine}
         ${button(opts.trackerUrl, copy.ctaLabel, opts.brand.primaryColor)}
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Diese E-Mail wurde automatisch zu Ihrem Auftrag erstellt. Bei Rückfragen
           antworten Sie einfach direkt.
         </p>
@@ -1373,13 +1449,13 @@ export function appointmentConfirmedEmail(opts: {
       preheader: `Ihr Vor-Ort-Termin: ${opts.appointmentFormatted}`,
       contentHtml: `
         <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
-        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Termin bestätigt</p>
+        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Termin bestätigt</p>
         <p style="margin:0 0 16px;font-size:16px;font-weight:600;">${escapeHtml(opts.brand.name)} — ${escapeHtml(opts.orderNumber)}</p>
         <p style="margin:0 0 16px;font-size:14px;">wir haben Ihren Vor-Ort-Termin bestätigt:</p>
-        <p style="margin:0 0 16px;padding:14px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:16px;font-weight:600;">${escapeHtml(opts.appointmentFormatted)}</p>
+        <p style="margin:0 0 16px;padding:14px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:16px;font-weight:600;">${escapeHtml(opts.appointmentFormatted)}</p>
         <p style="margin:0 0 16px;font-size:14px;">Sollte der Termin nicht passen, antworten Sie einfach auf diese E-Mail oder rufen Sie uns an — wir finden eine Alternative.</p>
         ${button(opts.trackerUrl, 'Auftrag ansehen', opts.brand.primaryColor)}
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">Wir freuen uns auf Ihren Termin.</p>
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">Wir freuen uns auf Ihren Termin.</p>
       `,
       footerNote: `Terminbestätigung zu Ihrem Auftrag bei ${opts.brand.domain}.`,
     }),
@@ -1406,7 +1482,7 @@ export function orderMessageEmail(opts: {
       preheader: `Nachricht zu Ihrem Auftrag ${opts.orderNumber}.`,
       contentHtml: `
         <p style="margin:0 0 12px;">Hallo ${escapeHtml(opts.customerName)},</p>
-        <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.messageBody)}</div>
+        <div style="font-size:14px;line-height:1.6;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.messageBody)}</div>
         ${signature}
         ${trackerButton}
       `,
@@ -1452,7 +1528,7 @@ export function customerMessageEmail(opts: {
       preheader: opts.subject,
       contentHtml: `
         <p style="margin:0 0 12px;">${escapeHtml(formalGreeting(opts.recipient))}</p>
-        <div style="font-size:14px;line-height:1.6;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.messageBody)}</div>
+        <div style="font-size:14px;line-height:1.6;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.messageBody)}</div>
         ${signature}
       `,
       footerNote: `Sie können direkt auf diese E-Mail antworten.`,
@@ -1477,11 +1553,11 @@ export function pickupSchedulingLinkEmail(opts: {
       preheader: 'Wählen Sie Ihren Wunschtermin online aus.',
       contentHtml: `
         <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
-        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Termin auswählen</p>
+        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Termin auswählen</p>
         <p style="margin:0 0 16px;font-size:16px;font-weight:600;">${escapeHtml(opts.brand.name)} — ${escapeHtml(opts.orderNumber)}</p>
         <p style="margin:0 0 16px;font-size:14px;">für Ihren Auftrag fehlt noch der Termin. Über den folgenden Link sehen Sie unsere freien Zeiten und wählen den Termin, der Ihnen am besten passt:</p>
         ${button(opts.bookingUrl, 'Termin auswählen', opts.brand.primaryColor)}
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">Der Link ist für eine Buchung gültig. Nach der Auswahl erhalten Sie eine Bestätigung mit Kalendereintrag. Falls Sie den Termin später ändern möchten, nutzen Sie die Links in dieser Bestätigung oder antworten Sie einfach auf diese E-Mail.</p>
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">Der Link ist für eine Buchung gültig. Nach der Auswahl erhalten Sie eine Bestätigung mit Kalendereintrag. Falls Sie den Termin später ändern möchten, nutzen Sie die Links in dieser Bestätigung oder antworten Sie einfach auf diese E-Mail.</p>
       `,
       footerNote: `Terminauswahl zu Ihrem Auftrag bei ${opts.brand.domain}.`,
     }),
@@ -1502,12 +1578,12 @@ export function paymentRequestEmail(opts: {
       preheader: `Bitte begleichen Sie Ihren Auftrag über ${opts.totalFormatted}.`,
       contentHtml: `
         <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.customerName)},</p>
-        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Zahlung per Kreditkarte</p>
+        <p style="margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Zahlung per Kreditkarte</p>
         <p style="margin:0 0 16px;font-size:16px;font-weight:600;">${escapeHtml(opts.brand.name)} — ${escapeHtml(opts.orderNumber)}</p>
         <p style="margin:0 0 16px;font-size:14px;">Ihr Service ist abgeschlossen — vielen Dank! Sie können Ihren Auftrag jetzt bequem und sicher online per Kreditkarte bezahlen.</p>
-        <p style="margin:0 0 16px;padding:14px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:16px;font-weight:600;">Zu zahlender Betrag: ${escapeHtml(opts.totalFormatted)}</p>
+        <p style="margin:0 0 16px;padding:14px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:16px;font-weight:600;">Zu zahlender Betrag: ${escapeHtml(opts.totalFormatted)}</p>
         ${button(opts.payUrl, 'Jetzt sicher bezahlen', opts.brand.primaryColor)}
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">Die Zahlung wird sicher über Stripe abgewickelt. Bei Rückfragen antworten Sie einfach auf diese E-Mail.</p>
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">Die Zahlung wird sicher über Stripe abgewickelt. Bei Rückfragen antworten Sie einfach auf diese E-Mail.</p>
       `,
       footerNote: `Zahlungsaufforderung zu Ihrem Auftrag bei ${opts.brand.domain}.`,
     }),
@@ -1531,7 +1607,7 @@ export function taskAssignedEmail(opts: {
   taskUrl: string;
 }): RenderedEmail {
   const dueLine = opts.dueAt
-    ? `<tr><td style="padding:4px 0;font-size:12px;color:#6b5b48;width:90px;">Fällig</td><td style="padding:4px 0;font-size:13px;">${escapeHtml(new Date(opts.dueAt).toLocaleString('de-DE'))}</td></tr>`
+    ? `<tr><td style="padding:4px 0;font-size:12px;color:#5f6b7a;width:90px;">Fällig</td><td style="padding:4px 0;font-size:13px;">${escapeHtml(new Date(opts.dueAt).toLocaleString('de-DE'))}</td></tr>`
     : '';
   return {
     subject: `Aufgabe zugewiesen: ${opts.taskTitle}`,
@@ -1544,20 +1620,20 @@ export function taskAssignedEmail(opts: {
           Dir wurde eine neue Aufgabe in <strong>${escapeHtml(opts.brandName)}</strong> zugewiesen.
         </p>
 
-        <div style="margin:0 0 16px;padding:14px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;">
-          <p style="margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Aufgabe</p>
-          <p style="margin:0 0 10px;font-size:15px;font-weight:600;color:#2d2419;">${escapeHtml(opts.taskTitle)}</p>
-          ${opts.taskBody ? `<p style="margin:0 0 10px;font-size:13px;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.taskBody)}</p>` : ''}
+        <div style="margin:0 0 16px;padding:14px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;">
+          <p style="margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Aufgabe</p>
+          <p style="margin:0 0 10px;font-size:15px;font-weight:600;color:#1f2933;">${escapeHtml(opts.taskTitle)}</p>
+          ${opts.taskBody ? `<p style="margin:0 0 10px;font-size:13px;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.taskBody)}</p>` : ''}
           <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin-top:6px;">
-            <tr><td style="padding:4px 0;font-size:12px;color:#6b5b48;width:90px;">Marke</td><td style="padding:4px 0;font-size:13px;">${escapeHtml(opts.brandName)}</td></tr>
-            <tr><td style="padding:4px 0;font-size:12px;color:#6b5b48;width:90px;">Priorität</td><td style="padding:4px 0;font-size:13px;">${escapeHtml(PRIORITY_LABEL[opts.priority] ?? opts.priority)}</td></tr>
+            <tr><td style="padding:4px 0;font-size:12px;color:#5f6b7a;width:90px;">Marke</td><td style="padding:4px 0;font-size:13px;">${escapeHtml(opts.brandName)}</td></tr>
+            <tr><td style="padding:4px 0;font-size:12px;color:#5f6b7a;width:90px;">Priorität</td><td style="padding:4px 0;font-size:13px;">${escapeHtml(PRIORITY_LABEL[opts.priority] ?? opts.priority)}</td></tr>
             ${dueLine}
           </table>
         </div>
 
         ${button(opts.taskUrl, 'Aufgabe öffnen', ADMIN_BRAND.primaryColor)}
 
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Du kannst die Aufgabe übernehmen, abschließen oder verwerfen, sobald du im Admin angemeldet bist.
         </p>
       `,
@@ -1586,10 +1662,10 @@ export function taskCommentEmail(opts: {
           <strong>${escapeHtml(opts.brandName)}</strong> hinzugefügt.
         </p>
 
-        <p style="margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Aufgabe</p>
-        <p style="margin:0 0 16px;font-size:14px;font-weight:600;color:#2d2419;">${escapeHtml(opts.taskTitle)}</p>
+        <p style="margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#5f6b7a;">Aufgabe</p>
+        <p style="margin:0 0 16px;font-size:14px;font-weight:600;color:#1f2933;">${escapeHtml(opts.taskTitle)}</p>
 
-        <div style="margin:0 0 16px;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;color:#2d2419;white-space:pre-wrap;">${nl2br(opts.commentBody)}</div>
+        <div style="margin:0 0 16px;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:14px;color:#1f2933;white-space:pre-wrap;">${nl2br(opts.commentBody)}</div>
 
         ${button(opts.taskUrl, 'Im Portal antworten', ADMIN_BRAND.primaryColor)}
       `,
@@ -1605,11 +1681,11 @@ function partnerGreeting(name?: string | null): string {
 }
 
 function linkFallback(url: string): string {
-  return `<p style="margin:0 0 6px;font-size:12px;color:#6b5b48;">
+  return `<p style="margin:0 0 6px;font-size:12px;color:#5f6b7a;">
           Funktioniert der Button nicht? Kopieren Sie diesen Link in Ihren Browser:
         </p>
-        <p style="margin:0;font-size:12px;color:#6b5b48;word-break:break-all;">
-          <a href="${escapeHtml(url)}" style="color:#6b5b48;">${escapeHtml(url)}</a>
+        <p style="margin:0;font-size:12px;color:#5f6b7a;word-break:break-all;">
+          <a href="${escapeHtml(url)}" style="color:#5f6b7a;">${escapeHtml(url)}</a>
         </p>`;
 }
 
@@ -1656,7 +1732,7 @@ export function partnerResetPasswordEmail(opts: {
         </p>
         ${button(opts.resetUrl, 'Passwort zurücksetzen', opts.brand.primaryColor)}
         ${linkFallback(opts.resetUrl)}
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Haben Sie diese E-Mail nicht angefordert, können Sie sie ignorieren — Ihr Passwort bleibt unverändert.
         </p>
       `,
@@ -1670,10 +1746,10 @@ function jobFacts(rows: Array<[string, string | null | undefined]>): string {
     .filter((r): r is [string, string] => !!r[1])
     .map(
       ([k, v]) =>
-        `<tr><td style="padding:4px 12px 4px 0;font-size:12px;color:#6b5b48;white-space:nowrap;vertical-align:top;width:120px;">${escapeHtml(k)}</td><td style="padding:4px 0;font-size:14px;">${escapeHtml(v)}</td></tr>`,
+        `<tr><td style="padding:4px 12px 4px 0;font-size:12px;color:#5f6b7a;white-space:nowrap;vertical-align:top;width:120px;">${escapeHtml(k)}</td><td style="padding:4px 0;font-size:14px;">${escapeHtml(v)}</td></tr>`,
     )
     .join('');
-  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 8px;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;width:100%;">${cells}</table>`;
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 8px;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;width:100%;">${cells}</table>`;
 }
 
 export function partnerOfferEmail(opts: {
@@ -1757,7 +1833,7 @@ export function partnerDocumentReviewedEmail(opts: {
   const body = opts.approved
     ? `<p style="margin:0 0 12px;">Ihr Nachweis <strong>${escapeHtml(opts.documentLabel)}</strong> wurde geprüft und freigegeben.</p>`
     : `<p style="margin:0 0 12px;">Ihr Nachweis <strong>${escapeHtml(opts.documentLabel)}</strong> konnte leider nicht freigegeben werden.</p>
-       ${opts.reason ? `<div style="margin:0 0 12px;padding:12px 16px;background:#f4ebdc;border:1px solid #e2d3b6;border-radius:8px;font-size:14px;white-space:pre-wrap;">${nl2br(opts.reason)}</div>` : ''}
+       ${opts.reason ? `<div style="margin:0 0 12px;padding:12px 16px;background:#f6f7f9;border-left:3px solid #cfd5dc;font-size:14px;white-space:pre-wrap;">${nl2br(opts.reason)}</div>` : ''}
        <p style="margin:0 0 12px;">Bitte laden Sie im Partnerportal ein neues Dokument hoch.</p>`;
   return {
     subject: opts.approved
@@ -1847,14 +1923,14 @@ export function customerLoginEmail(opts: {
           <strong>${escapeHtml(opts.brand.name)}</strong>. Ein Passwort benötigen Sie nicht.
         </p>
         ${button(opts.loginUrl, 'Meine Aufträge öffnen', accent)}
-        <p style="margin:0 0 6px;font-size:12px;color:#6b5b48;">
+        <p style="margin:0 0 6px;font-size:12px;color:#5f6b7a;">
           Der Link ist ${opts.validMinutes} Minuten gültig. Funktioniert der Button nicht? Kopieren Sie
           diesen Link in Ihren Browser:
         </p>
-        <p style="margin:0 0 16px;font-size:12px;color:#6b5b48;word-break:break-all;">
-          <a href="${escapeHtml(opts.loginUrl)}" style="color:#6b5b48;">${escapeHtml(opts.loginUrl)}</a>
+        <p style="margin:0 0 16px;font-size:12px;color:#5f6b7a;word-break:break-all;">
+          <a href="${escapeHtml(opts.loginUrl)}" style="color:#5f6b7a;">${escapeHtml(opts.loginUrl)}</a>
         </p>
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
+        <p style="margin:24px 0 0;font-size:12px;color:#5f6b7a;">
           Haben Sie diesen Link nicht angefordert, können Sie diese E-Mail einfach ignorieren.
         </p>
       `,
@@ -1863,49 +1939,38 @@ export function customerLoginEmail(opts: {
   };
 }
 
-/** Receipt for a withdrawal declaration (§ 356a BGB): confirms receipt only, promises nothing. */
+/** Eingangsbestätigung for the Widerrufsbutton (§ 356a BGB); wording approved 2026-11-13. */
 export function withdrawalReceiptEmail(opts: {
   brand: BrandInfo;
   name: string;
-  email: string;
-  receivedLabel: string;
+  receivedAt: Date;
   orderNumber?: string;
-  orderDate?: string;
+  /** The submitted form fields, in form order. */
+  declaration: ReadonlyArray<readonly [string, string]>;
 }): RenderedEmail {
-  const rows: Array<[string, string]> = [
-    ['Name', opts.name],
-    ['E-Mail', opts.email],
-    ...(opts.orderNumber
-      ? ([['Auftragsnummer', opts.orderNumber]] as Array<[string, string]>)
-      : []),
-    ...(opts.orderDate
-      ? ([['Datum der Bestellung', opts.orderDate]] as Array<[string, string]>)
-      : []),
-  ];
+  const { date, time } = berlinDateTimeParts(opts.receivedAt);
+  const booking = opts.orderNumber
+    ? `zu Buchung ${escapeHtml(opts.orderNumber)}`
+    : 'zu Ihrer Buchung';
+  const declaration = opts.declaration.map(([k, v]) => `${escapeHtml(k)}: ${nl2br(v)}`).join('; ');
+  const contacts = [opts.brand.phone, opts.brand.email].filter((x): x is string => Boolean(x));
+  const contactHtml = contacts.length
+    ? `<p style="margin:0 0 16px;">Bei Fragen erreichen Sie uns unter ${contacts.map(escapeHtml).join(' oder ')}.</p>`
+    : '';
   return {
-    subject: `Eingangsbestätigung Ihres Widerrufs · ${opts.brand.name}`,
+    subject: opts.orderNumber
+      ? `Eingangsbestätigung Ihres Widerrufs — Buchung ${opts.orderNumber}`
+      : 'Eingangsbestätigung Ihres Widerrufs',
     html: layout({
       brand: opts.brand,
-      preheader: `Wir haben Ihre Widerrufserklärung am ${opts.receivedLabel} erhalten.`,
+      preheader: `Wir bestätigen den Eingang Ihrer Widerrufserklärung am ${date} um ${time} Uhr.`,
       contentHtml: `
-        <p style="margin:0 0 16px;">Hallo ${escapeHtml(opts.name)},</p>
-        <p style="margin:0 0 16px;">
-          wir haben Ihre Widerrufserklärung am <strong>${escapeHtml(opts.receivedLabel)}</strong> erhalten.
-        </p>
-        <p style="margin:16px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#6b5b48;">Ihre Angaben</p>
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 16px;font-size:14px;">
-          ${rows
-            .map(
-              ([k, v]) => `<tr>
-            <td style="padding:4px 16px 4px 0;color:#6b5b48;white-space:nowrap;">${escapeHtml(k)}</td>
-            <td style="padding:4px 0;">${escapeHtml(v)}</td>
-          </tr>`,
-            )
-            .join('')}
-        </table>
-        <p style="margin:24px 0 0;font-size:12px;color:#6b5b48;">
-          Bitte heben Sie diese Bestätigung auf. Bei Fragen antworten Sie einfach auf diese E-Mail.
-        </p>
+        <p style="margin:0 0 16px;">Sehr geehrte/r ${escapeHtml(opts.name)},</p>
+        <p style="margin:0 0 16px;">wir bestätigen den Eingang Ihrer Widerrufserklärung ${booking} am <strong>${date}</strong> um <strong>${time} Uhr</strong>.</p>
+        <p style="margin:0 0 16px;">Inhalt Ihrer Erklärung: ${declaration}.</p>
+        <p style="margin:0 0 16px;">Die Rückerstattung bereits geleisteter Zahlungen erfolgt binnen 14 Tagen auf das ursprünglich verwendete Zahlungsmittel.</p>
+        ${contactHtml}
+        <p style="margin:0;">${escapeHtml(opts.brand.legalName ?? opts.brand.name)}</p>
       `,
       footerNote: `Sie erhalten diese E-Mail, weil auf ${opts.brand.domain} ein Widerruf erklärt wurde.`,
     }),

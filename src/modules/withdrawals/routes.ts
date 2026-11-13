@@ -123,10 +123,17 @@ export const withdrawalsPublicRoutes: FastifyPluginAsync = async (app) => {
             email: withdrawalReceiptEmail({
               brand,
               name: body.name,
-              email: body.email,
-              receivedLabel,
+              receivedAt,
               orderNumber,
-              orderDate: body.orderDate ? germanDate(body.orderDate) : undefined,
+              declaration: [
+                ['Name', body.name],
+                ['E-Mail', body.email],
+                ...(orderNumber ? ([['Auftragsnummer', orderNumber]] as const) : []),
+                ...(body.orderDate
+                  ? ([['Datum der Bestellung', germanDate(body.orderDate)]] as const)
+                  : []),
+                ...(body.message ? ([['Nachricht', `„${body.message}“`]] as const) : []),
+              ],
             }),
           });
           if (companyRow.email) {

@@ -104,3 +104,49 @@ export function verifyCustomerToken(
     return null;
   }
 }
+
+export type MarketingChannel = 'email' | 'sms';
+
+interface MarketingOptOutPayload {
+  c: number;
+  s: string;
+}
+
+/** Marketing unsubscribe token for one customer of one brand; no expiry, old links must keep working. */
+export function signMarketingOptOutToken(customerId: number, slug: string): string {
+  const payload: MarketingOptOutPayload = { c: customerId, s: slug };
+  const encoded = b64urlEncode(Buffer.from(JSON.stringify(payload), 'utf8'));
+  return `${encoded}.${b64urlEncode(hmac(`marketing:${encoded}`))}`;
+}
+
+export function verifyMarketingOptOutToken(
+  token: string,
+): { customerId: number; slug: string } | null {
+  const [encoded, sig, extra] = token.split('.');
+  if (!encoded || !sig || extra !== undefined) return null;
+  const expected = hmac(`marketing:${encoded}`);
+  const provided = b64urlDecode(sig);
+  if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) return null;
+  try {
+    const data = JSON.parse(
+      b64urlDecode(encoded).toString('utf8'),
+    ) as Partial<MarketingOptOutPayload>;
+    if (typeof data.c !== 'number' || !Number.isInteger(data.c) || typeof data.s !== 'string') {
+      return null;
+    }
+    return { customerId: data.c, slug: data.s };
+  } catch {
+    return null;
+  }
+}
+
+/** One-click unsubscribe link for marketing mail/SMS (served by /storefront/marketing/unsubscribe). */
+export function marketingUnsubscribeUrl(
+  slug: string,
+  customerId: number,
+  channel: MarketingChannel,
+): string {
+  const base = env.BETTER_AUTH_URL.replace(/\/$/, '');
+  const t = encodeURIComponent(signMarketingOptOutToken(customerId, slug));
+  return `${base}/storefront/marketing/unsubscribe?t=${t}&channel=${channel}`;
+}

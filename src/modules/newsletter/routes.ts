@@ -46,7 +46,7 @@ function apiBaseUrl(): string {
   return env.BETTER_AUTH_URL.replace(/\/$/, '');
 }
 
-function escapeHtml(input: string): string {
+export function escapeHtml(input: string): string {
   return input
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -55,7 +55,7 @@ function escapeHtml(input: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function renderHtmlPage(
+export function renderHtmlPage(
   reply: FastifyReply,
   opts: {
     title: string;
